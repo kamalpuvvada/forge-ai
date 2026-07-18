@@ -175,6 +175,67 @@ public sealed class EngineeringTaskServiceTests
         Assert.Equal(failed.Id, Assert.Single(persisted.ModelCalls).Id);
     }
 
+    [Fact]
+    public async Task Missing_direct_evidence_refresh_reuses_snapshot_makes_zero_model_calls_then_plans_on_user_action()
+    {
+        var repository = new InMemoryRepository();
+        var now = DateTimeOffset.UtcNow;
+        var appMetadata = new RepositoryFileMetadata("web/src/App.tsx", ".tsx", 100, 2, "source", false, null, ["App"]);
+        var apiMetadata = new RepositoryFileMetadata("web/src/api.ts", ".ts", 80, 1, "source", false, null, ["exportReport"]);
+        var snapshot = PlanningWorkflowTests.Snapshot(now) with
+        {
+            Files = [appMetadata, apiMetadata],
+            TotalDiscoveredFiles = 2,
+            EligibleTextFileCount = 2
+        };
+        var app = new RepositoryTextFile(appMetadata, "import { exportReport } from './api'\nexport const App = () => 'task report export'");
+        var api = new RepositoryTextFile(apiMetadata, "export const exportReport = () => 'task report export'");
+        var task = PlanningTaskWithMissingDirectEvidenceFailure(now, snapshot, app);
+        await repository.SaveAsync(task);
+        var discovery = new FixedDiscovery(snapshot, [app, api]);
+        var planner = new CapturingPlanningEngine();
+        var service = new EngineeringTaskService(repository, new ScriptedEngine(ClarificationEvaluation.Summarize("unused")),
+            TimeProvider.System, discovery, new DeterministicEvidenceSelectionService(new RepositoryAnalysisLimits()), planner, new RepositoryAnalysisLimits());
+
+        var refreshed = await service.RefreshEvidenceAsync(task.Id);
+
+        Assert.Equal(WorkflowStatus.ReadyForPlanning, refreshed.Status);
+        Assert.Equal(0, discovery.CallCount);
+        Assert.Equal(1, discovery.ReadCount);
+        Assert.Equal(0, planner.CallCount);
+        Assert.Contains(refreshed.EvidenceItems, item => item.RelativePath == "web/src/api.ts");
+        Assert.Contains((await repository.GetAsync(task.Id))!.EvidenceItems, item => item.RelativePath == "web/src/api.ts");
+
+        var planned = await service.CreatePlanAsync(task.Id);
+
+        Assert.Equal(WorkflowStatus.AwaitingPlanApproval, planned.Status);
+        Assert.Equal(1, planner.CallCount);
+        Assert.Equal(2, discovery.ReadCount);
+        Assert.Contains(planned.ImplementationPlan!.AffectedFiles, file => file.Path == "web/src/api.ts");
+    }
+
+    [Fact]
+    public async Task Evidence_refresh_rejects_stale_snapshot_without_model_call()
+    {
+        var repository = new InMemoryRepository();
+        var now = DateTimeOffset.UtcNow;
+        var snapshot = PlanningWorkflowTests.Snapshot(now);
+        var metadata = snapshot.Files[0];
+        var app = new RepositoryTextFile(metadata, "public class App { void ExportTaskReport() {} }");
+        var task = PlanningTaskWithMissingDirectEvidenceFailure(now, snapshot, app);
+        await repository.SaveAsync(task);
+        var planner = new CapturingPlanningEngine();
+        var service = new EngineeringTaskService(repository, new ScriptedEngine(ClarificationEvaluation.Summarize("unused")),
+            TimeProvider.System, new FixedDiscovery(snapshot, [app], isFresh: false),
+            new DeterministicEvidenceSelectionService(new RepositoryAnalysisLimits()), planner, new RepositoryAnalysisLimits());
+
+        var exception = await Assert.ThrowsAsync<PlanningException>(() => service.RefreshEvidenceAsync(task.Id));
+
+        Assert.Equal("stale_snapshot", exception.Category);
+        Assert.Equal(0, planner.CallCount);
+        Assert.Equal(WorkflowStatus.Planning, (await repository.GetAsync(task.Id))!.Status);
+    }
+
     private static EngineeringTaskService CreateService(IClarificationEngine engine) =>
         new(new InMemoryRepository(), engine, TimeProvider.System);
 
@@ -215,7 +276,28 @@ public sealed class EngineeringTaskServiceTests
         return task;
     }
 
-    private sealed class FixedDiscovery(RepositorySnapshot snapshot, IReadOnlyList<RepositoryTextFile>? textFiles = null) : IRepositoryDiscoveryService
+    private static EngineeringTask PlanningTaskWithMissingDirectEvidenceFailure(
+        DateTimeOffset now,
+        RepositorySnapshot snapshot,
+        RepositoryTextFile selectedFile)
+    {
+        var task = EngineeringTask.Create("C:/repo", "Export the task report from the UI", now);
+        task.ApplyClarificationEvaluation(ClarificationEvaluation.Summarize("Export the task report through the frontend API helper."), now);
+        task.ApproveRequirementSummary(now);
+        task.BeginRepositoryAnalysis(now);
+        task.StoreRepositorySnapshot(snapshot, now);
+        var evidence = new EvidenceItem("E1", selectedFile.Metadata.RelativePath, 1, 2, selectedFile.Content,
+            "requirement terms in content", 50, "hash");
+        task.StoreEvidence(new EvidenceSelection([evidence], 1, 1, evidence.Excerpt.Length), now);
+        task.RecordModelCall(new ModelCallRecord(Guid.NewGuid(), ModelCallStage.Planning, "OpenAI", "gpt-5.6-sol", "medium",
+            now, now, false, "resp_plan", 1000, 0, 100, 25, 0.0071m, "missing_direct_evidence"), now);
+        return task;
+    }
+
+    private sealed class FixedDiscovery(
+        RepositorySnapshot snapshot,
+        IReadOnlyList<RepositoryTextFile>? textFiles = null,
+        bool isFresh = true) : IRepositoryDiscoveryService
     {
         public int CallCount { get; private set; }
         public int ReadCount { get; private set; }
@@ -227,7 +309,7 @@ public sealed class EngineeringTaskServiceTests
         public Task<RepositorySnapshotReadResult> ReadSnapshotAsync(RepositorySnapshot existingSnapshot, CancellationToken cancellationToken = default)
         {
             ReadCount++;
-            return Task.FromResult(new RepositorySnapshotReadResult(true, textFiles ?? []));
+            return Task.FromResult(new RepositorySnapshotReadResult(isFresh, textFiles ?? []));
         }
     }
 

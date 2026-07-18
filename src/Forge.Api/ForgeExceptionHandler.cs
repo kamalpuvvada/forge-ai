@@ -24,6 +24,11 @@ public sealed class ForgeExceptionHandler(
                 "analysis_limits" => (422, "Repository analysis limit", discovery.Message, "repository_analysis_limit"),
                 _ => (400, "Repository path invalid", discovery.Message, "repository_missing_path")
             },
+            PlanningProviderException { Category: "missing_direct_evidence" } provider => (
+                422,
+                "Repository evidence does not support the plan",
+                provider.Message,
+                "missing_direct_evidence"),
             PlanningProviderException provider => (
                 provider.Category is "rate_limit" or "timeout" ? 503 : 502,
                 "AI planning failure",

@@ -25,6 +25,8 @@ public static class ImplementationPlanValidator
 
     public const string ValidationAlreadyPerformedMessage =
         "The implementation plan claimed that validation had already been performed.";
+    public const string MissingDirectEvidenceMessage =
+        "The plan referenced an existing repository file that was not included in the selected evidence.";
 
     private const string ValidationSubject =
         @"(?:all\s+)?(?:tests?|build|lint|validation|commands?|checks?|pdf|result|export|download)";
@@ -114,6 +116,8 @@ public static class ImplementationPlanValidator
                 throw Invalid($"Planned {file.Action.ToString().ToLowerInvariant()} path '{path}' does not exist in the snapshot.");
             if (file.Action == PlannedFileAction.Create && exists)
                 throw Invalid($"Planned create path '{path}' already exists in the snapshot.");
+            if (exists && !evidencePaths.Values.Contains(path, StringComparer.OrdinalIgnoreCase))
+                throw new PlanningException("missing_direct_evidence", MissingDirectEvidenceMessage);
             ValidateEvidenceIds(file.EvidenceIds, evidenceIds, $"affected file '{path}'");
             if (exists && file.EvidenceIds.Count == 0)
                 throw Invalid($"Existing affected path '{path}' must cite repository evidence.");

@@ -52,6 +52,106 @@ public sealed class EvidenceSelectionTests(ITestOutputHelper output)
     }
 
     [Fact]
+    public void Selected_tsx_relative_import_boosts_material_api_companion_over_documentation()
+    {
+        var limits = new RepositoryAnalysisLimits { MaximumEvidenceFiles = 2, MaximumEvidenceCharacters = 60_000 };
+        var files = new[]
+        {
+            TextFile("web/src/App.tsx", "import { exportReport } from './api'\nexport function App() { return exportReport('task report') }"),
+            TextFile("web/src/api.ts", "export const exportReport = (value: string) => value"),
+            TextFile("README.md", "task report export export export documentation")
+        };
+
+        var result = Selector(limits).Select(Snapshot(files), files, "Export the task report from the UI", "Add task report export through the frontend API helper.", []);
+
+        Assert.Equal(new[] { "web/src/api.ts", "web/src/App.tsx" }, result.Items.Select(item => item.RelativePath));
+        Assert.Contains("selected local TypeScript/JavaScript import companion", result.Items[0].ReasonSelected);
+        Assert.DoesNotContain(result.Items, item => item.RelativePath == "README.md");
+    }
+
+    [Fact]
+    public void Extensionless_tsx_and_local_index_imports_resolve()
+    {
+        var files = new[]
+        {
+            TextFile("web/src/App.tsx", "import { Panel } from './components/Panel'\nimport { exportReport } from './services'\nexport const App = () => exportReport(Panel)"),
+            TextFile("web/src/components/Panel.tsx", "export const Panel = 'task report panel'"),
+            TextFile("web/src/services/index.ts", "export const exportReport = (value: unknown) => value")
+        };
+
+        var paths = Selector().Select(Snapshot(files), files, "Export task report panel", "Export the task report from the UI.", [])
+            .Items.Select(item => item.RelativePath).ToArray();
+
+        Assert.Contains("web/src/components/Panel.tsx", paths);
+        Assert.Contains("web/src/services/index.ts", paths);
+    }
+
+    [Fact]
+    public void Package_and_out_of_repository_traversal_imports_are_not_expanded()
+    {
+        var files = new[]
+        {
+            TextFile("web/src/App.tsx", "import React from 'react'\nimport { hidden } from '../../../outside/api'\nexport const App = () => 'task report export'"),
+            TextFile("web/src/react.ts", "export const React = true"),
+            TextFile("outside/api.ts", "export const hidden = 'secret'"),
+            TextFile("src/ExportService.cs", "class ExportService { void ExportTaskReport() {} }")
+        };
+
+        var result = Selector().Select(Snapshot(files), files, "Export task report", "Export task report from the UI and service.", []);
+
+        Assert.DoesNotContain(result.Items, item => item.ReasonSelected.Contains("import companion", StringComparison.Ordinal) &&
+            (item.RelativePath is "web/src/react.ts" or "outside/api.ts"));
+    }
+
+    [Fact]
+    public void Companion_expansion_preserves_file_and_character_limits_and_test_layers()
+    {
+        var limits = new RepositoryAnalysisLimits { MaximumEvidenceFiles = 4, MaximumEvidenceCharacters = 120, MaximumEvidenceCharactersPerFile = 60 };
+        var files = new[]
+        {
+            TextFile("web/src/App.tsx", "import { exportReport } from './api'\nexport const App = () => 'task report export frontend'"),
+            TextFile("web/src/api.ts", "export const exportReport = () => 'task report export api'"),
+            TextFile("web/src/App.test.tsx", "test('task report export frontend', () => {})"),
+            TextFile("tests/TaskExportTests.cs", "class TaskExportTests { void TaskReportExportBackend() {} }"),
+            TextFile("README.md", "task report export documentation")
+        };
+
+        var result = Selector(limits).Select(Snapshot(files), files,
+            "Export task report with backend and frontend tests", "Add task report export with backend and frontend tests.", []);
+
+        Assert.True(result.Items.Count <= 4);
+        Assert.True(result.TotalCharacters <= 120);
+        Assert.Contains(result.Items, item => item.RelativePath == "web/src/api.ts");
+        Assert.Contains(result.Items, item => item.RelativePath == "web/src/App.test.tsx");
+        Assert.Contains(result.Items, item => item.RelativePath == "tests/TaskExportTests.cs");
+    }
+
+    [Fact]
+    public void Csharp_symbol_relationship_boosts_service_and_test_companions()
+    {
+        var controllerMetadata = new RepositoryFileMetadata("src/Api/ReportController.cs", ".cs", 100, 2,
+            "source", false, "src", ["ReportController"]);
+        var serviceMetadata = new RepositoryFileMetadata("src/Core/IReportService.cs", ".cs", 80, 1,
+            "source", false, "src", ["IReportService"]);
+        var testMetadata = new RepositoryFileMetadata("tests/ReportControllerTests.cs", ".cs", 80, 1,
+            "source", true, "tests", ["ReportControllerTests"]);
+        var files = new[]
+        {
+            new RepositoryTextFile(controllerMetadata, "class ReportController { ReportController(IReportService service) {} void ExportTaskReport() {} }"),
+            new RepositoryTextFile(serviceMetadata, "interface IReportService { void ExportTaskReport(); }"),
+            new RepositoryTextFile(testMetadata, "class ReportControllerTests { ReportController controller; void ExportTaskReport() {} }")
+        };
+
+        var result = Selector().Select(Snapshot(files), files, "Export task reports through the API with tests.",
+            "Add task report export through the controller and service with backend tests.", []);
+
+        Assert.Contains(result.Items, item => item.RelativePath == "src/Core/IReportService.cs" &&
+            item.ReasonSelected.Contains("selected C# symbol companion", StringComparison.Ordinal));
+        Assert.Contains(result.Items, item => item.RelativePath == "tests/ReportControllerTests.cs" &&
+            item.ReasonSelected.Contains("selected C# symbol companion", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public async Task Sensitive_values_and_unsafe_paths_never_enter_evidence_or_plan()
     {
         const string credential = "super-secret-credential";
@@ -131,6 +231,7 @@ public sealed class EvidenceSelectionTests(ITestOutputHelper output)
         Assert.InRange(result.Items.Count, 4, 12);
         Assert.True(result.TotalCharacters <= 60_000);
         Assert.Contains(result.Items, item => item.RelativePath.StartsWith("web/", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(result.Items, item => item.RelativePath == "web/forge-web/src/api.ts");
         Assert.Contains(result.Items, item => item.RelativePath.StartsWith("src/Forge.Api/", StringComparison.OrdinalIgnoreCase));
         Assert.Contains(result.Items, item => item.RelativePath.StartsWith("src/Forge.Core/", StringComparison.OrdinalIgnoreCase));
         Assert.Contains(result.Items, item => item.RelativePath.Contains("Tests", StringComparison.OrdinalIgnoreCase));

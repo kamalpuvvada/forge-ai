@@ -25,6 +25,7 @@ export const forgeApi = {
   requestRevision: (id: string, correction: string) => request<EngineeringTask>(`/api/tasks/${id}/requirement-revision`, { method: 'POST', body: JSON.stringify({ correction }) }),
   approveRequirement: (id: string) => request<EngineeringTask>(`/api/tasks/${id}/requirement-approval`, { method: 'POST' }),
   analyzeRepository: (id: string) => request<EngineeringTask>(`/api/tasks/${id}/repository-analysis`, { method: 'POST' }),
+  refreshEvidence: (id: string) => request<EngineeringTask>(`/api/tasks/${id}/evidence-refresh`, { method: 'POST' }),
   createPlan: (id: string) => request<EngineeringTask>(`/api/tasks/${id}/plan`, { method: 'POST' }),
   requestPlanRevision: (id: string, correction: string) => request<EngineeringTask>(`/api/tasks/${id}/plan-revision`, { method: 'POST', body: JSON.stringify({ correction }) }),
   approvePlan: (id: string) => request<EngineeringTask>(`/api/tasks/${id}/plan-approval`, { method: 'POST' }),

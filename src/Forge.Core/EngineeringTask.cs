@@ -169,6 +169,37 @@ public sealed class EngineeringTask
         UpdatedAt = now;
     }
 
+    public void CompleteEvidenceRefresh(DateTimeOffset now)
+    {
+        EnsureEvidenceRefreshCanBeRequested();
+        if (EvidenceItems.Count == 0)
+            throw new WorkflowException("Refreshed repository evidence is required before planning can resume.");
+        ImplementationPlan = null;
+        PlanCreatedAt = null;
+        PlanApprovedAt = null;
+        Status = WorkflowStatus.ReadyForPlanning;
+        UpdatedAt = now;
+    }
+
+    public void EnsureEvidenceRefreshCanBeRequested()
+    {
+        EnsureStatus(WorkflowStatus.Planning);
+        if (RepositorySnapshot is null || RepositoryAnalyzedAt is null || string.IsNullOrWhiteSpace(RequirementSummary))
+            throw new WorkflowException("A saved repository snapshot and approved requirement are required to refresh evidence.");
+        var latestPlanningCall = _modelCalls.LastOrDefault(call => call.Stage == ModelCallStage.Planning);
+        if (latestPlanningCall is not { Succeeded: false, FailureCategory: "missing_direct_evidence" })
+            throw new WorkflowException("Evidence refresh is available only after a plan fails for missing direct evidence.");
+    }
+
+    public void BeginPlanGenerationFromRefreshedEvidence(DateTimeOffset now)
+    {
+        EnsureStatus(WorkflowStatus.ReadyForPlanning);
+        if (RepositorySnapshot is null || EvidenceItems.Count == 0)
+            throw new WorkflowException("A fresh repository snapshot and refreshed evidence are required before planning.");
+        Status = WorkflowStatus.Planning;
+        UpdatedAt = now;
+    }
+
     public void StoreImplementationPlan(ImplementationPlan plan, DateTimeOffset now, TimeSpan maximumSnapshotAge)
     {
         EnsureStatus(WorkflowStatus.Planning);

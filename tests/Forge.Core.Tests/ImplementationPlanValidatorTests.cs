@@ -79,6 +79,28 @@ public sealed class ImplementationPlanValidatorTests
     }
 
     [Fact]
+    public void Existing_affected_path_without_direct_selected_evidence_is_rejected_specifically()
+    {
+        var plan = ValidPlan();
+        var unsupported = plan with
+        {
+            AffectedFiles = [plan.AffectedFiles[0] with { Path = "src/NotSelected.cs" }],
+            Steps = [plan.Steps[0] with { AffectedPaths = ["src/NotSelected.cs"] }],
+            RequirementCoverage = [plan.RequirementCoverage[0] with { AffectedPaths = ["src/NotSelected.cs"] }]
+        };
+        var snapshot = Snapshot() with
+        {
+            Files = [.. Snapshot().Files, new RepositoryFileMetadata("src/NotSelected.cs", ".cs", 20, 1, "source", false, null, ["NotSelected"])]
+        };
+
+        var exception = Assert.Throws<PlanningException>(() =>
+            ImplementationPlanValidator.Validate(unsupported, snapshot, Evidence()));
+
+        Assert.Equal("missing_direct_evidence", exception.Category);
+        Assert.Equal(ImplementationPlanValidator.MissingDirectEvidenceMessage, exception.Message);
+    }
+
+    [Fact]
     public void Repository_understanding_and_summary_use_strict_completed_run_detection()
     {
         var plan = ValidPlan();

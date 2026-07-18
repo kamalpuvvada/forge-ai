@@ -25,6 +25,10 @@ public sealed class OpenAIPlanningEngine(
         Keep the plan narrowly appropriate for the approved requirement. Never emit absolute local paths.
         Return only the supplied strict JSON schema. Step order must start at 1 and increase by 1.
         Every step path must also appear in affectedFiles, and every existing path claim must cite evidence IDs.
+        The supplied "Allowed existing affected paths" list is authoritative. Every modify, delete, or inspect
+        path must be chosen exactly from that list. An existing repository path absent from the list must not
+        appear in affectedFiles or steps. Use create only for genuinely new paths. Do not infer an existing file
+        from naming conventions or another file's imports unless that file appears in selected evidence.
         Keep the output compact: at most 10 affected files, 8 steps, 8 validation commands, 4 risks,
         4 assumptions, and 4 unresolved questions. Use concise, non-repetitive descriptions. Do not repeat
         the full approved requirement, quote evidence excerpts, or copy repository content. Objective,
@@ -167,11 +171,17 @@ public sealed class OpenAIPlanningEngine(
         }
         catch (Exception exception)
         {
-            var category = exception is OpenAITransportException transport ? transport.Category : "invalid_plan_response";
+            var category = exception switch
+            {
+                OpenAITransportException transport => transport.Category,
+                PlanningException { Category: "missing_direct_evidence" } => "missing_direct_evidence",
+                _ => "invalid_plan_response"
+            };
             var safeMessage = exception switch
             {
                 OpenAITransportException => exception.Message,
                 PlanningException { Category: "invalid_plan_field" } planning => planning.Message,
+                PlanningException { Category: "missing_direct_evidence" } planning => planning.Message,
                 PlanningException when exception.Message == ImplementationPlanValidator.ValidationAlreadyPerformedMessage =>
                     ImplementationPlanValidator.ValidationAlreadyPerformedMessage,
                 _ => "OpenAI returned an invalid structured implementation plan."
@@ -264,6 +274,9 @@ public sealed class OpenAIPlanningEngine(
         var snapshot = context.Snapshot;
         var payload = new
         {
+            allowedExistingAffectedPaths = context.Evidence.Select(item => Safe(item.RelativePath, snapshot.NormalizedRoot))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .Order(StringComparer.OrdinalIgnoreCase),
             approvedRequirementSummary = Safe(context.ApprovedRequirementSummary, snapshot.NormalizedRoot),
             clarificationAnswers = context.ClarificationAnswers.Select(answer => new
             {
@@ -286,9 +299,7 @@ public sealed class OpenAIPlanningEngine(
                 snapshot.DetectedExtensions,
                 projectFiles = snapshot.ProjectFiles.Select(path => Safe(path, snapshot.NormalizedRoot)),
                 testLocations = snapshot.TestLocations.Select(path => Safe(path, snapshot.NormalizedRoot)),
-                warnings = snapshot.Warnings.Select(warning => Safe(warning, snapshot.NormalizedRoot)),
-                selectedEvidencePaths = context.Evidence.Select(item => item.RelativePath)
-                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                warnings = snapshot.Warnings.Select(warning => Safe(warning, snapshot.NormalizedRoot))
             },
             evidence = context.Evidence.Select(item => new
             {

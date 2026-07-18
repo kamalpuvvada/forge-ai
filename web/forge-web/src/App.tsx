@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import type { FormEvent } from 'react'
 import { ForgeApiError, forgeApi } from './api'
+import { getPlanningRecovery, getReadyPlanningAction } from './planningRecovery'
 import type { EngineeringTask, SystemCapabilities, WorkflowStatus } from './types'
 import './App.css'
 
@@ -78,7 +79,7 @@ function App() {
     finally { setBusy(false) }
   }
   async function retryPlanGeneration() {
-    if (!task || task.status !== 'Planning') return
+    if (!task || (task.status !== 'Planning' && task.status !== 'ReadyForPlanning')) return
     setBusy(true); setError(null); setPlanningFailure(null); setPlanningSnapshotStale(false); setPlanningProgress(2)
     try {
       const planned = await forgeApi.createPlan(task.id)
@@ -87,6 +88,18 @@ function App() {
       try { setTask(await forgeApi.getTask(task.id)) } catch { /* Keep the current task if refresh fails. */ }
       setPlanningSnapshotStale(caught instanceof ForgeApiError && caught.code === 'stale_snapshot')
       setPlanningFailure(caught instanceof Error ? caught.message : 'Planning could not be completed.')
+    } finally { setBusy(false) }
+  }
+  async function refreshEvidence() {
+    if (!task || task.status !== 'Planning') return
+    setBusy(true); setError(null); setPlanningFailure(null); setPlanningSnapshotStale(false)
+    try {
+      const refreshed = await forgeApi.refreshEvidence(task.id)
+      setTask(refreshed)
+    } catch (caught) {
+      try { setTask(await forgeApi.getTask(task.id)) } catch { /* Keep the failed planning task if refresh fails. */ }
+      setPlanningSnapshotStale(caught instanceof ForgeApiError && caught.code === 'stale_snapshot')
+      setPlanningFailure(caught instanceof Error ? caught.message : 'Repository evidence could not be refreshed.')
     } finally { setBusy(false) }
   }
   async function submitPlanCorrection(event: FormEvent) {
@@ -111,6 +124,8 @@ function App() {
   const planningCalls = telemetry.calls.filter(call => call.stage === 'Planning')
   const planningCost = planningCalls.reduce((total, call) => total + call.estimatedCostUsd, 0)
   const latestFailedPlanningCall = [...planningCalls].reverse().find(call => !call.succeeded)
+  const planningRecovery = getPlanningRecovery(latestFailedPlanningCall?.failureCategory ?? null, planningSnapshotStale)
+  const readyPlanningAction = getReadyPlanningAction((task?.evidenceItems.length ?? 0) > 0)
   const planningFailureMessage = planningFailure ?? (task?.status === 'Planning' && latestFailedPlanningCall
     ? planningFailureForCategory(latestFailedPlanningCall.failureCategory)
     : null)
@@ -160,8 +175,8 @@ function App() {
             {!correctionMode ? <div className="approval-row"><p><strong>Explicit approval required</strong><br />Approval locks this summary as planning context.</p><div className="approval-actions"><button className="secondary-button" onClick={() => setCorrectionMode(true)}>Request correction</button><button className="primary-button compact" onClick={approveSummary} disabled={busy}>Approve requirement <span>→</span></button></div></div>
               : <form className="correction-form" onSubmit={submitCorrection}><div><strong>Request a correction</strong><p>The current summary will be preserved in revision history and regenerated.</p></div><label><span>CORRECTION NOTE</span><textarea autoFocus value={correction} onChange={event => setCorrection(event.target.value)} placeholder="State only what should change…" rows={4} maxLength={5000} required /></label><div className="approval-actions"><button type="button" className="secondary-button" onClick={() => { setCorrectionMode(false); setCorrection('') }}>Cancel</button><button className="primary-button compact" disabled={busy || !correction.trim()}>{busy ? 'Regenerating…' : 'Submit correction'}</button></div></form>}
           </div>}
-          {task?.status === 'ReadyForPlanning' && <div className="ready-view"><div className="success-seal">✓</div><p className="eyebrow">REQUIREMENT APPROVED</p><h2>Ready for evidence-backed planning</h2><p>Forge will inspect the repository read-only, select bounded evidence, and use the configured planning provider.</p><div className="coming-next"><span>04</span><div><strong>Read-only planning</strong><p>No files, Git state, packages, builds, or tests will be changed.</p></div><button className="primary-button compact" onClick={() => void analyzeAndPlan()} disabled={busy}>Analyze repository and create plan</button></div><button className="text-button" onClick={startAnother}>Start another task</button></div>}
-          {task?.status === 'Planning' && planningFailureMessage && !busy && <div className="planning-failure"><div className="failure-seal">!</div><p className="eyebrow">PLAN GENERATION FAILED</p><h2>{planningSnapshotStale ? 'The repository needs a fresh read-only analysis.' : 'The existing evidence is ready for another attempt.'}</h2><p>{planningFailureMessage}</p>{latestFailedPlanningCall && <div className="failed-call-summary"><strong>{latestFailedPlanningCall.model} · {latestFailedPlanningCall.failureCategory}</strong><span>{latestFailedPlanningCall.outputTokens.toLocaleString()} output tokens · estimated ${latestFailedPlanningCall.estimatedCostUsd.toFixed(6)}</span></div>}{planningSnapshotStale ? <button className="primary-button compact" onClick={() => void analyzeAndPlan()} disabled={busy}>Re-analyze repository and create plan <span>→</span></button> : <button className="primary-button compact" onClick={() => void retryPlanGeneration()} disabled={busy}>Retry plan generation <span>→</span></button>}<small>{planningSnapshotStale ? 'The changed repository invalidated the saved snapshot; analysis must be refreshed first.' : 'Retry uses this snapshot and selected evidence. Repository analysis is not repeated.'}</small></div>}
+          {task?.status === 'ReadyForPlanning' && <div className="ready-view"><div className="success-seal">✓</div><p className="eyebrow">{readyPlanningAction.eyebrow}</p><h2>Ready for evidence-backed planning</h2><p>{readyPlanningAction.usesSavedEvidence ? 'The refreshed evidence is saved. Generate the plan only when you are ready to make one explicit provider call.' : 'Forge will inspect the repository read-only, select bounded evidence, and use the configured planning provider.'}</p><div className="coming-next"><span>04</span><div><strong>Read-only planning</strong><p>No files, Git state, packages, builds, or tests will be changed.</p></div><button className="primary-button compact" onClick={() => void (readyPlanningAction.usesSavedEvidence ? retryPlanGeneration() : analyzeAndPlan())} disabled={busy}>{readyPlanningAction.button}</button></div><button className="text-button" onClick={startAnother}>Start another task</button></div>}
+          {task?.status === 'Planning' && planningFailureMessage && !busy && <div className="planning-failure"><div className="failure-seal">!</div><p className="eyebrow">PLAN GENERATION FAILED</p><h2>{planningRecovery.heading}</h2><p>{planningFailureMessage}</p>{latestFailedPlanningCall && <div className="failed-call-summary"><strong>{latestFailedPlanningCall.model} · {latestFailedPlanningCall.failureCategory}</strong><span>{latestFailedPlanningCall.outputTokens.toLocaleString()} output tokens · estimated ${latestFailedPlanningCall.estimatedCostUsd.toFixed(6)}</span></div>}{planningRecovery.action === 'reanalyze' ? <button className="primary-button compact" onClick={() => void analyzeAndPlan()} disabled={busy}>Re-analyze repository and create plan <span>→</span></button> : planningRecovery.action === 'refresh' ? <button className="primary-button compact" onClick={() => void refreshEvidence()} disabled={busy}>Refresh evidence <span>→</span></button> : <button className="primary-button compact" onClick={() => void retryPlanGeneration()} disabled={busy}>Retry plan generation <span>→</span></button>}<small>{planningRecovery.note}</small></div>}
           {task?.status === 'Planning' && task.planRevisionNotes.length > 0 && !busy && <section className="plan-revision-history"><small>PREVIOUS PLAN PRESERVED</small>{task.planRevisionNotes.map((revision, index) => <article key={revision.submittedAt}><strong>Revision {index + 1}: {revision.previousPlanTitle}</strong><p>{revision.correction}</p><code>{revision.previousAffectedPaths.join(', ') || 'No affected paths'}</code></article>)}</section>}
           {((task?.status === 'Planning' && !planningFailureMessage) || planningProgress !== null && busy) && <div className="planning-progress"><div className="action-title"><span className="title-icon">04</span><div><h2>Creating an evidence-backed plan</h2><p>The target remains read-only throughout analysis.</p></div></div>{['Inspecting repository', 'Selecting evidence', 'Creating evidence-backed plan', 'Awaiting approval'].map((label, index) => <div className={`planning-progress-step ${index < (planningProgress ?? 0) ? 'complete' : index === (planningProgress ?? 0) ? 'active' : ''}`} key={label}><span>{index < (planningProgress ?? 0) ? '✓' : index + 1}</span><p>{label}</p></div>)}</div>}
           {task?.status === 'AwaitingPlanApproval' && task.implementationPlan && <div className="plan-view">
@@ -197,6 +212,7 @@ function App() {
 function formatStatus(status: WorkflowStatus) { return status.replace(/([a-z])([A-Z])/g, '$1 $2') }
 function formatTokens(tokens: number) { return tokens.toLocaleString() }
 function planningFailureForCategory(category: string | null) {
+  if (category === 'missing_direct_evidence') return 'The plan referenced an existing repository file that was not included in the selected evidence.'
   if (category === 'output_truncated') return 'The planning response reached its output limit before the structured plan was complete.'
   if (category === 'content_filter') return "The planning response was stopped by the provider's content filter."
   return 'OpenAI did not return a valid completed planning response.'

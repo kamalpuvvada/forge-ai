@@ -291,6 +291,55 @@ public sealed class EngineeringTaskApiTests : IClassFixture<FakeModeFactory>
     }
 
     [Fact]
+    public async Task Missing_direct_evidence_refresh_is_zero_call_persists_and_requires_separate_plan_request()
+    {
+        await using var factory = new MissingDirectEvidenceFactory();
+        using var client = factory.CreateClient();
+        var webSource = Path.Combine(factory.TargetRepositoryPath, "web", "src");
+        Directory.CreateDirectory(webSource);
+        await File.WriteAllTextAsync(Path.Combine(webSource, "App.tsx"),
+            "import { exportReport } from './api'\nexport const App = () => 'task report export'");
+        await File.WriteAllTextAsync(Path.Combine(webSource, "api.ts"),
+            "export const exportReport = () => 'task report export'");
+        var createdResponse = await client.PostAsJsonAsync("/api/tasks", new
+        {
+            repository = factory.TargetRepositoryPath,
+            requirement = "Export the task report from the UI through the frontend API helper. Acceptance criteria: export is available. Validation: run tests."
+        });
+        createdResponse.EnsureSuccessStatusCode();
+        var id = (await createdResponse.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("id").GetGuid();
+        (await client.PostAsync($"/api/tasks/{id}/requirement-approval", null)).EnsureSuccessStatusCode();
+        (await client.PostAsync($"/api/tasks/{id}/repository-analysis", null)).EnsureSuccessStatusCode();
+
+        var failedResponse = await client.PostAsync($"/api/tasks/{id}/plan", null);
+        var problem = await failedResponse.Content.ReadFromJsonAsync<JsonElement>();
+
+        Assert.Equal(HttpStatusCode.UnprocessableEntity, failedResponse.StatusCode);
+        Assert.Equal("missing_direct_evidence", problem.GetProperty("code").GetString());
+        Assert.Equal(ImplementationPlanValidator.MissingDirectEvidenceMessage, problem.GetProperty("detail").GetString());
+        Assert.Equal(1, factory.PlanningEngine.CallCount);
+
+        var refreshResponse = await client.PostAsync($"/api/tasks/{id}/evidence-refresh", null);
+        Assert.True(refreshResponse.IsSuccessStatusCode, await refreshResponse.Content.ReadAsStringAsync());
+        var refreshed = await refreshResponse.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Equal("ReadyForPlanning", refreshed.GetProperty("status").GetString());
+        Assert.Equal(1, factory.PlanningEngine.CallCount);
+        Assert.Contains(refreshed.GetProperty("evidenceItems").EnumerateArray(), item =>
+            item.GetProperty("relativePath").GetString() == "web/src/api.ts");
+
+        var reread = await client.GetFromJsonAsync<JsonElement>($"/api/tasks/{id}");
+        Assert.Contains(reread.GetProperty("evidenceItems").EnumerateArray(), item =>
+            item.GetProperty("relativePath").GetString() == "web/src/api.ts");
+        var plannedResponse = await client.PostAsync($"/api/tasks/{id}/plan", null);
+        Assert.True(plannedResponse.IsSuccessStatusCode, await plannedResponse.Content.ReadAsStringAsync());
+        var planned = await plannedResponse.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Equal("AwaitingPlanApproval", planned.GetProperty("status").GetString());
+        Assert.Equal(2, factory.PlanningEngine.CallCount);
+        Assert.Contains(planned.GetProperty("implementationPlan").GetProperty("affectedFiles").EnumerateArray(), file =>
+            file.GetProperty("path").GetString() == "web/src/api.ts");
+    }
+
+    [Fact]
     public async Task OpenAI_mode_starts_without_key_and_reports_both_ai_stages_unavailable()
     {
         await using var factory = new OpenAiNoKeyFactory();
@@ -441,6 +490,41 @@ public sealed class OutputTruncatedPlanningFactory : FakeModeFactory
             return Task.FromException<PlanningEvaluation>(new PlanningProviderException(
                 "The planning response reached its output limit before the structured plan was complete.",
                 "output_truncated", failed));
+        }
+    }
+}
+
+public sealed class MissingDirectEvidenceFactory : FakeModeFactory
+{
+    public FailOncePlanningEngine PlanningEngine { get; } = new();
+
+    protected override void ConfigureWebHost(IWebHostBuilder builder)
+    {
+        base.ConfigureWebHost(builder);
+        builder.ConfigureServices(services =>
+        {
+            services.RemoveAll<IPlanningEngine>();
+            services.AddSingleton<IPlanningEngine>(PlanningEngine);
+        });
+    }
+
+    public sealed class FailOncePlanningEngine : IPlanningEngine
+    {
+        public int CallCount { get; private set; }
+
+        public Task<PlanningEvaluation> CreatePlanAsync(PlanningContext context, CancellationToken cancellationToken = default)
+        {
+            CallCount++;
+            if (CallCount == 1)
+            {
+                var now = DateTimeOffset.UtcNow;
+                var failed = new ModelCallRecord(Guid.NewGuid(), ModelCallStage.Planning, "OpenAI", "gpt-5.6-sol", "medium",
+                    now, now, false, "resp_plan", 1000, 0, 100, 25, 0.0071m, "missing_direct_evidence");
+                return Task.FromException<PlanningEvaluation>(new PlanningProviderException(
+                    ImplementationPlanValidator.MissingDirectEvidenceMessage, "missing_direct_evidence", failed));
+            }
+
+            return new FakePlanningEngine().CreatePlanAsync(context, cancellationToken);
         }
     }
 }

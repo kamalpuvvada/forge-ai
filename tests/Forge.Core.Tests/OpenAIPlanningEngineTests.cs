@@ -33,6 +33,9 @@ public sealed class OpenAIPlanningEngineTests
         Assert.Contains("do not count as planning test implementation", gateway.Request?.DeveloperInstructions);
         Assert.Contains("concrete service or component", gateway.Request?.DeveloperInstructions);
         Assert.Contains("frontend API helpers", gateway.Request?.DeveloperInstructions);
+        Assert.Contains("Allowed existing affected paths", gateway.Request?.DeveloperInstructions);
+        Assert.Contains("absent from the list must not", gateway.Request?.DeveloperInstructions);
+        Assert.Contains("appear in affectedFiles or steps", gateway.Request?.DeveloperInstructions);
         Assert.Equal(1, gateway.CallCount);
     }
 
@@ -155,6 +158,23 @@ public sealed class OpenAIPlanningEngineTests
     }
 
     [Fact]
+    public async Task Existing_path_without_selected_evidence_has_specific_safe_failure_cost_and_no_retry()
+    {
+        var output = ValidJson().Replace("src/App.cs", "src/NotSelected.cs", StringComparison.Ordinal);
+        var gateway = new CapturingGateway(Envelope(output));
+
+        var exception = await Assert.ThrowsAsync<PlanningProviderException>(() =>
+            CreateEngine(gateway).CreatePlanAsync(Context()));
+
+        Assert.Equal("missing_direct_evidence", exception.Category);
+        Assert.Equal(ImplementationPlanValidator.MissingDirectEvidenceMessage, exception.Message);
+        Assert.Equal("missing_direct_evidence", exception.FailedCall.FailureCategory);
+        Assert.Equal(0.0071m, exception.FailedCall.EstimatedCostUsd);
+        Assert.Equal(1, gateway.CallCount);
+        Assert.DoesNotContain(output, exception.ToString(), StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task Future_validation_language_in_expected_result_remains_valid()
     {
         var output = ValidJson().Replace(
@@ -243,7 +263,7 @@ public sealed class OpenAIPlanningEngineTests
         Assert.Contains("src/App.cs", serialized, StringComparison.Ordinal);
         Assert.Contains("Forge.slnx", serialized, StringComparison.Ordinal);
         Assert.Contains("tests", serialized, StringComparison.Ordinal);
-        Assert.Contains("selectedEvidencePaths", serialized, StringComparison.Ordinal);
+        Assert.Contains("allowedExistingAffectedPaths", serialized, StringComparison.Ordinal);
         Assert.DoesNotContain("src/NotSelected.cs", serialized, StringComparison.Ordinal);
         Assert.DoesNotContain("declaredSymbols", serialized, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("fullHeadSha", serialized, StringComparison.OrdinalIgnoreCase);

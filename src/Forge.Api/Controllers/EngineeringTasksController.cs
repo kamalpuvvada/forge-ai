@@ -87,6 +87,16 @@ public sealed class EngineeringTasksController(EngineeringTaskService service) :
         return Ok(EngineeringTaskResponse.FromDomain(task));
     }
 
+    [HttpPost("{id:guid}/evidence-refresh")]
+    [ProducesResponseType<EngineeringTaskResponse>(StatusCodes.Status200OK)]
+    [ProducesResponseType<ProblemDetails>(StatusCodes.Status409Conflict)]
+    [ProducesResponseType<ProblemDetails>(StatusCodes.Status422UnprocessableEntity)]
+    public async Task<ActionResult<EngineeringTaskResponse>> RefreshEvidence(Guid id, CancellationToken cancellationToken)
+    {
+        var task = await service.RefreshEvidenceAsync(id, cancellationToken);
+        return Ok(EngineeringTaskResponse.FromDomain(task));
+    }
+
     [HttpPost("{id:guid}/plan-revision")]
     [ProducesResponseType<EngineeringTaskResponse>(StatusCodes.Status200OK)]
     [ProducesResponseType<ValidationProblemDetails>(StatusCodes.Status400BadRequest)]
