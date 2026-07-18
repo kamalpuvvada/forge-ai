@@ -9,13 +9,28 @@ export class ForgeApiError extends Error {
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, { ...init, headers: { 'Content-Type': 'application/json', ...init?.headers } })
-  if (!response.ok) {
-    let problem: ProblemDetails | undefined
-    try { problem = (await response.json()) as ProblemDetails } catch { /* Use the status fallback below. */ }
-    const validation = problem?.errors ? Object.values(problem.errors).flat().join(' ') : undefined
-    throw new ForgeApiError(validation || problem?.detail || problem?.title || `Request failed (${response.status}).`, problem?.code)
-  }
+  if (!response.ok) await throwResponseError(response)
   return response.json() as Promise<T>
+}
+
+async function throwResponseError(response: Response): Promise<never> {
+  let problem: ProblemDetails | undefined
+  try { problem = (await response.json()) as ProblemDetails } catch { /* Use the status fallback below. */ }
+  const validation = problem?.errors ? Object.values(problem.errors).flat().join(' ') : undefined
+  throw new ForgeApiError(validation || problem?.detail || problem?.title || `Request failed (${response.status}).`, problem?.code)
+}
+
+export interface TaskPdfDownload { blob: Blob; filename: string }
+
+export function parseSafePdfFilename(contentDisposition: string | null, taskId: string) {
+  const fallback = `forge-task-${taskId}.pdf`
+  if (!contentDisposition) return fallback
+  const encoded = /filename\*=UTF-8''([^;]+)/i.exec(contentDisposition)?.[1]
+  const plain = /filename\s*=\s*"?([^";]+)"?/i.exec(contentDisposition)?.[1]
+  let candidate = encoded ?? plain
+  if (!candidate) return fallback
+  try { candidate = decodeURIComponent(candidate.trim()) } catch { return fallback }
+  return /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.pdf$/i.test(candidate) ? candidate : fallback
 }
 
 export const forgeApi = {
@@ -29,5 +44,13 @@ export const forgeApi = {
   createPlan: (id: string) => request<EngineeringTask>(`/api/tasks/${id}/plan`, { method: 'POST' }),
   requestPlanRevision: (id: string, correction: string) => request<EngineeringTask>(`/api/tasks/${id}/plan-revision`, { method: 'POST', body: JSON.stringify({ correction }) }),
   approvePlan: (id: string) => request<EngineeringTask>(`/api/tasks/${id}/plan-approval`, { method: 'POST' }),
+  exportTaskPdf: async (id: string): Promise<TaskPdfDownload> => {
+    const response = await fetch(`/api/tasks/${id}/export/pdf`, { headers: { Accept: 'application/pdf' } })
+    if (!response.ok) await throwResponseError(response)
+    return {
+      blob: await response.blob(),
+      filename: parseSafePdfFilename(response.headers.get('Content-Disposition'), id),
+    }
+  },
   getCapabilities: () => request<SystemCapabilities>('/api/system/capabilities'),
 }

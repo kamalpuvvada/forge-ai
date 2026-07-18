@@ -6,6 +6,11 @@ public enum ModelCallStage
     Planning
 }
 
+public sealed record ModelPricingSnapshot(
+    decimal InputPerMillionUsd,
+    decimal CachedInputPerMillionUsd,
+    decimal OutputPerMillionUsd);
+
 public sealed record ModelCallRecord(
     Guid Id,
     ModelCallStage Stage,
@@ -16,9 +21,10 @@ public sealed record ModelCallRecord(
     DateTimeOffset CompletedAt,
     bool Succeeded,
     string? ProviderResponseId,
-    int InputTokens,
-    int CachedInputTokens,
-    int OutputTokens,
+    int? InputTokens,
+    int? CachedInputTokens,
+    int? OutputTokens,
     int? ReasoningTokens,
-    decimal EstimatedCostUsd,
-    string? FailureCategory);
+    decimal? EstimatedCostUsd,
+    string? FailureCategory,
+    ModelPricingSnapshot? PricingSnapshot = null);

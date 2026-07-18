@@ -18,11 +18,15 @@ export interface ModelCall {
   completedAt: string
   succeeded: boolean
   providerResponseId: string | null
-  inputTokens: number
-  cachedInputTokens: number
-  outputTokens: number
+  inputTokens: number | null
+  cachedInputTokens: number | null
+  uncachedInputTokens: number | null
+  outputTokens: number | null
   reasoningTokens: number | null
-  estimatedCostUsd: number
+  estimatedCostUsd: number | null
+  pricingProvenance: string
+  hasStoredPricingSnapshot: boolean
+  storedPricingSnapshot: { inputPerMillionUsd: number; cachedInputPerMillionUsd: number; outputPerMillionUsd: number } | null
   failureCategory: string | null
 }
 export interface ModelTelemetry {
@@ -31,6 +35,8 @@ export interface ModelTelemetry {
   totalCachedInputTokens: number
   totalOutputTokens: number
   totalEstimatedCostUsd: number
+  costUnavailableCallCount: number
+  isPartialEstimate: boolean
   calls: ModelCall[]
 }
 export interface RepositoryFile { relativePath: string; extension: string; sizeBytes: number; lineCount: number; probableRole: string; isTest: boolean; association: string | null; declaredSymbols: string[] }

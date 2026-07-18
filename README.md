@@ -26,6 +26,7 @@ dotnet build .\ForgeAI.slnx --configuration Release --no-restore
 dotnet test .\ForgeAI.slnx --configuration Release --no-build
 Push-Location .\web\forge-web
 npm ci
+npm test -- --run
 npm run lint
 npm run build
 Pop-Location
@@ -98,7 +99,7 @@ This implementation task did **not** make a live or billable OpenAI request.
 
 ## Token and estimated-cost telemetry
 
-Forge stores call identity, clarification/planning stage, provider/model, reasoning effort, timestamps, outcome, response ID when available, input/cached/output/reasoning tokens, safe failure category, and estimated USD cost. The API returns task totals and the UI separates clarification and planning call counts and planning cost.
+Forge stores call identity, clarification/planning stage, provider/model, reasoning effort, timestamps, outcome, response ID when available, nullable input/cached/output/reasoning tokens, safe failure category, and a nullable estimated USD cost. A stored zero estimate is therefore distinct from a missing estimate. Newly priced calls also retain the exact input, cached-input, and output rates used for their estimate as a per-call pricing snapshot.
 
 Costs are estimates based on configurable per-million-token rates. Cached input is not charged twice:
 
@@ -110,6 +111,8 @@ estimate = uncached input × input rate
 ```
 
 The SDK output-token total already includes reasoning tokens, so reasoning tokens are a breakdown and are not added again.
+
+Cost display is resolved consistently in the task API and PDF export. A valid stored pricing snapshot is authoritative; a legacy stored estimate is preserved when its snapshot is unavailable; an unpriced legacy call may be re-estimated from current model pricing only when all usage is valid; otherwise its cost is unavailable. Totals exclude unavailable calls and identify themselves as partial. All monetary values are estimates, not invoices.
 
 | Model | Input / 1M | Cached input / 1M | Output / 1M |
 |---|---:|---:|---:|
@@ -127,13 +130,24 @@ The SDK output-token total already includes reasoning tokens, so reasoning token
 - `POST /api/tasks/{id}/repository-analysis`
 - `POST /api/tasks/{id}/plan`
 - `POST /api/tasks/{id}/plan-approval`
+- `GET /api/tasks/{id}/export/pdf`
 - `GET /api/system/capabilities`
 
 The capabilities endpoint returns only safe mode/model/feature availability and never returns the API key or a secret-derived value.
 
+The PDF endpoint reads the persisted task without changing it and returns `application/pdf` as an attachment named `forge-task-{taskId}.pdf`. The report includes approved task content, clarification history, model-call usage, per-call pricing provenance, and an estimated total. It omits repository paths, provider payloads, global configuration, keys, and connection details. The frontend offers the download after plan approval, prevents overlapping requests, reports safe failures, and always revokes its temporary object URL.
+
+PDF generation uses PdfPig 0.1.15 (Apache-2.0), registered behind `IEngineeringTaskPdfExporter`. Its Standard 14 font path is deliberately limited to ASCII plus the WinAnsi em dash verified by PDF extraction tests. Common typographic punctuation is otherwise normalized and unsupported Unicode scalars are replaced with `?`. Text is wrapped and paginated rather than clipped.
+
 ## SQLite development schema
 
-The Development API creates the database automatically. Existing databases gain known clarification, snapshot, evidence, plan, fingerprint, and planning-timestamp columns through `PRAGMA table_info` and narrowly scoped `ALTER TABLE ADD COLUMN` commands. Legacy approved plans stored as `Implementing` are read as structured `PlanApproved` plans because no implementation artifacts existed in that slice. Snapshot, evidence, and plan payloads are bounded JSON.
+The Development API creates the database automatically. Existing databases gain known clarification, snapshot, evidence, plan, fingerprint, and planning-timestamp columns through `PRAGMA table_info` and narrowly scoped `ALTER TABLE ADD COLUMN` commands. Model calls are already stored as a bounded JSON payload, so nullable estimates and per-call pricing snapshots are additive JSON properties: legacy payloads load without rewriting or inventing historical rates, while newly saved calls round-trip the exact snapshot. Legacy approved plans stored as `Implementing` are read as structured `PlanApproved` plans because no implementation artifacts existed in that slice. Snapshot, evidence, model-call, and plan payloads are bounded JSON.
+
+Microsoft.Data.Sqlite remains on the .NET 8 servicing line at 8.0.22. Forge explicitly selects the coherent SQLitePCLRaw `bundle_e_sqlite3` 2.1.12 package set, which resolves to the patched SQLite 3.53.3 native runtime; a focused test opens a temporary database and verifies `select sqlite_version()` remains at or above the advisory-safe minimum.
+
+## Manual PDF validation
+
+Run the API and frontend in Fake mode as described above. Complete clarification, approve the requirement, analyze the repository, create and approve a plan, then choose **Download task PDF**. Confirm the browser downloads a `forge-task-{taskId}.pdf`, open it, and inspect the requirement, clarification, status, and model-call/cost sections. Fake mode deliberately records no billable model calls, so pricing-provenance scenarios are covered by automated tests.
 
 After stopping the API, reset local data with:
 
