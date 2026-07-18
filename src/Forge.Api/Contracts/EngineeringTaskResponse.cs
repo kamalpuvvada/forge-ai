@@ -3,6 +3,23 @@ using Forge.Infrastructure;
 
 namespace Forge.Api.Contracts;
 
+public sealed record EngineeringTaskSummaryResponse(
+    Guid Id,
+    WorkflowStatus Status,
+    DateTimeOffset CreatedAt,
+    DateTimeOffset UpdatedAt,
+    string Repository,
+    string OriginalRequirementPreview)
+{
+    public static EngineeringTaskSummaryResponse FromDomain(EngineeringTaskSummary summary) => new(
+        summary.Id,
+        summary.Status,
+        summary.CreatedAt,
+        summary.UpdatedAt,
+        summary.Repository,
+        summary.OriginalRequirementPreview);
+}
+
 public sealed record ClarificationAnswerResponse(string Question, string Answer, DateTimeOffset AnsweredAt);
 public sealed record RequirementRevisionResponse(string Correction, string PreviousSummary, DateTimeOffset SubmittedAt);
 public sealed record PlanRevisionResponse(

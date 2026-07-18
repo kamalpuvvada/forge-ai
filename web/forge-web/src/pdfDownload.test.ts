@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { ForgeApiError, forgeApi } from './api'
-import { createTaskPdfDownloader, downloadTaskPdf, exportErrorMessage } from './pdfDownload'
+import { createPlanPdfDownloader, createTaskPdfDownloader, downloadPlanPdf, downloadTaskPdf, exportErrorMessage } from './pdfDownload'
 
 describe('task PDF browser download', () => {
   afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals() })
@@ -46,5 +46,32 @@ describe('task PDF browser download', () => {
       .toBe('The server could not generate this PDF.')
     expect(exportErrorMessage(new Error('sensitive browser detail'))).toBe('The PDF export could not be completed.')
     expect(exportErrorMessage({ secret: 'hidden' })).toBe('The PDF export could not be completed.')
+  })
+
+  it('downloads the distinct proposed or approved plan PDF and cleans up the object URL', async () => {
+    vi.spyOn(forgeApi, 'exportPlanPdf').mockResolvedValue({ blob: new Blob(['plan']), filename: 'forge-plan-abc.pdf' })
+    const anchor = { href: '', download: '', style: { display: '' }, click: vi.fn(), remove: vi.fn() }
+    vi.stubGlobal('document', { createElement: vi.fn(() => anchor), body: { appendChild: vi.fn() } })
+    const revokeObjectURL = vi.fn()
+    vi.stubGlobal('URL', { createObjectURL: vi.fn(() => 'blob:plan'), revokeObjectURL })
+
+    await downloadPlanPdf('abc')
+
+    expect(anchor.download).toBe('forge-plan-abc.pdf')
+    expect(anchor.click).toHaveBeenCalledOnce()
+    expect(revokeObjectURL).toHaveBeenCalledWith('blob:plan')
+  })
+
+  it('prevents overlapping plan downloads', async () => {
+    let release!: () => void
+    const pending = new Promise<void>(resolve => { release = resolve })
+    const download = vi.fn(() => pending)
+    const controller = createPlanPdfDownloader(download)
+    const first = controller.run('abc')
+
+    await expect(controller.run('abc')).resolves.toBe(false)
+    release()
+    await expect(first).resolves.toBe(true)
+    expect(download).toHaveBeenCalledOnce()
   })
 })

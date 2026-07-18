@@ -10,8 +10,18 @@ namespace Forge.Api.Controllers;
 public sealed class EngineeringTasksController(
     EngineeringTaskService service,
     ModelCostResolver costResolver,
-    IEngineeringTaskPdfExporter pdfExporter) : ControllerBase
+    IEngineeringTaskPdfExporter pdfExporter,
+    IImplementationPlanPdfExporter planPdfExporter) : ControllerBase
 {
+    [HttpGet]
+    [ProducesResponseType<IReadOnlyList<EngineeringTaskSummaryResponse>>(StatusCodes.Status200OK)]
+    public async Task<ActionResult<IReadOnlyList<EngineeringTaskSummaryResponse>>> ListRecent(
+        CancellationToken cancellationToken)
+    {
+        var summaries = await service.ListRecentAsync(cancellationToken);
+        return Ok(summaries.Select(EngineeringTaskSummaryResponse.FromDomain).ToArray());
+    }
+
     [HttpPost]
     [ProducesResponseType<EngineeringTaskResponse>(StatusCodes.Status201Created)]
     [ProducesResponseType<ValidationProblemDetails>(StatusCodes.Status400BadRequest)]
@@ -44,6 +54,19 @@ public sealed class EngineeringTasksController(
             ?? throw new KeyNotFoundException($"Engineering task '{id}' was not found.");
         var bytes = pdfExporter.Export(task);
         return File(bytes, "application/pdf", $"forge-task-{task.Id:D}.pdf");
+    }
+
+    [HttpGet("{id:guid}/export/plan-pdf")]
+    [Produces("application/pdf")]
+    [ProducesResponseType<FileContentResult>(StatusCodes.Status200OK)]
+    [ProducesResponseType<ProblemDetails>(StatusCodes.Status404NotFound)]
+    [ProducesResponseType<ProblemDetails>(StatusCodes.Status409Conflict)]
+    public async Task<IActionResult> ExportPlanPdf(Guid id, CancellationToken cancellationToken)
+    {
+        var task = await service.GetAsync(id, cancellationToken)
+            ?? throw new KeyNotFoundException($"Engineering task '{id}' was not found.");
+        var bytes = planPdfExporter.Export(task);
+        return File(bytes, "application/pdf", $"forge-plan-{task.Id:D}.pdf");
     }
 
     [HttpPost("{id:guid}/answers")]

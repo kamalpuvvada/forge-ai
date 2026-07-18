@@ -123,6 +123,7 @@ Cost display is resolved consistently in the task API and PDF export. A valid st
 ## API
 
 - `POST /api/tasks`
+- `GET /api/tasks` (up to 50 lightweight summaries, most recently updated first)
 - `GET /api/tasks/{id}`
 - `POST /api/tasks/{id}/answers`
 - `POST /api/tasks/{id}/requirement-revision`
@@ -131,11 +132,14 @@ Cost display is resolved consistently in the task API and PDF export. A valid st
 - `POST /api/tasks/{id}/plan`
 - `POST /api/tasks/{id}/plan-approval`
 - `GET /api/tasks/{id}/export/pdf`
+- `GET /api/tasks/{id}/export/plan-pdf`
 - `GET /api/system/capabilities`
 
 The capabilities endpoint returns only safe mode/model/feature availability and never returns the API key or a secret-derived value.
 
 The PDF endpoint reads the persisted task without changing it and returns `application/pdf` as an attachment named `forge-task-{taskId}.pdf`. The report includes approved task content, clarification history, model-call usage, per-call pricing provenance, and an estimated total. It omits repository paths, provider payloads, global configuration, keys, and connection details. The frontend offers the download after plan approval, prevents overlapping requests, reports safe failures, and always revokes its temporary object URL.
+
+The separate plan-PDF endpoint is available only for a complete persisted plan in `AwaitingPlanApproval` or `PlanApproved`. It returns `forge-plan-{taskId}.pdf` and derives its exact `PROPOSED PLAN — NOT APPROVED` or `APPROVED PLAN` label from persisted workflow state. Proposed validations are always marked `NOT EXECUTED`. The frontend uses `/?task={taskId}` as its canonical native deep link; history selection, refresh, Back, and Forward reopen the existing immutable task through the detail endpoint.
 
 PDF generation uses PdfPig 0.1.15 (Apache-2.0), registered behind `IEngineeringTaskPdfExporter`. Its Standard 14 font path is deliberately limited to ASCII plus the WinAnsi em dash verified by PDF extraction tests. Common typographic punctuation is otherwise normalized and unsupported Unicode scalars are replaced with `?`. Text is wrapped and paginated rather than clipped.
 

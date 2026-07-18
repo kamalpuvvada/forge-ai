@@ -6,6 +6,18 @@ namespace Forge.Core.Tests;
 public sealed class EngineeringTaskServiceTests
 {
     [Fact]
+    public async Task Recent_history_service_enforces_the_fixed_maximum()
+    {
+        var repository = new InMemoryRepository();
+        var service = new EngineeringTaskService(repository,
+            new ScriptedEngine(ClarificationEvaluation.Summarize("unused")), TimeProvider.System);
+
+        await service.ListRecentAsync();
+
+        Assert.Equal(EngineeringTaskService.MaximumRecentTasks, repository.LastMaximumCount);
+    }
+
+    [Fact]
     public async Task Complete_requirement_can_be_summarized_immediately()
     {
         var service = CreateService(new ScriptedEngine(ClarificationEvaluation.Summarize("Ready now")));
@@ -356,6 +368,17 @@ public sealed class EngineeringTaskServiceTests
     private sealed class InMemoryRepository : IEngineeringTaskRepository
     {
         private readonly Dictionary<Guid, EngineeringTask> _tasks = [];
+        public int? LastMaximumCount { get; private set; }
+        public Task<IReadOnlyList<EngineeringTaskSummary>> ListRecentAsync(int maximumCount, CancellationToken cancellationToken = default)
+        {
+            LastMaximumCount = maximumCount;
+            return Task.FromResult<IReadOnlyList<EngineeringTaskSummary>>(_tasks.Values
+                .OrderByDescending(task => task.UpdatedAt)
+                .Take(maximumCount)
+                .Select(task => new EngineeringTaskSummary(
+                    task.Id, task.Status, task.CreatedAt, task.UpdatedAt, task.Repository, task.OriginalRequirement))
+                .ToArray());
+        }
         public Task<EngineeringTask?> GetAsync(Guid id, CancellationToken cancellationToken = default) =>
             Task.FromResult(_tasks.GetValueOrDefault(id));
         public Task SaveAsync(EngineeringTask task, CancellationToken cancellationToken = default)

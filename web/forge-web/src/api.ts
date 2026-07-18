@@ -1,4 +1,4 @@
-import type { EngineeringTask, SystemCapabilities } from './types'
+import type { EngineeringTask, EngineeringTaskSummary, SystemCapabilities } from './types'
 
 interface ProblemDetails { title?: string; detail?: string; code?: string; errors?: Record<string, string[]> }
 
@@ -22,8 +22,8 @@ async function throwResponseError(response: Response): Promise<never> {
 
 export interface TaskPdfDownload { blob: Blob; filename: string }
 
-export function parseSafePdfFilename(contentDisposition: string | null, taskId: string) {
-  const fallback = `forge-task-${taskId}.pdf`
+export function parseSafePdfFilename(contentDisposition: string | null, taskId: string, documentType: 'task' | 'plan' = 'task') {
+  const fallback = `forge-${documentType}-${taskId}.pdf`
   if (!contentDisposition) return fallback
   const encoded = /filename\*=UTF-8''([^;]+)/i.exec(contentDisposition)?.[1]
   const plain = /filename\s*=\s*"?([^";]+)"?/i.exec(contentDisposition)?.[1]
@@ -34,6 +34,7 @@ export function parseSafePdfFilename(contentDisposition: string | null, taskId: 
 }
 
 export const forgeApi = {
+  listTasks: () => request<EngineeringTaskSummary[]>('/api/tasks'),
   getTask: (id: string) => request<EngineeringTask>(`/api/tasks/${id}`),
   createTask: (repository: string, requirement: string) => request<EngineeringTask>('/api/tasks', { method: 'POST', body: JSON.stringify({ repository, requirement }) }),
   answerQuestion: (id: string, answer: string) => request<EngineeringTask>(`/api/tasks/${id}/answers`, { method: 'POST', body: JSON.stringify({ answer }) }),
@@ -50,6 +51,14 @@ export const forgeApi = {
     return {
       blob: await response.blob(),
       filename: parseSafePdfFilename(response.headers.get('Content-Disposition'), id),
+    }
+  },
+  exportPlanPdf: async (id: string): Promise<TaskPdfDownload> => {
+    const response = await fetch(`/api/tasks/${id}/export/plan-pdf`, { headers: { Accept: 'application/pdf' } })
+    if (!response.ok) await throwResponseError(response)
+    return {
+      blob: await response.blob(),
+      filename: parseSafePdfFilename(response.headers.get('Content-Disposition'), id, 'plan'),
     }
   },
   getCapabilities: () => request<SystemCapabilities>('/api/system/capabilities'),

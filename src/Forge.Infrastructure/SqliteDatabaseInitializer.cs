@@ -57,6 +57,7 @@ public sealed class SqliteDatabaseInitializer(string connectionString)
         await EnsureColumnAsync(connection, "RepositoryAnalyzedAt", "TEXT NULL", cancellationToken);
         await EnsureColumnAsync(connection, "RepositoryFingerprint", "TEXT NULL", cancellationToken);
         await EnsureColumnAsync(connection, "PlanCreatedAt", "TEXT NULL", cancellationToken);
+        await EnsureIndexAsync(connection, cancellationToken);
     }
 
     private static async Task EnsureColumnAsync(
@@ -77,5 +78,15 @@ public sealed class SqliteDatabaseInitializer(string connectionString)
         await using var alter = connection.CreateCommand();
         alter.CommandText = $"ALTER TABLE EngineeringTasks ADD COLUMN {columnName} {columnDefinition};";
         await alter.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    private static async Task EnsureIndexAsync(SqliteConnection connection, CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            CREATE INDEX IF NOT EXISTS IX_EngineeringTasks_UpdatedAt_Id
+            ON EngineeringTasks (UpdatedAt DESC, Id ASC);
+            """;
+        await command.ExecuteNonQueryAsync(cancellationToken);
     }
 }

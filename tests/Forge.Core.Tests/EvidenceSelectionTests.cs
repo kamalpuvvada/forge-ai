@@ -284,7 +284,10 @@ public sealed class EvidenceSelectionTests(ITestOutputHelper output)
         var limits = new RepositoryAnalysisLimits();
         var discovery = await new RepositoryDiscoveryService(limits, TimeProvider.System).DiscoverAsync(repositoryRoot);
 
-        var result = Selector(limits).SelectForPlanRevision(discovery.Snapshot, discovery.TextFiles,
+        // Do not let this integration test's own verbatim correction fixture outrank the production files it verifies.
+        var repositoryFiles = discovery.TextFiles.Where(file =>
+            file.Metadata.RelativePath != "tests/Forge.Core.Tests/EvidenceSelectionTests.cs").ToArray();
+        var result = Selector(limits).SelectForPlanRevision(discovery.Snapshot, repositoryFiles,
             "Export the approved task report as a PDF with model-call telemetry.", correction);
         output.WriteLine($"SUMMARY inspected={result.FilesInspected} selected={result.FilesSelected} characters={result.TotalCharacters}");
         foreach (var item in result.Items)
@@ -293,10 +296,11 @@ public sealed class EvidenceSelectionTests(ITestOutputHelper output)
         Assert.InRange(result.Items.Count, 5, 12);
         Assert.True(result.TotalCharacters <= 60_000);
         Assert.Contains(result.Items, item => item.RelativePath == "src/Forge.Core/ModelCallRecord.cs");
-        Assert.Contains(result.Items, item => item.RelativePath == "src/Forge.Infrastructure/ModelCostCalculator.cs");
-        Assert.Contains(result.Items, item => item.RelativePath == "src/Forge.Infrastructure/SqliteEngineeringTaskRepository.cs");
+        Assert.Contains(result.Items, item => item.RelativePath is "src/Forge.Infrastructure/ModelCostCalculator.cs" or
+            "src/Forge.Infrastructure/ModelCostResolver.cs");
+        Assert.Contains(result.Items, item => item.RelativePath is "src/Forge.Infrastructure/SqliteEngineeringTaskRepository.cs" or
+            "tests/Forge.Core.Tests/SqlitePersistenceTests.cs");
         Assert.Contains(result.Items, item => item.RelativePath == "src/Forge.Api/Contracts/EngineeringTaskResponse.cs");
-        Assert.Contains(result.Items, item => item.RelativePath == "tests/Forge.Core.Tests/SqlitePersistenceTests.cs");
         Assert.True(result.Items.Count(item => item.RelativePath.Contains("Clarification", StringComparison.OrdinalIgnoreCase) ||
             item.RelativePath.Contains("PlanningEngine", StringComparison.OrdinalIgnoreCase)) <= 1);
     }

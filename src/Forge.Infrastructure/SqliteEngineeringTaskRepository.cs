@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Text;
 using System.Text.Json;
 using Forge.Core;
 using Microsoft.Data.Sqlite;
@@ -8,6 +9,43 @@ namespace Forge.Infrastructure;
 public sealed class SqliteEngineeringTaskRepository(string connectionString) : IEngineeringTaskRepository
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
+    private const int MaximumHistoryCount = 50;
+    private const int MaximumPreviewLength = 160;
+    private const int MaximumPreviewContentLength = MaximumPreviewLength - 1;
+
+    public async Task<IReadOnlyList<EngineeringTaskSummary>> ListRecentAsync(
+        int maximumCount,
+        CancellationToken cancellationToken = default)
+    {
+        if (maximumCount is < 1 or > MaximumHistoryCount)
+            throw new ArgumentOutOfRangeException(nameof(maximumCount), $"Task history must request between 1 and {MaximumHistoryCount} items.");
+
+        await using var connection = new SqliteConnection(connectionString);
+        await connection.OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT Id, Status, CreatedAt, UpdatedAt, Repository,
+                   substr(OriginalRequirement, 1, $previewReadLength) AS OriginalRequirementPreview
+            FROM EngineeringTasks
+            ORDER BY UpdatedAt DESC, Id ASC
+            LIMIT $maximumCount;
+            """;
+        command.Parameters.AddWithValue("$previewReadLength", MaximumPreviewLength + 1);
+        command.Parameters.AddWithValue("$maximumCount", maximumCount);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        var summaries = new List<EngineeringTaskSummary>();
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            summaries.Add(new EngineeringTaskSummary(
+                Guid.Parse(reader.GetString(0)),
+                Enum.Parse<WorkflowStatus>(reader.GetString(1)),
+                ParseDate(reader.GetString(2)),
+                ParseDate(reader.GetString(3)),
+                reader.GetString(4),
+                CreatePreview(reader.GetString(5))));
+        }
+        return summaries;
+    }
 
     public async Task<EngineeringTask?> GetAsync(Guid id, CancellationToken cancellationToken = default)
     {
@@ -185,4 +223,28 @@ public sealed class SqliteEngineeringTaskRepository(string connectionString) : I
 
     private static string FormatDate(DateTimeOffset date) => date.ToString("O", CultureInfo.InvariantCulture);
     private static DateTimeOffset ParseDate(string date) => DateTimeOffset.Parse(date, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind);
+    private static string CreatePreview(string value)
+    {
+        var normalized = string.Join(' ', value.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
+        return normalized.Length <= MaximumPreviewLength
+            ? normalized
+            : $"{TruncateOnRuneBoundary(normalized, MaximumPreviewContentLength)}\u2026";
+    }
+
+    private static string TruncateOnRuneBoundary(string value, int maximumLength)
+    {
+        if (value.Length <= maximumLength) return value;
+
+        var boundary = 0;
+        foreach (var rune in value.EnumerateRunes())
+        {
+            var nextBoundary = boundary + rune.Utf16SequenceLength;
+            if (nextBoundary > maximumLength) break;
+            boundary = nextBoundary;
+        }
+
+        return boundary == 0
+            ? string.Empty
+            : value[..boundary];
+    }
 }

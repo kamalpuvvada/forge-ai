@@ -1,7 +1,7 @@
 import { ForgeApiError, forgeApi } from './api'
 
-export async function downloadTaskPdf(taskId: string) {
-  const download = await forgeApi.exportTaskPdf(taskId)
+async function downloadPdf(taskId: string, exportPdf: (id: string) => ReturnType<typeof forgeApi.exportTaskPdf>) {
+  const download = await exportPdf(taskId)
   const objectUrl = URL.createObjectURL(download.blob)
   const anchor = document.createElement('a')
   try {
@@ -15,6 +15,9 @@ export async function downloadTaskPdf(taskId: string) {
     URL.revokeObjectURL(objectUrl)
   }
 }
+
+export function downloadTaskPdf(taskId: string) { return downloadPdf(taskId, forgeApi.exportTaskPdf) }
+export function downloadPlanPdf(taskId: string) { return downloadPdf(taskId, forgeApi.exportPlanPdf) }
 
 export function createTaskPdfDownloader(download: (taskId: string) => Promise<void> = downloadTaskPdf) {
   let active = false
@@ -31,6 +34,10 @@ export function createTaskPdfDownloader(download: (taskId: string) => Promise<vo
       }
     },
   }
+}
+
+export function createPlanPdfDownloader(download: (taskId: string) => Promise<void> = downloadPlanPdf) {
+  return createTaskPdfDownloader(download)
 }
 
 export function exportErrorMessage(error: unknown) {
