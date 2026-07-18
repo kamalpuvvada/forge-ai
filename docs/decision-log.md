@@ -41,3 +41,33 @@
 **Decision:** Use `Microsoft.Data.Sqlite` directly rather than introducing an ORM in the first slice.  
 **Reason:** One aggregate and one table do not justify broader ORM and migration complexity.  
 **Trade-off:** SQL and rehydration are maintained manually; revisit if the persisted model expands materially.
+
+## 008 — Async clarification decision boundary
+
+**Decision:** `IClarificationEngine` is cancellation-aware and returns one validated ask-or-summarize decision.
+**Reason:** Requirements may already be complete, and provider work is asynchronous. Purpose-specific domain methods replace the general transition escape hatch.
+**Trade-off:** Adapters cannot return partial or ambiguous results.
+
+## 009 — Official Responses SDK behind a protocol boundary
+
+**Decision:** Use official `OpenAI` 2.12.0 Responses types in `SdkOpenAIResponsesGateway`, with the clarification engine depending on a narrow normalized gateway.
+**Reason:** Production code compiles against official SDK types while automated tests stay deterministic and non-billable. The Responses SDK surface is currently experimental, so isolation reduces change impact.
+**Trade-off:** The mapping layer must be updated if that experimental surface changes.
+
+## 010 — Strict structured clarification output
+
+**Decision:** Request strict JSON Schema and validate the ask/summarize combination after deserialization.
+**Reason:** Malformed, both, or neither decisions must never become workflow facts.
+**Trade-off:** Readable but schema-invalid output is rejected instead of guessed or repaired.
+
+## 011 — No silent provider fallback
+
+**Decision:** Fake and OpenAI modes are explicit; OpenAI failures never invoke Fake logic.
+**Reason:** A fabricated fallback would conceal cost, availability, and trust failures.
+**Trade-off:** OpenAI-mode demonstrations stop visibly when configuration or the provider fails.
+
+## 012 — Persist telemetry with additive development migration
+
+**Decision:** Store revision notes and compact model-call records as JSON columns, adding missing columns through SQLite schema inspection.
+**Reason:** Existing local databases remain usable without a full migration framework for this competition slice.
+**Trade-off:** JSON columns are less queryable than normalized tables and should be revisited if reporting expands.

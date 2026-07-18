@@ -1,4 +1,4 @@
-import type { EngineeringTask } from './types'
+import type { EngineeringTask, SystemCapabilities } from './types'
 
 interface ProblemDetails { title?: string; detail?: string; errors?: Record<string, string[]> }
 
@@ -16,5 +16,7 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
 export const forgeApi = {
   createTask: (repository: string, requirement: string) => request<EngineeringTask>('/api/tasks', { method: 'POST', body: JSON.stringify({ repository, requirement }) }),
   answerQuestion: (id: string, answer: string) => request<EngineeringTask>(`/api/tasks/${id}/answers`, { method: 'POST', body: JSON.stringify({ answer }) }),
+  requestRevision: (id: string, correction: string) => request<EngineeringTask>(`/api/tasks/${id}/requirement-revision`, { method: 'POST', body: JSON.stringify({ correction }) }),
   approveRequirement: (id: string) => request<EngineeringTask>(`/api/tasks/${id}/requirement-approval`, { method: 'POST' }),
+  getCapabilities: () => request<SystemCapabilities>('/api/system/capabilities'),
 }

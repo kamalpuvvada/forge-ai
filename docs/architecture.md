@@ -1,90 +1,111 @@
 # Architecture
 
-## Components and responsibilities
+## Components and dependency direction
 
-- **Forge.Core** contains the `EngineeringTask` aggregate, workflow state machine, clarification contracts, repository port, and application service. It has no project dependencies.
-- **Forge.Infrastructure** contains the development-only `FakeClarificationEngine`, SQLite repository, and development database bootstrap.
-- **Forge.Api** composes the application and exposes REST DTOs for creating, reading, answering, and approving tasks. Swagger is enabled in Development.
-- **forge-web** is a React client that renders the current state and communicates only through REST.
-
-Dependency direction is `Web → HTTP API → Core ports ← Infrastructure adapters`. Core never references Infrastructure or API.
+- **Forge.Core** owns the `EngineeringTask` aggregate, purpose-specific workflow operations, async clarification contract, correction notes, model-call records, and application service. It has no project dependencies.
+- **Forge.Infrastructure** implements Core ports with SQLite, deterministic Fake clarification, configurable pricing, and an OpenAI clarification adapter.
+- **Forge.Api** selects Fake or OpenAI mode, exposes REST DTOs and safe capabilities, and maps exceptions to RFC-compatible Problem Details.
+- **forge-web** renders one current action, correction/revision history, capabilities, and live task telemetry through REST.
 
 ```mermaid
 flowchart LR
     User[Developer] --> Web[React + Vite]
     Web -->|REST DTOs| Api[ASP.NET Core API]
     Api --> Service[EngineeringTaskService]
-    Service --> Domain[EngineeringTask aggregate]
-    Service --> Engine[IClarificationEngine]
+    Service --> Domain[EngineeringTask]
+    Service --> Port[IClarificationEngine]
     Service --> Repo[IEngineeringTaskRepository]
-    Fake[FakeClarificationEngine\nDevelopment only] --> Engine
-    Sqlite[SQLite adapter] --> Repo
-    Sqlite --> Db[(forge.db)]
+    Fake[FakeClarificationEngine] --> Port
+    OpenAIEngine[OpenAIClarificationEngine] --> Port
+    OpenAIEngine --> Gateway[IOpenAIResponsesGateway]
+    Gateway --> SDK[Official OpenAI 2.12.0\nResponsesClient]
+    RepoAdapter[SQLite adapter] --> Repo
+    RepoAdapter --> DB[(forge.db)]
 ```
 
-## Workflow state machine
+Dependencies point inward: API and Infrastructure depend on Core; Core knows neither. Official SDK types remain inside `SdkOpenAIResponsesGateway`. The `IOpenAIResponsesGateway` normalization boundary permits non-billable adapter tests.
 
-Invalid state changes throw `WorkflowException` in domain code. The current slice ends at `ReadyForPlanning`; later states exist so their order is explicit, not to imply their functionality is present.
+## Clarification state and correction flow
+
+The aggregate has no public general-purpose state transition. Application callers use explicit operations to apply an evaluation, answer the current question, request a summary revision, record a model call, or approve a summary.
 
 ```mermaid
 stateDiagram-v2
     [*] --> Draft
-    Draft --> Clarifying
-    Clarifying --> RequirementSummaryReady
-    RequirementSummaryReady --> AwaitingRequirementApproval
+    Draft --> Clarifying: evaluation asks one question
+    Draft --> AwaitingRequirementApproval: evaluation summarizes immediately
+    Clarifying --> Clarifying: answer then evaluation asks one question
+    Clarifying --> AwaitingRequirementApproval: evaluation summarizes
+    AwaitingRequirementApproval --> Clarifying: correction note
+    Clarifying --> AwaitingRequirementApproval: corrected summary
     AwaitingRequirementApproval --> ReadyForPlanning: explicit approval
     ReadyForPlanning --> Planning
     Planning --> AwaitingPlanApproval
-    AwaitingPlanApproval --> Implementing: explicit approval
+    AwaitingPlanApproval --> Implementing
     Implementing --> Validating
     Validating --> Reviewing
     Reviewing --> Completed
-    Draft --> Failed
-    Clarifying --> Failed
-    RequirementSummaryReady --> Failed
-    AwaitingRequirementApproval --> Failed
-    ReadyForPlanning --> Failed
-    Planning --> Failed
-    AwaitingPlanApproval --> Failed
-    Implementing --> Failed
-    Validating --> Failed
-    Reviewing --> Failed
 ```
 
-## Current clarification sequence
+Correction is permitted only while awaiting requirement approval. The correction record retains its timestamp and previous summary; previous clarification answers remain unchanged. The current summary is cleared before reevaluation and the revised summary requires another explicit approval.
+
+## OpenAI structured-output boundary
+
+OpenAI mode uses `gpt-5.6-terra`, low reasoning effort, and a bounded 800-token output through the Responses API. `CreateResponseOptions.TextOptions` specifies `ResponseTextFormat.CreateJsonSchemaFormat(..., jsonSchemaIsStrict: true)`. The schema contains:
+
+- `decision`: `ask` or `summarize`;
+- nullable `question` and `summary`;
+- arrays for known facts, assumptions, and unresolved gaps.
+
+After deserialization the adapter independently enforces:
+
+- ask: one non-empty question and no summary;
+- summarize: one non-empty summary and no question.
+
+Malformed, both, neither, and unknown decisions are provider failures. Forge never free-form parses or silently invokes Fake mode.
+
+The developer instruction prefix is stable. Each turn reconstructs one compact JSON context containing only the repository identifier, original requirement, previous question/answer pairs, and correction notes. Repository content is never implied. `previous_response_id` is intentionally unused.
 
 ```mermaid
 sequenceDiagram
     actor Developer
-    participant Web
     participant API
     participant Service
-    participant Fake as FakeClarificationEngine
+    participant Engine as IClarificationEngine
+    participant Provider as Responses API / Fake
     participant DB as SQLite
-    Developer->>Web: Repository + requirement
-    Web->>API: POST /api/tasks
-    API->>Service: Create task
-    Service->>Fake: Evaluate task
-    Fake-->>Service: One question
-    Service->>DB: Persist aggregate
-    API-->>Web: Task DTO
-    loop One question per turn
-        Developer->>Web: Answer current question
-        Web->>API: POST /api/tasks/{id}/answers
-        API->>Service: Save answer and evaluate
-        Service->>Fake: Evaluate preserved context
-        Fake-->>Service: Next question or summary
-        Service->>DB: Persist aggregate
-        API-->>Web: Updated task DTO
-    end
-    Developer->>Web: Approve summary
-    Web->>API: POST /api/tasks/{id}/requirement-approval
-    Service->>DB: Persist ReadyForPlanning
-    API-->>Web: Approved task DTO
+    Developer->>API: create, answer, or correction
+    API->>Service: validated command + cancellation token
+    Service->>Engine: EvaluateAsync(canonical task context)
+    Engine->>Provider: one bounded evaluation
+    Provider-->>Engine: ask OR summarize
+    Engine-->>Service: validated decision + optional call telemetry
+    Service->>DB: persist task atomically
+    Service-->>API: current task DTO
+    API-->>Developer: one question or current summary
 ```
 
-## Integration boundaries
+## Telemetry and estimated cost
 
-`IClarificationEngine` is the replacement point for a future OpenAI adapter. That adapter will return one prioritized question or a grounded summary, plus recorded model-call metadata; it must not bypass domain gates.
+Each real provider attempt records call ID, clarification stage, provider, model, reasoning effort, timestamps, success, response ID, input/cached/output/reasoning tokens, estimated cost, and a non-sensitive failure category. Fake mode produces no model-call record.
 
-Repository discovery, relevant-file retrieval, deterministic search, builds, tests, and diff inspection will be introduced behind focused tool interfaces. Planning must cite retrieved files and evidence. Target-repository mutation remains prohibited until both requirement and plan approval are stored.
+The estimate subtracts cached tokens from total input, prices uncached and cached input separately, then adds output pricing. Output already contains reasoning tokens, so reasoning usage is not double-counted. Rates are bound from `Forge:AI:Pricing`.
+
+## Persistence compatibility
+
+`EngineeringTasks` retains the first-slice columns and adds:
+
+- `RequirementRevisionNotes TEXT NOT NULL DEFAULT '[]'`
+- `ModelCalls TEXT NOT NULL DEFAULT '[]'`
+
+Development startup uses `PRAGMA table_info(EngineeringTasks)` and adds only missing known columns. Existing databases do not need to be deleted.
+
+## Failure handling and capabilities
+
+Central exception handling maps missing tasks, invalid workflow operations, configuration faults, provider faults, and unexpected failures to safe Problem Details. Provider exception bodies and logs never include credentials or raw responses.
+
+`GET /api/system/capabilities` returns mode, model, reasoning effort, safe configuration readiness, and truthful `false` values for repository inspection and planning. It exposes no key or secret-derived data.
+
+## Current boundaries
+
+Repository scanning, planning, target-repository changes/tests, review, repair, pull-request creation, authentication, production migrations, and live provider validation are not part of this slice.

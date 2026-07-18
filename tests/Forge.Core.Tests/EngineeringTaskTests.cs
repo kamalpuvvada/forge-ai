@@ -1,3 +1,4 @@
+using System.Reflection;
 using Forge.Core;
 
 namespace Forge.Core.Tests;
@@ -7,83 +8,101 @@ public sealed class EngineeringTaskTests
     private static readonly DateTimeOffset Now = new(2026, 7, 18, 10, 0, 0, TimeSpan.Zero);
 
     [Fact]
-    public void Valid_workflow_transitions_reach_ready_for_planning()
+    public void Initial_evaluation_can_produce_summary_without_a_question()
     {
-        var task = EngineeringTask.Create("C:/repo", "Add an audit log", Now);
+        var task = NewTask();
+        task.ApplyClarificationEvaluation(ClarificationEvaluation.Summarize("Complete summary"), Now);
 
-        task.BeginClarification("What should be audited?", Now.AddMinutes(1));
-        task.AnswerCurrentQuestion("All configuration changes", Now.AddMinutes(2));
-        task.PrepareRequirementSummary("Audit all configuration changes.", Now.AddMinutes(3));
-        task.ApproveRequirementSummary(Now.AddMinutes(4));
-
-        Assert.Equal(WorkflowStatus.ReadyForPlanning, task.Status);
-        Assert.Equal(Now.AddMinutes(4), task.RequirementApprovedAt);
+        Assert.Equal(WorkflowStatus.AwaitingRequirementApproval, task.Status);
+        Assert.Equal("Complete summary", task.RequirementSummary);
+        Assert.Null(task.CurrentPendingQuestion);
     }
 
     [Fact]
-    public void Invalid_transition_is_rejected_without_changing_status()
+    public void Incomplete_initial_requirement_exposes_exactly_one_question()
     {
-        var task = EngineeringTask.Create("C:/repo", "Add an audit log", Now);
+        var task = NewTask();
+        task.ApplyClarificationEvaluation(ClarificationEvaluation.Ask("What is required?"), Now);
 
-        var exception = Assert.Throws<WorkflowException>(() =>
-            task.TransitionTo(WorkflowStatus.Implementing, Now.AddMinutes(1)));
-
-        Assert.Contains("Draft", exception.Message);
-        Assert.Equal(WorkflowStatus.Draft, task.Status);
+        Assert.Equal(WorkflowStatus.Clarifying, task.Status);
+        Assert.Equal("What is required?", task.CurrentPendingQuestion);
+        Assert.Null(task.RequirementSummary);
+        Assert.Throws<WorkflowException>(() =>
+            task.ApplyClarificationEvaluation(ClarificationEvaluation.Ask("Another?"), Now));
     }
 
     [Fact]
-    public void A_second_pending_question_is_rejected()
+    public void Earlier_answers_are_preserved()
     {
-        var task = EngineeringTask.Create("C:/repo", "Add an audit log", Now);
-        task.BeginClarification("First question?", Now);
-
-        var exception = Assert.Throws<WorkflowException>(() =>
-            task.AskNextQuestion("Second question?", Now));
-
-        Assert.Contains("one clarification question", exception.Message, StringComparison.OrdinalIgnoreCase);
-        Assert.Equal("First question?", task.CurrentPendingQuestion);
-    }
-
-    [Fact]
-    public void Earlier_answers_are_preserved_when_next_question_is_answered()
-    {
-        var task = EngineeringTask.Create("C:/repo", "Add an audit log", Now);
-        task.BeginClarification("First question?", Now);
+        var task = NewTask();
+        task.ApplyClarificationEvaluation(ClarificationEvaluation.Ask("First?"), Now);
         task.AnswerCurrentQuestion("First answer", Now.AddMinutes(1));
-        task.AskNextQuestion("Second question?", Now.AddMinutes(1));
+        task.ApplyClarificationEvaluation(ClarificationEvaluation.Ask("Second?"), Now.AddMinutes(1));
         task.AnswerCurrentQuestion("Second answer", Now.AddMinutes(2));
 
-        Assert.Collection(task.ClarificationAnswers,
-            first => Assert.Equal("First answer", first.Answer),
-            second => Assert.Equal("Second answer", second.Answer));
+        Assert.Equal(["First answer", "Second answer"], task.ClarificationAnswers.Select(x => x.Answer));
         Assert.Contains("First answer", task.CurrentClarifiedRequirement);
         Assert.Contains("Second answer", task.CurrentClarifiedRequirement);
     }
 
     [Fact]
-    public void Requirement_cannot_be_approved_before_summary_is_ready()
+    public void Requirement_revision_is_rejected_outside_approval()
     {
-        var task = EngineeringTask.Create("C:/repo", "Add an audit log", Now);
-        task.BeginClarification("What should be audited?", Now);
-
-        Assert.Throws<WorkflowException>(() => task.ApproveRequirementSummary(Now.AddMinutes(1)));
-        Assert.Null(task.RequirementApprovedAt);
-        Assert.Equal(WorkflowStatus.Clarifying, task.Status);
+        var task = NewTask();
+        Assert.Throws<WorkflowException>(() => task.RequestRequirementRevision("Change scope", Now));
+        Assert.Empty(task.RequirementRevisionNotes);
     }
 
     [Fact]
-    public void Requirement_summary_approval_sets_timestamp_and_advances_once()
+    public void Requirement_revision_rejects_empty_text_without_mutation()
     {
-        var task = EngineeringTask.Create("C:/repo", "Add an audit log", Now);
-        task.BeginClarification("What should be audited?", Now);
-        task.AnswerCurrentQuestion("Configuration", Now.AddMinutes(1));
-        task.PrepareRequirementSummary("Audit configuration.", Now.AddMinutes(2));
+        var task = AwaitingApprovalTask();
+        Assert.Throws<ArgumentException>(() => task.RequestRequirementRevision(" ", Now.AddMinutes(1)));
+        Assert.Equal("Original summary", task.RequirementSummary);
+        Assert.Equal(WorkflowStatus.AwaitingRequirementApproval, task.Status);
+        Assert.Empty(task.RequirementRevisionNotes);
+    }
 
+    [Fact]
+    public void Requirement_revision_clears_current_summary_and_preserves_history()
+    {
+        var task = AwaitingApprovalTask();
+        task.RequestRequirementRevision("Administrators only", Now.AddMinutes(1));
+
+        Assert.Null(task.RequirementSummary);
+        Assert.Equal(WorkflowStatus.Clarifying, task.Status);
+        var note = Assert.Single(task.RequirementRevisionNotes);
+        Assert.Equal("Administrators only", note.Correction);
+        Assert.Equal("Original summary", note.PreviousSummary);
+    }
+
+    [Fact]
+    public void Corrected_summary_still_requires_explicit_approval()
+    {
+        var task = AwaitingApprovalTask();
+        task.RequestRequirementRevision("Administrators only", Now.AddMinutes(1));
+        task.ApplyClarificationEvaluation(ClarificationEvaluation.Summarize("Revised summary"), Now.AddMinutes(2));
+
+        Assert.Null(task.RequirementApprovedAt);
+        Assert.Equal(WorkflowStatus.AwaitingRequirementApproval, task.Status);
         task.ApproveRequirementSummary(Now.AddMinutes(3));
-
-        Assert.Equal(Now.AddMinutes(3), task.RequirementApprovedAt);
         Assert.Equal(WorkflowStatus.ReadyForPlanning, task.Status);
-        Assert.Throws<WorkflowException>(() => task.ApproveRequirementSummary(Now.AddMinutes(4)));
+    }
+
+    [Fact]
+    public void General_state_transition_cannot_be_called_externally()
+    {
+        var publicTransition = typeof(EngineeringTask).GetMethod(
+            "TransitionTo",
+            BindingFlags.Instance | BindingFlags.Public);
+        Assert.Null(publicTransition);
+    }
+
+    private static EngineeringTask NewTask() => EngineeringTask.Create("C:/repo", "Add audit logging", Now);
+    private static EngineeringTask AwaitingApprovalTask()
+    {
+        var task = NewTask();
+        task.ApplyClarificationEvaluation(ClarificationEvaluation.Summarize("Original summary"), Now);
+        return task;
     }
 }

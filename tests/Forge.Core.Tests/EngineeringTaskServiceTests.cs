@@ -5,37 +5,81 @@ namespace Forge.Core.Tests;
 public sealed class EngineeringTaskServiceTests
 {
     [Fact]
-    public async Task Service_exposes_exactly_one_question_and_preserves_each_answer()
+    public async Task Complete_requirement_can_be_summarized_immediately()
     {
-        var repository = new InMemoryRepository();
-        var service = new EngineeringTaskService(repository, new ThreeQuestionEngine(), TimeProvider.System);
-
-        var task = await service.CreateAsync("C:/repo", "Create a health endpoint");
-        Assert.Equal("Question 1?", task.CurrentPendingQuestion);
-
-        task = await service.AnswerAsync(task.Id, "Answer 1");
-        Assert.Equal("Question 2?", task.CurrentPendingQuestion);
-        Assert.Single(task.ClarificationAnswers);
-
-        task = await service.AnswerAsync(task.Id, "Answer 2");
-        Assert.Equal("Question 3?", task.CurrentPendingQuestion);
-
-        task = await service.AnswerAsync(task.Id, "Answer 3");
-        Assert.Null(task.CurrentPendingQuestion);
-        Assert.Equal(3, task.ClarificationAnswers.Count);
+        var service = CreateService(new ScriptedEngine(ClarificationEvaluation.Summarize("Ready now")));
+        var task = await service.CreateAsync("C:/repo", "Complete requirement");
         Assert.Equal(WorkflowStatus.AwaitingRequirementApproval, task.Status);
-        Assert.Equal(["Answer 1", "Answer 2", "Answer 3"], task.ClarificationAnswers.Select(x => x.Answer));
+        Assert.Empty(task.ClarificationAnswers);
     }
 
-    private sealed class ThreeQuestionEngine : IClarificationEngine
+    [Fact]
+    public async Task Correction_can_lead_directly_to_revised_summary()
     {
-        public ClarificationResult Evaluate(EngineeringTask task) => task.ClarificationAnswers.Count switch
+        var engine = new QueueEngine(
+            ClarificationEvaluation.Summarize("Original"),
+            ClarificationEvaluation.Summarize("Revised"));
+        var service = CreateService(engine);
+        var task = await service.CreateAsync("C:/repo", "Requirement");
+
+        task = await service.RequestRevisionAsync(task.Id, "Narrow the scope");
+
+        Assert.Equal("Revised", task.RequirementSummary);
+        Assert.Single(task.RequirementRevisionNotes);
+        Assert.Equal(WorkflowStatus.AwaitingRequirementApproval, task.Status);
+    }
+
+    [Fact]
+    public async Task Correction_can_lead_to_one_new_question()
+    {
+        var engine = new QueueEngine(
+            ClarificationEvaluation.Summarize("Original"),
+            ClarificationEvaluation.Ask("Which administrators?"));
+        var service = CreateService(engine);
+        var task = await service.CreateAsync("C:/repo", "Requirement");
+
+        task = await service.RequestRevisionAsync(task.Id, "Administrators only");
+
+        Assert.Equal("Which administrators?", task.CurrentPendingQuestion);
+        Assert.Null(task.RequirementSummary);
+    }
+
+    [Fact]
+    public async Task Cancellation_token_flows_to_engine()
+    {
+        using var source = new CancellationTokenSource();
+        var engine = new TokenCapturingEngine();
+        var service = CreateService(engine);
+
+        await service.CreateAsync("C:/repo", "Requirement", source.Token);
+
+        Assert.Equal(source.Token, engine.ObservedToken);
+    }
+
+    private static EngineeringTaskService CreateService(IClarificationEngine engine) =>
+        new(new InMemoryRepository(), engine, TimeProvider.System);
+
+    private sealed class ScriptedEngine(ClarificationEvaluation evaluation) : IClarificationEngine
+    {
+        public Task<ClarificationEvaluation> EvaluateAsync(EngineeringTask task, CancellationToken cancellationToken = default) =>
+            Task.FromResult(evaluation);
+    }
+
+    private sealed class QueueEngine(params ClarificationEvaluation[] evaluations) : IClarificationEngine
+    {
+        private readonly Queue<ClarificationEvaluation> _evaluations = new(evaluations);
+        public Task<ClarificationEvaluation> EvaluateAsync(EngineeringTask task, CancellationToken cancellationToken = default) =>
+            Task.FromResult(_evaluations.Dequeue());
+    }
+
+    private sealed class TokenCapturingEngine : IClarificationEngine
+    {
+        public CancellationToken ObservedToken { get; private set; }
+        public Task<ClarificationEvaluation> EvaluateAsync(EngineeringTask task, CancellationToken cancellationToken = default)
         {
-            0 => ClarificationResult.Ask("Question 1?"),
-            1 => ClarificationResult.Ask("Question 2?"),
-            2 => ClarificationResult.Ask("Question 3?"),
-            _ => ClarificationResult.Summarize("Approved scope assembled from all three answers.")
-        };
+            ObservedToken = cancellationToken;
+            return Task.FromResult(ClarificationEvaluation.Summarize("Summary"));
+        }
     }
 
     private sealed class InMemoryRepository : IEngineeringTaskRepository

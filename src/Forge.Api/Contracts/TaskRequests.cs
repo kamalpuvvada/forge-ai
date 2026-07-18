@@ -8,3 +8,6 @@ public sealed record CreateEngineeringTaskRequest(
 
 public sealed record AnswerClarificationRequest(
     [Required, StringLength(5000)] string Answer);
+
+public sealed record RequestRequirementRevisionRequest(
+    [Required, StringLength(5000)] string Correction);

@@ -3,6 +3,8 @@ namespace Forge.Core;
 public sealed class EngineeringTask
 {
     private readonly List<ClarificationAnswer> _clarificationAnswers = [];
+    private readonly List<RequirementRevisionNote> _requirementRevisionNotes = [];
+    private readonly List<ModelCallRecord> _modelCalls = [];
 
     private EngineeringTask() { }
 
@@ -11,6 +13,8 @@ public sealed class EngineeringTask
     public string OriginalRequirement { get; private set; } = string.Empty;
     public string CurrentClarifiedRequirement { get; private set; } = string.Empty;
     public IReadOnlyList<ClarificationAnswer> ClarificationAnswers => _clarificationAnswers;
+    public IReadOnlyList<RequirementRevisionNote> RequirementRevisionNotes => _requirementRevisionNotes;
+    public IReadOnlyList<ModelCallRecord> ModelCalls => _modelCalls;
     public string? CurrentPendingQuestion { get; private set; }
     public string? RequirementSummary { get; private set; }
     public WorkflowStatus Status { get; private set; }
@@ -19,14 +23,10 @@ public sealed class EngineeringTask
     public DateTimeOffset? RequirementApprovedAt { get; private set; }
     public DateTimeOffset? PlanApprovedAt { get; private set; }
 
-    public static EngineeringTask Create(
-        string repository,
-        string requirement,
-        DateTimeOffset now)
+    public static EngineeringTask Create(string repository, string requirement, DateTimeOffset now)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(repository);
         ArgumentException.ThrowIfNullOrWhiteSpace(requirement);
-
         return new EngineeringTask
         {
             Id = Guid.NewGuid(),
@@ -39,75 +39,81 @@ public sealed class EngineeringTask
         };
     }
 
-    public void BeginClarification(string question, DateTimeOffset now)
+    public void ApplyClarificationEvaluation(ClarificationEvaluation evaluation, DateTimeOffset now)
     {
-        EnsureStatus(WorkflowStatus.Draft);
-        SetPendingQuestion(question);
-        TransitionTo(WorkflowStatus.Clarifying, now);
+        ArgumentNullException.ThrowIfNull(evaluation);
+        if (Status is not (WorkflowStatus.Draft or WorkflowStatus.Clarifying))
+            throw new WorkflowException($"Clarification evaluation cannot be applied while task status is {Status}.");
+        if (CurrentPendingQuestion is not null)
+            throw new WorkflowException("The pending clarification question must be answered before reevaluation.");
+
+        if (evaluation.ModelCall is not null) RecordModelCall(evaluation.ModelCall, now);
+
+        switch (evaluation.Decision)
+        {
+            case ClarificationDecision.Ask when !string.IsNullOrWhiteSpace(evaluation.Question) && evaluation.Summary is null:
+                CurrentPendingQuestion = evaluation.Question;
+                RequirementSummary = null;
+                Status = WorkflowStatus.Clarifying;
+                break;
+            case ClarificationDecision.Summarize when !string.IsNullOrWhiteSpace(evaluation.Summary) && evaluation.Question is null:
+                CurrentPendingQuestion = null;
+                RequirementSummary = evaluation.Summary;
+                Status = WorkflowStatus.AwaitingRequirementApproval;
+                break;
+            default:
+                throw new WorkflowException("Clarification evaluation must contain exactly one valid decision.");
+        }
+
+        UpdatedAt = now;
     }
 
     public void AnswerCurrentQuestion(string answer, DateTimeOffset now)
     {
         EnsureStatus(WorkflowStatus.Clarifying);
         ArgumentException.ThrowIfNullOrWhiteSpace(answer);
-
         if (string.IsNullOrWhiteSpace(CurrentPendingQuestion))
-        {
             throw new WorkflowException("There is no clarification question awaiting an answer.");
-        }
 
         _clarificationAnswers.Add(new ClarificationAnswer(CurrentPendingQuestion, answer.Trim(), now));
         CurrentPendingQuestion = null;
-        CurrentClarifiedRequirement = BuildClarifiedRequirement();
+        RebuildClarifiedRequirement();
         UpdatedAt = now;
     }
 
-    public void AskNextQuestion(string question, DateTimeOffset now)
+    public void RequestRequirementRevision(string correction, DateTimeOffset now)
     {
-        EnsureStatus(WorkflowStatus.Clarifying);
-        if (CurrentPendingQuestion is not null)
-        {
-            throw new WorkflowException("Only one clarification question can be pending at a time.");
-        }
+        EnsureStatus(WorkflowStatus.AwaitingRequirementApproval);
+        ArgumentException.ThrowIfNullOrWhiteSpace(correction);
+        if (string.IsNullOrWhiteSpace(RequirementSummary))
+            throw new WorkflowException("A current requirement summary is required before requesting a correction.");
 
-        SetPendingQuestion(question);
+        var note = new RequirementRevisionNote(correction.Trim(), RequirementSummary, now);
+        _requirementRevisionNotes.Add(note);
+        RequirementSummary = null;
+        RequirementApprovedAt = null;
+        CurrentPendingQuestion = null;
+        Status = WorkflowStatus.Clarifying;
+        RebuildClarifiedRequirement();
         UpdatedAt = now;
-    }
-
-    public void PrepareRequirementSummary(string summary, DateTimeOffset now)
-    {
-        EnsureStatus(WorkflowStatus.Clarifying);
-        if (CurrentPendingQuestion is not null)
-        {
-            throw new WorkflowException("The pending clarification question must be answered first.");
-        }
-
-        ArgumentException.ThrowIfNullOrWhiteSpace(summary);
-        RequirementSummary = summary.Trim();
-        TransitionTo(WorkflowStatus.RequirementSummaryReady, now);
-        TransitionTo(WorkflowStatus.AwaitingRequirementApproval, now);
     }
 
     public void ApproveRequirementSummary(DateTimeOffset now)
     {
         EnsureStatus(WorkflowStatus.AwaitingRequirementApproval);
         if (string.IsNullOrWhiteSpace(RequirementSummary))
-        {
             throw new WorkflowException("A requirement summary must exist before it can be approved.");
-        }
-
         RequirementApprovedAt = now;
-        TransitionTo(WorkflowStatus.ReadyForPlanning, now);
+        Status = WorkflowStatus.ReadyForPlanning;
+        UpdatedAt = now;
     }
 
-    public void TransitionTo(WorkflowStatus next, DateTimeOffset now)
+    public void RecordModelCall(ModelCallRecord call, DateTimeOffset now)
     {
-        if (!AllowedTransitions.TryGetValue(Status, out var allowed) || !allowed.Contains(next))
-        {
-            throw new WorkflowException($"Cannot transition from {Status} to {next}.");
-        }
-
-        Status = next;
+        ArgumentNullException.ThrowIfNull(call);
+        if (_modelCalls.Any(existing => existing.Id == call.Id))
+            throw new WorkflowException($"Model call '{call.Id}' has already been recorded.");
+        _modelCalls.Add(call);
         UpdatedAt = now;
     }
 
@@ -117,6 +123,8 @@ public sealed class EngineeringTask
         string originalRequirement,
         string currentClarifiedRequirement,
         IEnumerable<ClarificationAnswer> answers,
+        IEnumerable<RequirementRevisionNote> revisionNotes,
+        IEnumerable<ModelCallRecord> modelCalls,
         string? currentPendingQuestion,
         string? requirementSummary,
         WorkflowStatus status,
@@ -140,44 +148,21 @@ public sealed class EngineeringTask
             PlanApprovedAt = planApprovedAt
         };
         task._clarificationAnswers.AddRange(answers);
+        task._requirementRevisionNotes.AddRange(revisionNotes);
+        task._modelCalls.AddRange(modelCalls);
         return task;
-    }
-
-    private void SetPendingQuestion(string question)
-    {
-        ArgumentException.ThrowIfNullOrWhiteSpace(question);
-        CurrentPendingQuestion = question.Trim();
     }
 
     private void EnsureStatus(WorkflowStatus expected)
     {
         if (Status != expected)
-        {
             throw new WorkflowException($"Action requires {expected} status; current status is {Status}.");
-        }
     }
 
-    private string BuildClarifiedRequirement()
+    private void RebuildClarifiedRequirement()
     {
-        var details = string.Join(Environment.NewLine, _clarificationAnswers.Select(
-            answer => $"- {answer.Question}: {answer.Answer}"));
-        return $"{OriginalRequirement}{Environment.NewLine}{Environment.NewLine}Clarifications:{Environment.NewLine}{details}";
+        var details = _clarificationAnswers.Select(answer => $"- {answer.Question}: {answer.Answer}")
+            .Concat(_requirementRevisionNotes.Select(note => $"- Requirement correction: {note.Correction}"));
+        CurrentClarifiedRequirement = $"{OriginalRequirement}{Environment.NewLine}{Environment.NewLine}Clarifications:{Environment.NewLine}{string.Join(Environment.NewLine, details)}";
     }
-
-    private static readonly IReadOnlyDictionary<WorkflowStatus, WorkflowStatus[]> AllowedTransitions =
-        new Dictionary<WorkflowStatus, WorkflowStatus[]>
-        {
-            [WorkflowStatus.Draft] = [WorkflowStatus.Clarifying, WorkflowStatus.Failed],
-            [WorkflowStatus.Clarifying] = [WorkflowStatus.RequirementSummaryReady, WorkflowStatus.Failed],
-            [WorkflowStatus.RequirementSummaryReady] = [WorkflowStatus.AwaitingRequirementApproval, WorkflowStatus.Failed],
-            [WorkflowStatus.AwaitingRequirementApproval] = [WorkflowStatus.ReadyForPlanning, WorkflowStatus.Failed],
-            [WorkflowStatus.ReadyForPlanning] = [WorkflowStatus.Planning, WorkflowStatus.Failed],
-            [WorkflowStatus.Planning] = [WorkflowStatus.AwaitingPlanApproval, WorkflowStatus.Failed],
-            [WorkflowStatus.AwaitingPlanApproval] = [WorkflowStatus.Implementing, WorkflowStatus.Failed],
-            [WorkflowStatus.Implementing] = [WorkflowStatus.Validating, WorkflowStatus.Failed],
-            [WorkflowStatus.Validating] = [WorkflowStatus.Reviewing, WorkflowStatus.Failed],
-            [WorkflowStatus.Reviewing] = [WorkflowStatus.Completed, WorkflowStatus.Failed],
-            [WorkflowStatus.Completed] = [],
-            [WorkflowStatus.Failed] = []
-        };
 }

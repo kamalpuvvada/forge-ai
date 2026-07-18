@@ -25,8 +25,9 @@ public sealed class EngineeringTasksController(EngineeringTaskService service) :
     [ProducesResponseType<ProblemDetails>(StatusCodes.Status404NotFound)]
     public async Task<ActionResult<EngineeringTaskResponse>> Get(Guid id, CancellationToken cancellationToken)
     {
-        var task = await service.GetAsync(id, cancellationToken);
-        return task is null ? NotFoundProblem(id) : Ok(EngineeringTaskResponse.FromDomain(task));
+        var task = await service.GetAsync(id, cancellationToken)
+            ?? throw new KeyNotFoundException($"Engineering task '{id}' was not found.");
+        return Ok(EngineeringTaskResponse.FromDomain(task));
     }
 
     [HttpPost("{id:guid}/answers")]
@@ -39,39 +40,31 @@ public sealed class EngineeringTasksController(EngineeringTaskService service) :
         AnswerClarificationRequest request,
         CancellationToken cancellationToken)
     {
-        try
-        {
-            var task = await service.AnswerAsync(id, request.Answer, cancellationToken);
-            return Ok(EngineeringTaskResponse.FromDomain(task));
-        }
-        catch (KeyNotFoundException) { return NotFoundProblem(id); }
-        catch (WorkflowException exception) { return ConflictProblem(exception.Message); }
+        var task = await service.AnswerAsync(id, request.Answer, cancellationToken);
+        return Ok(EngineeringTaskResponse.FromDomain(task));
+    }
+
+    [HttpPost("{id:guid}/requirement-revision")]
+    [ProducesResponseType<EngineeringTaskResponse>(StatusCodes.Status200OK)]
+    [ProducesResponseType<ValidationProblemDetails>(StatusCodes.Status400BadRequest)]
+    [ProducesResponseType<ProblemDetails>(StatusCodes.Status404NotFound)]
+    [ProducesResponseType<ProblemDetails>(StatusCodes.Status409Conflict)]
+    public async Task<ActionResult<EngineeringTaskResponse>> RequestRevision(
+        Guid id,
+        RequestRequirementRevisionRequest request,
+        CancellationToken cancellationToken)
+    {
+        var task = await service.RequestRevisionAsync(id, request.Correction, cancellationToken);
+        return Ok(EngineeringTaskResponse.FromDomain(task));
     }
 
     [HttpPost("{id:guid}/requirement-approval")]
     [ProducesResponseType<EngineeringTaskResponse>(StatusCodes.Status200OK)]
     [ProducesResponseType<ProblemDetails>(StatusCodes.Status404NotFound)]
     [ProducesResponseType<ProblemDetails>(StatusCodes.Status409Conflict)]
-    public async Task<ActionResult<EngineeringTaskResponse>> ApproveRequirement(
-        Guid id,
-        CancellationToken cancellationToken)
+    public async Task<ActionResult<EngineeringTaskResponse>> ApproveRequirement(Guid id, CancellationToken cancellationToken)
     {
-        try
-        {
-            var task = await service.ApproveRequirementAsync(id, cancellationToken);
-            return Ok(EngineeringTaskResponse.FromDomain(task));
-        }
-        catch (KeyNotFoundException) { return NotFoundProblem(id); }
-        catch (WorkflowException exception) { return ConflictProblem(exception.Message); }
+        var task = await service.ApproveRequirementAsync(id, cancellationToken);
+        return Ok(EngineeringTaskResponse.FromDomain(task));
     }
-
-    private ObjectResult NotFoundProblem(Guid id) => Problem(
-        statusCode: StatusCodes.Status404NotFound,
-        title: "Engineering task not found",
-        detail: $"No engineering task exists with ID '{id}'.");
-
-    private ObjectResult ConflictProblem(string detail) => Problem(
-        statusCode: StatusCodes.Status409Conflict,
-        title: "Invalid workflow action",
-        detail: detail);
 }

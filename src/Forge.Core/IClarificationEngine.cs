@@ -2,5 +2,7 @@ namespace Forge.Core;
 
 public interface IClarificationEngine
 {
-    ClarificationResult Evaluate(EngineeringTask task);
+    Task<ClarificationEvaluation> EvaluateAsync(
+        EngineeringTask task,
+        CancellationToken cancellationToken = default);
 }

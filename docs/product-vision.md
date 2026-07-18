@@ -24,7 +24,7 @@ Trust is part of the workflow rather than a disclaimer. Requirement approval, ev
 4. The approved task becomes ready for evidence-backed planning.
 5. The complete competition story will then show repository retrieval, an approved plan, implementation, tests, review, repairs, a pull-request summary, and per-run usage/cost.
 
-The current vertical slice demonstrates steps 1–4 with deterministic demo questions and local persistence.
+The current vertical slice demonstrates steps 1–4 with local persistence, deterministic Fake mode, and an optional configured OpenAI clarification adapter. Repository analysis and planning remain unavailable.
 
 ## Three-day non-goals
 

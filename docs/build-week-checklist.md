@@ -1,7 +1,7 @@
 # Build Week submission checklist
 
 - [x] Working local requirement-clarification and approval slice
-- [ ] GPT-5.6 integration
+- [x] GPT-5.6 Responses integration implemented (first billable call intentionally pending approval)
 - [ ] Codex usage documented in the submission
 - [x] Automated core workflow tests
 - [x] README setup and validation commands
@@ -11,4 +11,5 @@
 - [ ] `/feedback` Codex Session ID
 - [ ] Final submission description
 - [ ] Product screenshots
+- [ ] First explicitly authorized live OpenAI validation
 - [ ] End-to-end final validation on a clean machine

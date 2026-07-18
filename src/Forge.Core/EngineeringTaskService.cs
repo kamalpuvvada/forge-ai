@@ -10,52 +10,31 @@ public sealed class EngineeringTaskService(
         string requirement,
         CancellationToken cancellationToken = default)
     {
-        var now = timeProvider.GetUtcNow();
-        var task = EngineeringTask.Create(repositoryIdentifier, requirement, now);
-        var result = clarificationEngine.Evaluate(task);
-        if (string.IsNullOrWhiteSpace(result.NextQuestion))
-        {
-            throw new InvalidOperationException("The clarification engine must return an initial question.");
-        }
-
-        task.BeginClarification(result.NextQuestion, now);
-        await repository.SaveAsync(task, cancellationToken);
+        var task = EngineeringTask.Create(repositoryIdentifier, requirement, timeProvider.GetUtcNow());
+        await EvaluateAndApplyAsync(task, cancellationToken);
         return task;
     }
 
-    public async Task<EngineeringTask?> GetAsync(Guid id, CancellationToken cancellationToken = default) =>
-        await repository.GetAsync(id, cancellationToken);
+    public Task<EngineeringTask?> GetAsync(Guid id, CancellationToken cancellationToken = default) =>
+        repository.GetAsync(id, cancellationToken);
 
-    public async Task<EngineeringTask> AnswerAsync(
-        Guid id,
-        string answer,
-        CancellationToken cancellationToken = default)
+    public async Task<EngineeringTask> AnswerAsync(Guid id, string answer, CancellationToken cancellationToken = default)
     {
         var task = await GetRequiredAsync(id, cancellationToken);
-        var now = timeProvider.GetUtcNow();
-        task.AnswerCurrentQuestion(answer, now);
-
-        var result = clarificationEngine.Evaluate(task);
-        if (!string.IsNullOrWhiteSpace(result.NextQuestion))
-        {
-            task.AskNextQuestion(result.NextQuestion, now);
-        }
-        else if (!string.IsNullOrWhiteSpace(result.RequirementSummary))
-        {
-            task.PrepareRequirementSummary(result.RequirementSummary, now);
-        }
-        else
-        {
-            throw new InvalidOperationException("The clarification engine returned neither a question nor a summary.");
-        }
-
-        await repository.SaveAsync(task, cancellationToken);
+        task.AnswerCurrentQuestion(answer, timeProvider.GetUtcNow());
+        await EvaluateAndApplyAsync(task, cancellationToken);
         return task;
     }
 
-    public async Task<EngineeringTask> ApproveRequirementAsync(
-        Guid id,
-        CancellationToken cancellationToken = default)
+    public async Task<EngineeringTask> RequestRevisionAsync(Guid id, string correction, CancellationToken cancellationToken = default)
+    {
+        var task = await GetRequiredAsync(id, cancellationToken);
+        task.RequestRequirementRevision(correction, timeProvider.GetUtcNow());
+        await EvaluateAndApplyAsync(task, cancellationToken);
+        return task;
+    }
+
+    public async Task<EngineeringTask> ApproveRequirementAsync(Guid id, CancellationToken cancellationToken = default)
     {
         var task = await GetRequiredAsync(id, cancellationToken);
         task.ApproveRequirementSummary(timeProvider.GetUtcNow());
@@ -63,9 +42,23 @@ public sealed class EngineeringTaskService(
         return task;
     }
 
-    private async Task<EngineeringTask> GetRequiredAsync(Guid id, CancellationToken cancellationToken)
+    private async Task EvaluateAndApplyAsync(EngineeringTask task, CancellationToken cancellationToken)
     {
-        return await repository.GetAsync(id, cancellationToken)
-            ?? throw new KeyNotFoundException($"Engineering task '{id}' was not found.");
+        try
+        {
+            var evaluation = await clarificationEngine.EvaluateAsync(task, cancellationToken);
+            task.ApplyClarificationEvaluation(evaluation, timeProvider.GetUtcNow());
+            await repository.SaveAsync(task, cancellationToken);
+        }
+        catch (ClarificationProviderException exception)
+        {
+            task.RecordModelCall(exception.FailedCall, timeProvider.GetUtcNow());
+            await repository.SaveAsync(task, CancellationToken.None);
+            throw;
+        }
     }
+
+    private async Task<EngineeringTask> GetRequiredAsync(Guid id, CancellationToken cancellationToken) =>
+        await repository.GetAsync(id, cancellationToken)
+        ?? throw new KeyNotFoundException($"Engineering task '{id}' was not found.");
 }

@@ -20,12 +20,16 @@ public sealed class SqliteEngineeringTaskRepository(string connectionString) : I
         if (!await reader.ReadAsync(cancellationToken)) return null;
 
         var answers = JsonSerializer.Deserialize<List<ClarificationAnswer>>(reader.GetString(reader.GetOrdinal("ClarificationAnswers")), JsonOptions) ?? [];
+        var revisionNotes = JsonSerializer.Deserialize<List<RequirementRevisionNote>>(reader.GetString(reader.GetOrdinal("RequirementRevisionNotes")), JsonOptions) ?? [];
+        var modelCalls = JsonSerializer.Deserialize<List<ModelCallRecord>>(reader.GetString(reader.GetOrdinal("ModelCalls")), JsonOptions) ?? [];
         return EngineeringTask.Rehydrate(
             Guid.Parse(reader.GetString(reader.GetOrdinal("Id"))),
             reader.GetString(reader.GetOrdinal("Repository")),
             reader.GetString(reader.GetOrdinal("OriginalRequirement")),
             reader.GetString(reader.GetOrdinal("CurrentClarifiedRequirement")),
             answers,
+            revisionNotes,
+            modelCalls,
             ReadNullableString(reader, "CurrentPendingQuestion"),
             ReadNullableString(reader, "RequirementSummary"),
             Enum.Parse<WorkflowStatus>(reader.GetString(reader.GetOrdinal("Status"))),
@@ -43,16 +47,19 @@ public sealed class SqliteEngineeringTaskRepository(string connectionString) : I
         command.CommandText = """
             INSERT INTO EngineeringTasks (
                 Id, Repository, OriginalRequirement, CurrentClarifiedRequirement,
-                ClarificationAnswers, CurrentPendingQuestion, RequirementSummary,
+                ClarificationAnswers, RequirementRevisionNotes, ModelCalls,
+                CurrentPendingQuestion, RequirementSummary,
                 Status, CreatedAt, UpdatedAt, RequirementApprovedAt, PlanApprovedAt)
             VALUES (
-                $id, $repository, $original, $clarified, $answers, $question, $summary,
+                $id, $repository, $original, $clarified, $answers, $revisions, $modelCalls, $question, $summary,
                 $status, $created, $updated, $requirementApproved, $planApproved)
             ON CONFLICT(Id) DO UPDATE SET
                 Repository = excluded.Repository,
                 OriginalRequirement = excluded.OriginalRequirement,
                 CurrentClarifiedRequirement = excluded.CurrentClarifiedRequirement,
                 ClarificationAnswers = excluded.ClarificationAnswers,
+                RequirementRevisionNotes = excluded.RequirementRevisionNotes,
+                ModelCalls = excluded.ModelCalls,
                 CurrentPendingQuestion = excluded.CurrentPendingQuestion,
                 RequirementSummary = excluded.RequirementSummary,
                 Status = excluded.Status,
@@ -66,6 +73,8 @@ public sealed class SqliteEngineeringTaskRepository(string connectionString) : I
         command.Parameters.AddWithValue("$original", task.OriginalRequirement);
         command.Parameters.AddWithValue("$clarified", task.CurrentClarifiedRequirement);
         command.Parameters.AddWithValue("$answers", JsonSerializer.Serialize(task.ClarificationAnswers, JsonOptions));
+        command.Parameters.AddWithValue("$revisions", JsonSerializer.Serialize(task.RequirementRevisionNotes, JsonOptions));
+        command.Parameters.AddWithValue("$modelCalls", JsonSerializer.Serialize(task.ModelCalls, JsonOptions));
         command.Parameters.AddWithValue("$question", (object?)task.CurrentPendingQuestion ?? DBNull.Value);
         command.Parameters.AddWithValue("$summary", (object?)task.RequirementSummary ?? DBNull.Value);
         command.Parameters.AddWithValue("$status", task.Status.ToString());

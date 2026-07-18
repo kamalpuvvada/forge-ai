@@ -1,17 +1,15 @@
 # Forge AI
 
-Forge AI is a trustworthy, explainable, and cost-aware software-engineering workflow that turns a requirement into a reviewed pull request. This repository currently contains the first runnable vertical slice: local task creation, deterministic one-question-at-a-time clarification, a requirement summary, explicit approval, and local SQLite persistence.
+Forge AI is a trustworthy, explainable, and cost-aware software-engineering workflow. The current slice creates an engineering task, clarifies only material gaps, supports requirement-summary correction, requires explicit approval, persists model-call telemetry, and can use either deterministic Fake mode or the official OpenAI Responses API.
 
-Planning, target-repository analysis, code changes, validation, review, pull-request creation, and live model integrations are **not implemented yet**.
+Planning, repository inspection, target-repository modification, validation, review, and pull-request creation remain explicitly unavailable.
 
 ## Prerequisites
 
 - Windows PowerShell 7 or Windows PowerShell 5.1
-- [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0) or a newer SDK that can target .NET 8
-- [Node.js](https://nodejs.org/) 20 or newer with npm
+- .NET 8 SDK or a newer SDK capable of targeting .NET 8
+- Node.js 20 or newer with npm
 - Git
-
-Verify the tools from the repository root:
 
 ```powershell
 dotnet --version
@@ -20,28 +18,31 @@ npm --version
 git --version
 ```
 
-## Restore dependencies
-
-From `C:\Projects\ForgeAI` (or your clone directory):
+## Restore and validate
 
 ```powershell
 dotnet restore .\ForgeAI.slnx
+dotnet build .\ForgeAI.slnx --configuration Release --no-restore
+dotnet test .\ForgeAI.slnx --configuration Release --no-build
 Push-Location .\web\forge-web
 npm ci
+npm run lint
+npm run build
 Pop-Location
 ```
 
-## Run locally
+## Run in Fake mode
 
-Open the first PowerShell terminal at the repository root and start the API:
+Fake mode is the committed default and does not require a key or make billable requests.
+
+Terminal 1:
 
 ```powershell
+$env:Forge__AI__Mode = 'Fake'
 dotnet run --project .\src\Forge.Api --launch-profile http
 ```
 
-The API listens at `http://localhost:5180`; Swagger is at `http://localhost:5180/swagger`.
-
-Open a second PowerShell terminal at the repository root and start the web client:
+Terminal 2:
 
 ```powershell
 Push-Location .\web\forge-web
@@ -49,31 +50,78 @@ npm run dev
 Pop-Location
 ```
 
-Open `http://localhost:5173`. Vite proxies `/api` requests to the local API.
+Open `http://localhost:5173`; Swagger is at `http://localhost:5180/swagger`.
 
-## Test and build
+The deterministic adapter asks up to three development questions. A requirement containing both `Acceptance criteria:` and `Validation:` is summarized immediately, demonstrating that zero questions are valid. Corrections are summarized immediately in Fake mode.
 
-Run the backend tests:
+## Run in OpenAI mode
 
-```powershell
-dotnet restore .\ForgeAI.slnx
-dotnet test .\ForgeAI.slnx --configuration Release
-```
-
-Build both applications:
+OpenAI API billing is separate from ChatGPT subscriptions. Configure billing and create a project API key through your OpenAI account first. The key is read only from `OPENAI_API_KEY` and is never persisted by Forge.
 
 ```powershell
-dotnet restore .\ForgeAI.slnx
-dotnet build .\ForgeAI.slnx --configuration Release --no-restore
-Push-Location .\web\forge-web
-npm ci
-npm run build
-Pop-Location
+$secureKey = Read-Host 'Enter OPENAI_API_KEY' -AsSecureString
+$env:OPENAI_API_KEY = [Net.NetworkCredential]::new('', $secureKey).Password
+$env:Forge__AI__Mode = 'OpenAI'
+dotnet run --project .\src\Forge.Api --launch-profile http
 ```
 
-## Reset the local SQLite database
+The clarification model is `gpt-5.6-terra`, reasoning effort is `low`, and output is limited to 800 tokens. Clear the current shell values when finished:
 
-Stop the backend first. Then run these exact, narrowly scoped commands from the repository root:
+```powershell
+Remove-Item Env:OPENAI_API_KEY -ErrorAction SilentlyContinue
+Remove-Item Env:Forge__AI__Mode -ErrorAction SilentlyContinue
+```
+
+This implementation task did **not** make a live or billable OpenAI request.
+
+## AI boundary and failure behavior
+
+- `IClarificationEngine.EvaluateAsync` is asynchronous and cancellation-aware.
+- Every evaluation returns exactly one decision: ask one question or provide a summary.
+- The OpenAI adapter uses official `OpenAI` 2.12.0 and the Responses API.
+- Strict JSON Schema structured output is requested and the one-decision invariant is validated again after deserialization.
+- Each turn sends compact canonical context: repository identifier, original requirement, answers, and revision notes. `previous_response_id` is not used.
+- Fake mode records no model usage.
+- OpenAI mode never falls back to Fake mode. Configuration, authentication, timeout, rate-limit, malformed-output, and provider failures return safe Problem Details.
+- API keys, authorization headers, complete raw responses, hidden reasoning, and user-input secrets are not stored in model-call records.
+
+## Token and estimated-cost telemetry
+
+Forge stores call identity, stage, provider/model, reasoning effort, timestamps, outcome, response ID when available, input/cached/output/reasoning tokens, safe failure category, and estimated USD cost. The API returns task totals and the UI provides expandable details.
+
+Costs are estimates based on configurable per-million-token rates. Cached input is not charged twice:
+
+```text
+uncached input = total input - cached input
+estimate = uncached input × input rate
+         + cached input × cached rate
+         + output × output rate
+```
+
+The SDK output-token total already includes reasoning tokens, so reasoning tokens are a breakdown and are not added again.
+
+| Model | Input / 1M | Cached input / 1M | Output / 1M |
+|---|---:|---:|---:|
+| gpt-5.6-sol | $5.00 | $0.50 | $30.00 |
+| gpt-5.6-terra | $2.50 | $0.25 | $15.00 |
+| gpt-5.6-luna | $1.00 | $0.10 | $6.00 |
+
+## API
+
+- `POST /api/tasks`
+- `GET /api/tasks/{id}`
+- `POST /api/tasks/{id}/answers`
+- `POST /api/tasks/{id}/requirement-revision`
+- `POST /api/tasks/{id}/requirement-approval`
+- `GET /api/system/capabilities`
+
+The capabilities endpoint returns only safe mode/model/feature availability and never returns the API key or a secret-derived value.
+
+## SQLite development schema
+
+The Development API creates the database automatically. Existing first-slice databases gain `RequirementRevisionNotes` and `ModelCalls` columns through `PRAGMA table_info` and narrowly scoped `ALTER TABLE ADD COLUMN` commands.
+
+After stopping the API, reset local data with:
 
 ```powershell
 Remove-Item -LiteralPath .\src\Forge.Api\data\forge.db -Force -ErrorAction SilentlyContinue
@@ -81,37 +129,13 @@ Remove-Item -LiteralPath .\src\Forge.Api\data\forge.db-shm -Force -ErrorAction S
 Remove-Item -LiteralPath .\src\Forge.Api\data\forge.db-wal -Force -ErrorAction SilentlyContinue
 ```
 
-The Development API safely recreates the database and table on its next start. This bootstrap intentionally avoids production migration complexity.
+## Current limitations
 
-## Implemented now
+- Fake mode uses generic deterministic logic and does not reason about requirements.
+- No automated test sends a real OpenAI request.
+- Repository values are identifiers only; files, Git history, technologies, and tests are not inspected.
+- Known-fact/assumption/gap arrays are validated at the provider boundary but are not yet first-class UI context.
+- Authentication, multi-user isolation, production migrations, hosted deployment, and provider retry policy are not implemented.
+- Planning and downstream engineering stages are state-machine placeholders only.
 
-- A modular-monolith solution targeting .NET 8 with Core, Infrastructure, API, tests, and a React/Vite client.
-- An `EngineeringTask` aggregate with explicit states, timestamps, approval timestamps, clarification history, and guarded transitions.
-- REST endpoints to create/read a task, answer the single pending question, and approve the requirement summary.
-- A clearly named `FakeClarificationEngine` behind `IClarificationEngine`, with three deterministic demo questions.
-- SQLite persistence through `Microsoft.Data.Sqlite`, initialized only in Development.
-- Swagger/OpenAPI and validation/problem responses.
-- A responsive developer-tool UI with progress, focused action states, answer history, errors/loading/success states, and truthful zero-use model telemetry.
-- xUnit coverage for valid and invalid transitions, one-question behavior, answer preservation, and approval gating.
-
-## Explicitly unfinished or mocked
-
-- `FakeClarificationEngine` is deterministic development/demo logic. It does not call OpenAI, analyze the requirement, or inspect a repository.
-- Repository paths are stored as identifiers only; existence, Git state, files, and architecture are not inspected.
-- The requirement summary is mechanically assembled from the original requirement and three answers.
-- Planning, plan approval behavior, implementation, builds/tests of a target repository, diff review, repairs, and pull-request preparation are only represented as future workflow states.
-- OpenAI integration (including GPT-5.6), token/cost capture, Codex tooling, GitHub OAuth/API integration, and all external cloud services are absent.
-- Authentication, authorization, production migrations, hosted deployment, and multi-user isolation are outside this slice.
-
-## Repository map
-
-```text
-src/Forge.Core             Domain aggregate, state machine, ports, application service
-src/Forge.Infrastructure   SQLite repository and fake clarification adapter
-src/Forge.Api              REST API, DTOs, Swagger, dependency composition
-tests/Forge.Core.Tests     Domain and application-service tests
-web/forge-web              React + Vite + TypeScript client
-docs                       Vision, architecture, decisions, submission checklist
-```
-
-See [product vision](docs/product-vision.md), [architecture](docs/architecture.md), [decision log](docs/decision-log.md), and the [Build Week checklist](docs/build-week-checklist.md).
+See [product vision](docs/product-vision.md), [architecture](docs/architecture.md), [decision log](docs/decision-log.md), and [Build Week checklist](docs/build-week-checklist.md).
