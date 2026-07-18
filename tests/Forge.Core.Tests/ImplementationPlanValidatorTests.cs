@@ -129,6 +129,120 @@ public sealed class ImplementationPlanValidatorTests
         });
     }
 
+    [Fact]
+    public void Summary_over_500_characters_is_accepted_below_its_explicit_limit()
+    {
+        Validate(ValidPlan() with { Summary = Text(501) });
+    }
+
+    [Fact]
+    public void Repository_understanding_over_500_characters_is_accepted_below_its_explicit_limit()
+    {
+        Validate(ValidPlan() with { RepositoryUnderstanding = Text(900) });
+    }
+
+    [Theory]
+    [InlineData("summary", "The implementation-plan summary exceeds its allowed length.")]
+    [InlineData("objective", "The implementation-plan objective exceeds its allowed length.")]
+    [InlineData("repository-understanding", "The implementation-plan repository understanding exceeds its allowed length.")]
+    [InlineData("affected-purpose", "Affected file 1 contains an overlong purpose.")]
+    [InlineData("step-description", "Implementation step 1 contains an overlong description.")]
+    [InlineData("expected-result", "Implementation step 1 contains an overlong expected result.")]
+    [InlineData("validation-command", "Proposed validation command 1 exceeds its allowed length.")]
+    [InlineData("risk", "Risk 1 exceeds its allowed length.")]
+    [InlineData("assumption", "Assumption 1 exceeds its allowed length.")]
+    [InlineData("unresolved-question", "Unresolved question 1 exceeds its allowed length.")]
+    [InlineData("title", "The implementation-plan title exceeds its allowed length.")]
+    [InlineData("file-path", "Affected file 1 contains an overlong path.")]
+    [InlineData("step-path", "Implementation step 1 contains an overlong affected path.")]
+    [InlineData("evidence-id", "The implementation plan contains an overlong evidence ID.")]
+    public void Each_field_limit_is_enforced_with_a_safe_specific_error(string field, string expectedMessage)
+    {
+        var exception = Assert.Throws<PlanningException>(() => Validate(WithOverlongField(ValidPlan(), field)));
+
+        Assert.Equal("invalid_plan_field", exception.Category);
+        Assert.Equal(expectedMessage, exception.Message);
+    }
+
+    [Theory]
+    [InlineData("title")]
+    [InlineData("objective")]
+    [InlineData("repository-understanding")]
+    [InlineData("summary")]
+    [InlineData("affected-purpose")]
+    [InlineData("step-description")]
+    [InlineData("expected-result")]
+    [InlineData("validation-command")]
+    [InlineData("risk")]
+    [InlineData("assumption")]
+    [InlineData("unresolved-question")]
+    [InlineData("file-path")]
+    [InlineData("evidence-id")]
+    public void Required_text_values_reject_whitespace_only_content(string field)
+    {
+        Assert.Throws<PlanningException>(() => Validate(WithWhitespaceField(ValidPlan(), field)));
+    }
+
+    private static ImplementationPlan WithOverlongField(ImplementationPlan plan, string field) => field switch
+    {
+        "summary" => plan with { Summary = Text(ImplementationPlanValidator.SummaryMaxLength + 1) },
+        "objective" => plan with { Objective = Text(ImplementationPlanValidator.ObjectiveMaxLength + 1) },
+        "repository-understanding" => plan with
+        {
+            RepositoryUnderstanding = Text(ImplementationPlanValidator.RepositoryUnderstandingMaxLength + 1)
+        },
+        "affected-purpose" => plan with
+        {
+            AffectedFiles = [plan.AffectedFiles[0] with { Purpose = Text(ImplementationPlanValidator.AffectedFilePurposeMaxLength + 1) }]
+        },
+        "step-description" => plan with
+        {
+            Steps = [plan.Steps[0] with { Description = Text(ImplementationPlanValidator.StepDescriptionMaxLength + 1) }]
+        },
+        "expected-result" => plan with
+        {
+            Steps = [plan.Steps[0] with { ExpectedResult = Text(ImplementationPlanValidator.StepExpectedResultMaxLength + 1) }]
+        },
+        "validation-command" => plan with { ProposedValidationCommands = [Text(ImplementationPlanValidator.ValidationCommandMaxLength + 1)] },
+        "risk" => plan with { Risks = [Text(ImplementationPlanValidator.RiskMaxLength + 1)] },
+        "assumption" => plan with { Assumptions = [Text(ImplementationPlanValidator.AssumptionMaxLength + 1)] },
+        "unresolved-question" => plan with { UnresolvedQuestions = [Text(ImplementationPlanValidator.UnresolvedQuestionMaxLength + 1)] },
+        "title" => plan with { Title = Text(ImplementationPlanValidator.TitleMaxLength + 1) },
+        "file-path" => plan with
+        {
+            AffectedFiles = [plan.AffectedFiles[0] with { Path = Text(ImplementationPlanValidator.FilePathMaxLength + 1) }]
+        },
+        "step-path" => plan with
+        {
+            Steps = [plan.Steps[0] with { AffectedPaths = [Text(ImplementationPlanValidator.FilePathMaxLength + 1)] }]
+        },
+        "evidence-id" => plan with
+        {
+            AffectedFiles = [plan.AffectedFiles[0] with { EvidenceIds = [Text(ImplementationPlanValidator.EvidenceIdMaxLength + 1)] }]
+        },
+        _ => throw new ArgumentOutOfRangeException(nameof(field))
+    };
+
+    private static ImplementationPlan WithWhitespaceField(ImplementationPlan plan, string field) => field switch
+    {
+        "title" => plan with { Title = " " },
+        "objective" => plan with { Objective = " " },
+        "repository-understanding" => plan with { RepositoryUnderstanding = " " },
+        "summary" => plan with { Summary = " " },
+        "affected-purpose" => plan with { AffectedFiles = [plan.AffectedFiles[0] with { Purpose = " " }] },
+        "step-description" => plan with { Steps = [plan.Steps[0] with { Description = " " }] },
+        "expected-result" => plan with { Steps = [plan.Steps[0] with { ExpectedResult = " " }] },
+        "validation-command" => plan with { ProposedValidationCommands = [" "] },
+        "risk" => plan with { Risks = [" "] },
+        "assumption" => plan with { Assumptions = [" "] },
+        "unresolved-question" => plan with { UnresolvedQuestions = [" "] },
+        "file-path" => plan with { AffectedFiles = [plan.AffectedFiles[0] with { Path = " " }] },
+        "evidence-id" => plan with { AffectedFiles = [plan.AffectedFiles[0] with { EvidenceIds = [" "] }] },
+        _ => throw new ArgumentOutOfRangeException(nameof(field))
+    };
+
+    private static string Text(int length) => new('x', length);
+
     private static void Validate(ImplementationPlan plan) =>
         ImplementationPlanValidator.Validate(plan, Snapshot(), Evidence());
 

@@ -23,9 +23,11 @@ public sealed class OpenAIPlanningEngineTests
         Assert.Equal("forge_implementation_plan", gateway.Request?.SchemaName);
         Assert.Contains("additionalProperties", gateway.Request?.JsonSchema);
         Assert.Contains("\"maxItems\": 6", gateway.Request?.JsonSchema);
+        Assert.DoesNotContain("\"maxLength\"", gateway.Request?.JsonSchema);
         Assert.Contains("tests must pass", gateway.Request?.DeveloperInstructions);
         Assert.Contains("tests passed", gateway.Request?.DeveloperInstructions);
         Assert.Contains("imperative, future, or", gateway.Request?.DeveloperInstructions);
+        Assert.Contains("one concise paragraph", gateway.Request?.DeveloperInstructions);
     }
 
     [Fact]
@@ -137,6 +139,33 @@ public sealed class OpenAIPlanningEngineTests
         var result = await CreateEngine(new CapturingGateway(Envelope(output))).CreatePlanAsync(Context());
 
         Assert.Contains("All tests must pass", result.Plan.Steps[0].ExpectedResult, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Completed_plan_with_501_character_summary_succeeds()
+    {
+        var summary = new string('x', 501);
+        var output = ValidJson().Replace("A focused evidence-backed export plan.", summary, StringComparison.Ordinal);
+
+        var result = await CreateEngine(new CapturingGateway(Envelope(output))).CreatePlanAsync(Context());
+
+        Assert.Equal(summary, result.Plan.Summary);
+    }
+
+    [Fact]
+    public async Task Overlong_summary_returns_specific_safe_failure_without_retry_or_raw_output()
+    {
+        var summary = new string('x', ImplementationPlanValidator.SummaryMaxLength + 1);
+        var output = ValidJson().Replace("A focused evidence-backed export plan.", summary, StringComparison.Ordinal);
+        var gateway = new CapturingGateway(Envelope(output));
+
+        var exception = await Assert.ThrowsAsync<PlanningProviderException>(() =>
+            CreateEngine(gateway).CreatePlanAsync(Context()));
+
+        Assert.Equal("invalid_plan_response", exception.Category);
+        Assert.Equal("The implementation-plan summary exceeds its allowed length.", exception.Message);
+        Assert.Equal(1, gateway.CallCount);
+        Assert.DoesNotContain(output, exception.ToString(), StringComparison.Ordinal);
     }
 
     [Fact]

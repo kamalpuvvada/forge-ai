@@ -27,7 +27,9 @@ public sealed class OpenAIPlanningEngine(
         Every step path must also appear in affectedFiles, and every existing path claim must cite evidence IDs.
         Keep the output compact: at most 6 affected files, 6 steps, 6 validation commands, 4 risks,
         4 assumptions, and 4 unresolved questions. Use concise, non-repetitive descriptions. Do not repeat
-        the requirement, quote evidence excerpts, or copy repository content. Refer to evidence only by ID.
+        the full approved requirement, quote evidence excerpts, or copy repository content. Objective,
+        repository understanding, and summary should each normally be one concise paragraph. Keep
+        affected-file purposes and step descriptions brief. Refer to evidence only by ID.
         """;
 
     internal const string ResponseSchema = """
@@ -138,6 +140,7 @@ public sealed class OpenAIPlanningEngine(
             var safeMessage = exception switch
             {
                 OpenAITransportException => exception.Message,
+                PlanningException { Category: "invalid_plan_field" } planning => planning.Message,
                 PlanningException when exception.Message == ImplementationPlanValidator.ValidationAlreadyPerformedMessage =>
                     ImplementationPlanValidator.ValidationAlreadyPerformedMessage,
                 _ => "OpenAI returned an invalid structured implementation plan."
