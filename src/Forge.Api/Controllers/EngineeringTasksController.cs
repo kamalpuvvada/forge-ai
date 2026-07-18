@@ -67,4 +67,32 @@ public sealed class EngineeringTasksController(EngineeringTaskService service) :
         var task = await service.ApproveRequirementAsync(id, cancellationToken);
         return Ok(EngineeringTaskResponse.FromDomain(task));
     }
+
+    [HttpPost("{id:guid}/repository-analysis")]
+    [ProducesResponseType<EngineeringTaskResponse>(StatusCodes.Status200OK)]
+    [ProducesResponseType<ProblemDetails>(StatusCodes.Status400BadRequest)]
+    [ProducesResponseType<ProblemDetails>(StatusCodes.Status409Conflict)]
+    public async Task<ActionResult<EngineeringTaskResponse>> AnalyzeRepository(Guid id, CancellationToken cancellationToken)
+    {
+        var task = await service.AnalyzeRepositoryAsync(id, cancellationToken);
+        return Ok(EngineeringTaskResponse.FromDomain(task));
+    }
+
+    [HttpPost("{id:guid}/plan")]
+    [ProducesResponseType<EngineeringTaskResponse>(StatusCodes.Status200OK)]
+    [ProducesResponseType<ProblemDetails>(StatusCodes.Status409Conflict)]
+    public async Task<ActionResult<EngineeringTaskResponse>> CreatePlan(Guid id, CancellationToken cancellationToken)
+    {
+        var task = await service.CreatePlanAsync(id, cancellationToken);
+        return Ok(EngineeringTaskResponse.FromDomain(task));
+    }
+
+    [HttpPost("{id:guid}/plan-approval")]
+    [ProducesResponseType<EngineeringTaskResponse>(StatusCodes.Status200OK)]
+    [ProducesResponseType<ProblemDetails>(StatusCodes.Status409Conflict)]
+    public async Task<ActionResult<EngineeringTaskResponse>> ApprovePlan(Guid id, CancellationToken cancellationToken)
+    {
+        var task = await service.ApprovePlanAsync(id, cancellationToken);
+        return Ok(EngineeringTaskResponse.FromDomain(task));
+    }
 }

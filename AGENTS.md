@@ -22,6 +22,8 @@
 - Never invent repository facts, user intent, model output, tool results, test success, or completed integrations. Separate known facts, assumptions, gaps, and failures.
 - Prefer deterministic code and normal development tools when an LLM is unnecessary. Retrieve only relevant context and reuse stable summaries to control token usage and cost.
 - Do not modify a target repository before both the requirement summary and implementation plan receive explicit approval.
+- Repository analysis is read-only: contain every path, skip reparse points and likely secrets, never execute repository code, and keep persisted evidence bounded and redacted.
+- Deterministic Fake plans must cite real evidence, label proposed validation as unexecuted, and never claim implementation occurred.
 - Never commit secrets, API keys, tokens, credentials, or sensitive local paths. Use configuration and ignored local files.
 - OpenAI mode reads only `OPENAI_API_KEY`. Never log or persist keys, authorization headers, raw provider responses, or hidden reasoning.
 - Never silently fall back from OpenAI to Fake mode. Provider and configuration failures remain visible and safe.

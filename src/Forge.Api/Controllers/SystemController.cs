@@ -17,6 +17,10 @@ public sealed class SystemController(ForgeAiOptions options, OpenAIConfiguration
         string.Equals(options.Mode, ForgeAiModes.Fake, StringComparison.OrdinalIgnoreCase) ||
             (string.Equals(options.Mode, ForgeAiModes.OpenAI, StringComparison.OrdinalIgnoreCase) &&
              options.IsOpenAiConfigurationComplete(configurationState.HasApiKey)),
+        true,
+        string.Equals(options.Mode, ForgeAiModes.Fake, StringComparison.OrdinalIgnoreCase),
+        false,
+        false,
         false,
         false));
 }

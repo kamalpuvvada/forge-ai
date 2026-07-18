@@ -1,8 +1,8 @@
 # Forge AI
 
-Forge AI is a trustworthy, explainable, and cost-aware software-engineering workflow. The current slice creates an engineering task, clarifies only material gaps, supports requirement-summary correction, requires explicit approval, persists model-call telemetry, and can use either deterministic Fake mode or the official OpenAI Responses API.
+Forge AI is a trustworthy, explainable, and cost-aware software-engineering workflow. The current slice clarifies and approves requirements, inspects a local repository read-only, selects bounded evidence deterministically, creates a labelled Fake-mode implementation plan, and requires explicit plan approval.
 
-Planning, repository inspection, target-repository modification, validation, review, and pull-request creation remain explicitly unavailable.
+Target-repository modification, validation execution, review, and pull-request creation remain explicitly unavailable.
 
 ## Prerequisites
 
@@ -52,7 +52,15 @@ Pop-Location
 
 Open `http://localhost:5173`; Swagger is at `http://localhost:5180/swagger`.
 
-The deterministic adapter asks up to three development questions. A requirement containing both `Acceptance criteria:` and `Validation:` is summarized immediately, demonstrating that zero questions are valid. Corrections are summarized immediately in Fake mode.
+The deterministic clarification adapter asks up to three development questions. After requirement approval, Forge can analyze the repository read-only and create a deterministic evidence-backed plan without any model call.
+
+## Read-only repository planning
+
+`Analyze repository and create plan` normalizes and contains the supplied path, uses read-only Git metadata commands when applicable, skips reparse points, and never runs repository code, package installation, builds, tests, or Git mutations. It persists compact metadata and bounded evidence rather than unrestricted file contents.
+
+Default limits are 5,000 discovered files, 256 KB per text file, 20 MB of considered text, 12 evidence files, and 60,000 evidence characters. Generated/minified/binary content, common build/dependency folders, and likely secret files such as `.env`, private keys, and credential files are excluded. Obvious sensitive key/value lines are replaced with `[REDACTED]`; this is a conservative safeguard, not a guarantee that a repository contains no secrets.
+
+Evidence ranking combines requirement terms with paths, declared symbols, content, project/module context, tests, configuration, and entry points. The Fake planner cites evidence IDs, labels validation commands as proposals, and stops after explicit plan approval without modifying the target.
 
 ## Run in OpenAI mode
 
@@ -113,13 +121,16 @@ The SDK output-token total already includes reasoning tokens, so reasoning token
 - `POST /api/tasks/{id}/answers`
 - `POST /api/tasks/{id}/requirement-revision`
 - `POST /api/tasks/{id}/requirement-approval`
+- `POST /api/tasks/{id}/repository-analysis`
+- `POST /api/tasks/{id}/plan`
+- `POST /api/tasks/{id}/plan-approval`
 - `GET /api/system/capabilities`
 
 The capabilities endpoint returns only safe mode/model/feature availability and never returns the API key or a secret-derived value.
 
 ## SQLite development schema
 
-The Development API creates the database automatically. Existing first-slice databases gain `RequirementRevisionNotes` and `ModelCalls` columns through `PRAGMA table_info` and narrowly scoped `ALTER TABLE ADD COLUMN` commands.
+The Development API creates the database automatically. Existing databases gain known clarification, snapshot, evidence, plan, fingerprint, and planning-timestamp columns through `PRAGMA table_info` and narrowly scoped `ALTER TABLE ADD COLUMN` commands. Snapshot, evidence, and plan payloads are bounded JSON.
 
 After stopping the API, reset local data with:
 
@@ -131,11 +142,12 @@ Remove-Item -LiteralPath .\src\Forge.Api\data\forge.db-wal -Force -ErrorAction S
 
 ## Current limitations
 
-- Fake mode uses generic deterministic logic and does not reason about requirements.
+- Fake clarification remains generic, and Fake planning uses ranking heuristics rather than semantic model reasoning.
 - No automated test sends a real OpenAI request.
-- Repository values are identifiers only; files, Git history, technologies, and tests are not inspected.
+- Redaction covers obvious sensitive key names but cannot guarantee that every secret pattern is detected.
+- Git evidence uses tracked files returned by `git ls-files`; ignored and untracked content is not selected.
 - Known-fact/assumption/gap arrays are validated at the provider boundary but are not yet first-class UI context.
 - Authentication, multi-user isolation, production migrations, hosted deployment, and provider retry policy are not implemented.
-- Planning and downstream engineering stages are state-machine placeholders only.
+- Implementation and downstream engineering stages are state-machine placeholders only.
 
 See [product vision](docs/product-vision.md), [architecture](docs/architecture.md), [decision log](docs/decision-log.md), and [Build Week checklist](docs/build-week-checklist.md).

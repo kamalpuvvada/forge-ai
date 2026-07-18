@@ -4,6 +4,8 @@
 - [x] GPT-5.6 Responses integration implemented (first billable call intentionally pending approval)
 - [ ] Codex usage documented in the submission
 - [x] Automated core workflow tests
+- [x] Read-only repository snapshot and deterministic evidence retrieval
+- [x] Evidence-backed deterministic Fake planning and explicit plan approval
 - [x] README setup and validation commands
 - [ ] Curated demo repository and demo data
 - [ ] Publicly accessible submission repository

@@ -71,3 +71,9 @@
 **Decision:** Store revision notes and compact model-call records as JSON columns, adding missing columns through SQLite schema inspection.
 **Reason:** Existing local databases remain usable without a full migration framework for this competition slice.
 **Trade-off:** JSON columns are less queryable than normalized tables and should be revisited if reporting expands.
+
+## 013 — Read-only deterministic repository planning
+
+**Decision:** Normalize and contain repository paths, use only read-only Git/file APIs, select bounded redacted evidence deterministically, and create an explicitly labelled Fake implementation plan with a separate approval gate.
+**Reason:** The demo can ground planning in real repository facts without billable calls or allowing target mutation.
+**Trade-off:** Lightweight symbol extraction, keyword scoring, and key-name redaction are explainable but cannot provide complete semantic understanding or comprehensive secret detection.

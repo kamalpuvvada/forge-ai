@@ -6,4 +6,8 @@ public sealed record SystemCapabilitiesResponse(
     string ReasoningEffort,
     bool AiConfigured,
     bool RepositoryInspectionAvailable,
-    bool PlanningAvailable);
+    bool PlanningAvailable,
+    bool TargetModificationAvailable,
+    bool ValidationAvailable,
+    bool ReviewAvailable,
+    bool PullRequestCreationAvailable);

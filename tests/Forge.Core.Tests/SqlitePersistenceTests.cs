@@ -66,6 +66,40 @@ public sealed class SqlitePersistenceTests : IDisposable
         while (await reader.ReadAsync()) columns.Add(reader.GetString(1));
         Assert.Contains("RequirementRevisionNotes", columns);
         Assert.Contains("ModelCalls", columns);
+        Assert.Contains("RepositorySnapshot", columns);
+        Assert.Contains("EvidenceItems", columns);
+        Assert.Contains("ImplementationPlan", columns);
+        Assert.Contains("RepositoryAnalyzedAt", columns);
+        Assert.Contains("RepositoryFingerprint", columns);
+        Assert.Contains("PlanCreatedAt", columns);
+    }
+
+    [Fact]
+    public async Task Snapshot_evidence_plan_and_approval_round_trip()
+    {
+        await new SqliteDatabaseInitializer(ConnectionString).InitializeAsync();
+        var repository = new SqliteEngineeringTaskRepository(ConnectionString);
+        var now = DateTimeOffset.UtcNow;
+        var task = EngineeringTask.Create("C:/repo", "Add report export", now);
+        task.ApplyClarificationEvaluation(ClarificationEvaluation.Summarize("Add report export"), now);
+        task.ApproveRequirementSummary(now);
+        task.BeginRepositoryAnalysis(now);
+        var snapshot = PlanningWorkflowTests.Snapshot(now);
+        var evidence = PlanningWorkflowTests.Evidence();
+        task.StoreRepositorySnapshot(snapshot, now);
+        task.StoreEvidence(new EvidenceSelection([evidence], 1, 1, evidence.Excerpt.Length), now);
+        task.StoreImplementationPlan(PlanningWorkflowTests.Plan(snapshot, [evidence]), now, TimeSpan.FromMinutes(30));
+        task.ApproveImplementationPlan(now.AddMinutes(1));
+
+        await repository.SaveAsync(task);
+        var loaded = await repository.GetAsync(task.Id);
+
+        Assert.NotNull(loaded?.RepositorySnapshot);
+        Assert.Equal(snapshot.Fingerprint, loaded.RepositoryFingerprint);
+        Assert.Equal(evidence.Excerpt, Assert.Single(loaded.EvidenceItems).Excerpt);
+        Assert.True(loaded.ImplementationPlan?.IsDeterministicFake);
+        Assert.Equal(now.AddMinutes(1), loaded.PlanApprovedAt);
+        Assert.Equal(WorkflowStatus.Implementing, loaded.Status);
     }
 
     public void Dispose()

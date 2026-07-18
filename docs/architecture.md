@@ -2,10 +2,10 @@
 
 ## Components and dependency direction
 
-- **Forge.Core** owns the `EngineeringTask` aggregate, purpose-specific workflow operations, async clarification contract, correction notes, model-call records, and application service. It has no project dependencies.
-- **Forge.Infrastructure** implements Core ports with SQLite, deterministic Fake clarification, configurable pricing, and an OpenAI clarification adapter.
-- **Forge.Api** selects Fake or OpenAI mode, exposes REST DTOs and safe capabilities, and maps exceptions to RFC-compatible Problem Details.
-- **forge-web** renders one current action, correction/revision history, capabilities, and live task telemetry through REST.
+- **Forge.Core** owns the aggregate, approval gates, repository/evidence/plan contracts, workflow invariants, and application service. It has no project dependencies.
+- **Forge.Infrastructure** implements SQLite, clarification adapters, safe repository discovery, deterministic evidence ranking, and Fake planning.
+- **Forge.Api** composes modes and read-only planning services, exposes REST DTOs and safe capabilities, and maps exceptions to Problem Details.
+- **forge-web** renders clarification, repository snapshots, evidence, plans, approvals, capabilities, and telemetry through REST.
 
 ```mermaid
 flowchart LR
@@ -21,6 +21,10 @@ flowchart LR
     Gateway --> SDK[Official OpenAI 2.12.0\nResponsesClient]
     RepoAdapter[SQLite adapter] --> Repo
     RepoAdapter --> DB[(forge.db)]
+    Service --> Discovery[IRepositoryDiscoveryService]
+    Service --> Evidence[IEvidenceSelectionService]
+    Service --> Planner[IPlanningEngine]
+    Discovery --> Git[read-only Git commands]
 ```
 
 Dependencies point inward: API and Infrastructure depend on Core; Core knows neither. Official SDK types remain inside `SdkOpenAIResponsesGateway`. The `IOpenAIResponsesGateway` normalization boundary permits non-billable adapter tests.
@@ -48,6 +52,16 @@ stateDiagram-v2
 ```
 
 Correction is permitted only while awaiting requirement approval. The correction record retains its timestamp and previous summary; previous clarification answers remain unchanged. The current summary is cleared before reevaluation and the revised summary requires another explicit approval.
+
+## Read-only repository analysis and planning
+
+After requirement approval, purpose-specific aggregate operations begin analysis, store a compact snapshot, store bounded evidence, store a validated plan, and approve that plan. Re-analysis is allowed before plan approval and replaces the prior snapshot/evidence/plan. Planning rejects missing evidence, stale snapshots, fingerprint mismatches, unsafe paths, unknown evidence IDs, and invalid create/modify/delete targets.
+
+Discovery normalizes the root, contains every inspected path, skips reparse points, and uses `ProcessStartInfo.ArgumentList` for read-only Git commands. It never invokes repository scripts. Common dependency/build folders, generated/minified/binary files, and likely secret files are excluded. Configurable defaults cap discovery at 5,000 files, text at 256 KB per file and 20 MB total, and evidence at 12 files/60,000 characters. Limit warnings make partial inspection visible.
+
+Evidence selection deterministically scores paths, lightweight C#/TypeScript symbols, content, roles, tests, and configuration relevance against approved requirement terms. Excerpts retain line numbers, are de-duplicated, hashed, and redact obvious sensitive key/value lines before persistence. Redaction is not a comprehensive secret scanner.
+
+`FakePlanningEngine` creates a labelled plan using only snapshot metadata and selected evidence. Affected files cite evidence IDs; validation commands are proposals only. Plan approval moves the workflow to `Implementing`, where the UI truthfully stops because target modification is unavailable.
 
 ## OpenAI structured-output boundary
 
@@ -97,6 +111,8 @@ The estimate subtracts cached tokens from total input, prices uncached and cache
 
 - `RequirementRevisionNotes TEXT NOT NULL DEFAULT '[]'`
 - `ModelCalls TEXT NOT NULL DEFAULT '[]'`
+- bounded snapshot, evidence, and implementation-plan JSON columns;
+- evidence counters, repository analysis/fingerprint fields, and plan creation/approval timestamps.
 
 Development startup uses `PRAGMA table_info(EngineeringTasks)` and adds only missing known columns. Existing databases do not need to be deleted.
 
@@ -104,8 +120,8 @@ Development startup uses `PRAGMA table_info(EngineeringTasks)` and adds only mis
 
 Central exception handling maps missing tasks, invalid workflow operations, configuration faults, provider faults, and unexpected failures to safe Problem Details. Provider exception bodies and logs never include credentials or raw responses.
 
-`GET /api/system/capabilities` returns mode, model, reasoning effort, safe configuration readiness, and truthful `false` values for repository inspection and planning. It exposes no key or secret-derived data.
+`GET /api/system/capabilities` reports repository inspection and Fake planning as available, while target modification, validation, review, and pull-request creation remain false. It exposes no key or secret-derived data.
 
 ## Current boundaries
 
-Repository scanning, planning, target-repository changes/tests, review, repair, pull-request creation, authentication, production migrations, and live provider validation are not part of this slice.
+Target-repository changes/tests, review, repair, pull-request creation, authentication, production migrations, and live planning providers are not part of this slice.

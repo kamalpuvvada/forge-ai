@@ -22,6 +22,15 @@ public sealed class EngineeringTask
     public DateTimeOffset UpdatedAt { get; private set; }
     public DateTimeOffset? RequirementApprovedAt { get; private set; }
     public DateTimeOffset? PlanApprovedAt { get; private set; }
+    public RepositorySnapshot? RepositorySnapshot { get; private set; }
+    public IReadOnlyList<EvidenceItem> EvidenceItems { get; private set; } = [];
+    public int EvidenceFilesInspected { get; private set; }
+    public int EvidenceFilesSelected { get; private set; }
+    public int TotalEvidenceCharacters { get; private set; }
+    public ImplementationPlan? ImplementationPlan { get; private set; }
+    public DateTimeOffset? RepositoryAnalyzedAt { get; private set; }
+    public string? RepositoryFingerprint { get; private set; }
+    public DateTimeOffset? PlanCreatedAt { get; private set; }
 
     public static EngineeringTask Create(string repository, string requirement, DateTimeOffset now)
     {
@@ -108,6 +117,86 @@ public sealed class EngineeringTask
         UpdatedAt = now;
     }
 
+    public void BeginRepositoryAnalysis(DateTimeOffset now)
+    {
+        if (Status is not (WorkflowStatus.ReadyForPlanning or WorkflowStatus.Planning or WorkflowStatus.AwaitingPlanApproval))
+            throw new WorkflowException($"Repository analysis requires ReadyForPlanning, Planning, or AwaitingPlanApproval status; current status is {Status}.");
+        if (RequirementApprovedAt is null || string.IsNullOrWhiteSpace(RequirementSummary))
+            throw new WorkflowException("The requirement must be approved before repository analysis.");
+
+        RepositorySnapshot = null;
+        EvidenceItems = [];
+        EvidenceFilesInspected = 0;
+        EvidenceFilesSelected = 0;
+        TotalEvidenceCharacters = 0;
+        ImplementationPlan = null;
+        RepositoryAnalyzedAt = null;
+        RepositoryFingerprint = null;
+        PlanCreatedAt = null;
+        PlanApprovedAt = null;
+        Status = WorkflowStatus.Planning;
+        UpdatedAt = now;
+    }
+
+    public void StoreRepositorySnapshot(RepositorySnapshot snapshot, DateTimeOffset now)
+    {
+        EnsureStatus(WorkflowStatus.Planning);
+        ArgumentNullException.ThrowIfNull(snapshot);
+        if (string.IsNullOrWhiteSpace(snapshot.Fingerprint) || snapshot.EligibleTextFileCount < 0)
+            throw new WorkflowException("A valid repository snapshot is required.");
+
+        RepositorySnapshot = snapshot;
+        RepositoryAnalyzedAt = snapshot.AnalyzedAt;
+        RepositoryFingerprint = snapshot.Fingerprint;
+        UpdatedAt = now;
+    }
+
+    public void StoreEvidence(EvidenceSelection selection, DateTimeOffset now)
+    {
+        EnsureStatus(WorkflowStatus.Planning);
+        ArgumentNullException.ThrowIfNull(selection);
+        if (RepositorySnapshot is null)
+            throw new WorkflowException("Repository evidence cannot be stored without a snapshot.");
+        if (selection.FilesSelected != selection.Items.Select(item => item.RelativePath).Distinct(StringComparer.OrdinalIgnoreCase).Count())
+            throw new WorkflowException("Evidence file counts are inconsistent.");
+
+        EvidenceItems = selection.Items.ToArray();
+        EvidenceFilesInspected = selection.FilesInspected;
+        EvidenceFilesSelected = selection.FilesSelected;
+        TotalEvidenceCharacters = selection.TotalCharacters;
+        UpdatedAt = now;
+    }
+
+    public void StoreImplementationPlan(ImplementationPlan plan, DateTimeOffset now, TimeSpan maximumSnapshotAge)
+    {
+        EnsureStatus(WorkflowStatus.Planning);
+        ArgumentNullException.ThrowIfNull(plan);
+        if (RepositorySnapshot is null || RepositoryAnalyzedAt is null || string.IsNullOrWhiteSpace(RepositoryFingerprint))
+            throw new WorkflowException("A repository snapshot is required before planning.");
+        if (EvidenceItems.Count == 0)
+            throw new WorkflowException("Repository evidence is required before planning.");
+        if (now - RepositoryAnalyzedAt > maximumSnapshotAge)
+            throw new PlanningException("stale_snapshot", "The repository snapshot is stale. Re-analyze the repository before creating a plan.");
+        if (!string.Equals(plan.RepositoryFingerprint, RepositoryFingerprint, StringComparison.Ordinal))
+            throw new PlanningException("stale_snapshot", "The plan does not match the current repository snapshot.");
+
+        ValidatePlan(plan);
+        ImplementationPlan = plan;
+        PlanCreatedAt = plan.CreatedAt;
+        Status = WorkflowStatus.AwaitingPlanApproval;
+        UpdatedAt = now;
+    }
+
+    public void ApproveImplementationPlan(DateTimeOffset now)
+    {
+        EnsureStatus(WorkflowStatus.AwaitingPlanApproval);
+        if (ImplementationPlan is null)
+            throw new WorkflowException("An implementation plan is required before approval.");
+        PlanApprovedAt = now;
+        Status = WorkflowStatus.Implementing;
+        UpdatedAt = now;
+    }
+
     public void RecordModelCall(ModelCallRecord call, DateTimeOffset now)
     {
         ArgumentNullException.ThrowIfNull(call);
@@ -131,7 +220,16 @@ public sealed class EngineeringTask
         DateTimeOffset createdAt,
         DateTimeOffset updatedAt,
         DateTimeOffset? requirementApprovedAt,
-        DateTimeOffset? planApprovedAt)
+        DateTimeOffset? planApprovedAt,
+        RepositorySnapshot? repositorySnapshot = null,
+        IEnumerable<EvidenceItem>? evidenceItems = null,
+        int evidenceFilesInspected = 0,
+        int evidenceFilesSelected = 0,
+        int totalEvidenceCharacters = 0,
+        ImplementationPlan? implementationPlan = null,
+        DateTimeOffset? repositoryAnalyzedAt = null,
+        string? repositoryFingerprint = null,
+        DateTimeOffset? planCreatedAt = null)
     {
         var task = new EngineeringTask
         {
@@ -145,13 +243,50 @@ public sealed class EngineeringTask
             CreatedAt = createdAt,
             UpdatedAt = updatedAt,
             RequirementApprovedAt = requirementApprovedAt,
-            PlanApprovedAt = planApprovedAt
+            PlanApprovedAt = planApprovedAt,
+            RepositorySnapshot = repositorySnapshot,
+            EvidenceItems = evidenceItems?.ToArray() ?? [],
+            EvidenceFilesInspected = evidenceFilesInspected,
+            EvidenceFilesSelected = evidenceFilesSelected,
+            TotalEvidenceCharacters = totalEvidenceCharacters,
+            ImplementationPlan = implementationPlan,
+            RepositoryAnalyzedAt = repositoryAnalyzedAt,
+            RepositoryFingerprint = repositoryFingerprint,
+            PlanCreatedAt = planCreatedAt
         };
         task._clarificationAnswers.AddRange(answers);
         task._requirementRevisionNotes.AddRange(revisionNotes);
         task._modelCalls.AddRange(modelCalls);
         return task;
     }
+
+    private void ValidatePlan(ImplementationPlan plan)
+    {
+        if (!plan.IsDeterministicFake || string.IsNullOrWhiteSpace(plan.Title) || string.IsNullOrWhiteSpace(plan.Objective) ||
+            string.IsNullOrWhiteSpace(plan.Summary) || plan.OrderedSteps.Count == 0)
+            throw new PlanningException("invalid_plan", "The implementation plan is incomplete or not labelled as deterministic Fake output.");
+
+        var snapshotPaths = RepositorySnapshot!.Files.Select(file => file.RelativePath).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var evidenceIds = EvidenceItems.Select(item => item.Id).ToHashSet(StringComparer.Ordinal);
+        foreach (var file in plan.AffectedFiles)
+        {
+            if (!IsSafeRelativePath(file.Path))
+                throw new PlanningException("invalid_plan", "The implementation plan contains an unsafe repository path.");
+            if (file.Action is PlannedFileAction.Modify or PlannedFileAction.Delete or PlannedFileAction.Inspect && !snapshotPaths.Contains(file.Path))
+                throw new PlanningException("invalid_plan", $"Planned {file.Action.ToString().ToLowerInvariant()} path '{file.Path}' does not exist in the snapshot.");
+            if (file.Action == PlannedFileAction.Create && snapshotPaths.Contains(file.Path))
+                throw new PlanningException("invalid_plan", $"Planned create path '{file.Path}' already exists in the snapshot.");
+            if (file.EvidenceIds.Any(id => !evidenceIds.Contains(id)))
+                throw new PlanningException("invalid_plan", $"Planned file '{file.Path}' references unknown evidence.");
+            if (file.Confidence is < 0 or > 1)
+                throw new PlanningException("invalid_plan", "Plan confidence must be between zero and one.");
+        }
+    }
+
+    private static bool IsSafeRelativePath(string path) =>
+        !string.IsNullOrWhiteSpace(path) &&
+        !Path.IsPathRooted(path) &&
+        !path.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar).Contains("..");
 
     private void EnsureStatus(WorkflowStatus expected)
     {

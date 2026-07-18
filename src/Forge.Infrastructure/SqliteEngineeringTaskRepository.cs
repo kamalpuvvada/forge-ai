@@ -22,6 +22,9 @@ public sealed class SqliteEngineeringTaskRepository(string connectionString) : I
         var answers = JsonSerializer.Deserialize<List<ClarificationAnswer>>(reader.GetString(reader.GetOrdinal("ClarificationAnswers")), JsonOptions) ?? [];
         var revisionNotes = JsonSerializer.Deserialize<List<RequirementRevisionNote>>(reader.GetString(reader.GetOrdinal("RequirementRevisionNotes")), JsonOptions) ?? [];
         var modelCalls = JsonSerializer.Deserialize<List<ModelCallRecord>>(reader.GetString(reader.GetOrdinal("ModelCalls")), JsonOptions) ?? [];
+        var snapshot = DeserializeNullable<RepositorySnapshot>(reader, "RepositorySnapshot");
+        var evidenceItems = JsonSerializer.Deserialize<List<EvidenceItem>>(reader.GetString(reader.GetOrdinal("EvidenceItems")), JsonOptions) ?? [];
+        var plan = DeserializeNullable<ImplementationPlan>(reader, "ImplementationPlan");
         return EngineeringTask.Rehydrate(
             Guid.Parse(reader.GetString(reader.GetOrdinal("Id"))),
             reader.GetString(reader.GetOrdinal("Repository")),
@@ -36,7 +39,16 @@ public sealed class SqliteEngineeringTaskRepository(string connectionString) : I
             ParseDate(reader.GetString(reader.GetOrdinal("CreatedAt"))),
             ParseDate(reader.GetString(reader.GetOrdinal("UpdatedAt"))),
             ReadNullableDate(reader, "RequirementApprovedAt"),
-            ReadNullableDate(reader, "PlanApprovedAt"));
+            ReadNullableDate(reader, "PlanApprovedAt"),
+            snapshot,
+            evidenceItems,
+            reader.GetInt32(reader.GetOrdinal("EvidenceFilesInspected")),
+            reader.GetInt32(reader.GetOrdinal("EvidenceFilesSelected")),
+            reader.GetInt32(reader.GetOrdinal("TotalEvidenceCharacters")),
+            plan,
+            ReadNullableDate(reader, "RepositoryAnalyzedAt"),
+            ReadNullableString(reader, "RepositoryFingerprint"),
+            ReadNullableDate(reader, "PlanCreatedAt"));
     }
 
     public async Task SaveAsync(EngineeringTask task, CancellationToken cancellationToken = default)
@@ -49,10 +61,14 @@ public sealed class SqliteEngineeringTaskRepository(string connectionString) : I
                 Id, Repository, OriginalRequirement, CurrentClarifiedRequirement,
                 ClarificationAnswers, RequirementRevisionNotes, ModelCalls,
                 CurrentPendingQuestion, RequirementSummary,
-                Status, CreatedAt, UpdatedAt, RequirementApprovedAt, PlanApprovedAt)
+                Status, CreatedAt, UpdatedAt, RequirementApprovedAt, PlanApprovedAt,
+                RepositorySnapshot, EvidenceItems, EvidenceFilesInspected, EvidenceFilesSelected,
+                TotalEvidenceCharacters, ImplementationPlan, RepositoryAnalyzedAt, RepositoryFingerprint, PlanCreatedAt)
             VALUES (
                 $id, $repository, $original, $clarified, $answers, $revisions, $modelCalls, $question, $summary,
-                $status, $created, $updated, $requirementApproved, $planApproved)
+                $status, $created, $updated, $requirementApproved, $planApproved,
+                $snapshot, $evidence, $evidenceInspected, $evidenceSelected, $evidenceCharacters,
+                $plan, $repositoryAnalyzed, $repositoryFingerprint, $planCreated)
             ON CONFLICT(Id) DO UPDATE SET
                 Repository = excluded.Repository,
                 OriginalRequirement = excluded.OriginalRequirement,
@@ -65,7 +81,16 @@ public sealed class SqliteEngineeringTaskRepository(string connectionString) : I
                 Status = excluded.Status,
                 UpdatedAt = excluded.UpdatedAt,
                 RequirementApprovedAt = excluded.RequirementApprovedAt,
-                PlanApprovedAt = excluded.PlanApprovedAt;
+                PlanApprovedAt = excluded.PlanApprovedAt,
+                RepositorySnapshot = excluded.RepositorySnapshot,
+                EvidenceItems = excluded.EvidenceItems,
+                EvidenceFilesInspected = excluded.EvidenceFilesInspected,
+                EvidenceFilesSelected = excluded.EvidenceFilesSelected,
+                TotalEvidenceCharacters = excluded.TotalEvidenceCharacters,
+                ImplementationPlan = excluded.ImplementationPlan,
+                RepositoryAnalyzedAt = excluded.RepositoryAnalyzedAt,
+                RepositoryFingerprint = excluded.RepositoryFingerprint,
+                PlanCreatedAt = excluded.PlanCreatedAt;
             """;
 
         command.Parameters.AddWithValue("$id", task.Id.ToString());
@@ -82,6 +107,15 @@ public sealed class SqliteEngineeringTaskRepository(string connectionString) : I
         command.Parameters.AddWithValue("$updated", FormatDate(task.UpdatedAt));
         command.Parameters.AddWithValue("$requirementApproved", task.RequirementApprovedAt is { } approved ? FormatDate(approved) : DBNull.Value);
         command.Parameters.AddWithValue("$planApproved", task.PlanApprovedAt is { } planApproved ? FormatDate(planApproved) : DBNull.Value);
+        command.Parameters.AddWithValue("$snapshot", task.RepositorySnapshot is null ? DBNull.Value : JsonSerializer.Serialize(task.RepositorySnapshot, JsonOptions));
+        command.Parameters.AddWithValue("$evidence", JsonSerializer.Serialize(task.EvidenceItems, JsonOptions));
+        command.Parameters.AddWithValue("$evidenceInspected", task.EvidenceFilesInspected);
+        command.Parameters.AddWithValue("$evidenceSelected", task.EvidenceFilesSelected);
+        command.Parameters.AddWithValue("$evidenceCharacters", task.TotalEvidenceCharacters);
+        command.Parameters.AddWithValue("$plan", task.ImplementationPlan is null ? DBNull.Value : JsonSerializer.Serialize(task.ImplementationPlan, JsonOptions));
+        command.Parameters.AddWithValue("$repositoryAnalyzed", task.RepositoryAnalyzedAt is { } analyzed ? FormatDate(analyzed) : DBNull.Value);
+        command.Parameters.AddWithValue("$repositoryFingerprint", (object?)task.RepositoryFingerprint ?? DBNull.Value);
+        command.Parameters.AddWithValue("$planCreated", task.PlanCreatedAt is { } planCreated ? FormatDate(planCreated) : DBNull.Value);
         await command.ExecuteNonQueryAsync(cancellationToken);
     }
 
@@ -95,6 +129,12 @@ public sealed class SqliteEngineeringTaskRepository(string connectionString) : I
     {
         var value = ReadNullableString(reader, name);
         return value is null ? null : ParseDate(value);
+    }
+
+    private static T? DeserializeNullable<T>(SqliteDataReader reader, string name) where T : class
+    {
+        var value = ReadNullableString(reader, name);
+        return value is null ? null : JsonSerializer.Deserialize<T>(value, JsonOptions);
     }
 
     private static string FormatDate(DateTimeOffset date) => date.ToString("O", CultureInfo.InvariantCulture);

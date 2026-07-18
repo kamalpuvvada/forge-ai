@@ -31,12 +31,30 @@ public sealed class SqliteDatabaseInitializer(string connectionString)
                 CreatedAt TEXT NOT NULL,
                 UpdatedAt TEXT NOT NULL,
                 RequirementApprovedAt TEXT NULL,
-                PlanApprovedAt TEXT NULL
+                PlanApprovedAt TEXT NULL,
+                RepositorySnapshot TEXT NULL,
+                EvidenceItems TEXT NOT NULL DEFAULT '[]',
+                EvidenceFilesInspected INTEGER NOT NULL DEFAULT 0,
+                EvidenceFilesSelected INTEGER NOT NULL DEFAULT 0,
+                TotalEvidenceCharacters INTEGER NOT NULL DEFAULT 0,
+                ImplementationPlan TEXT NULL,
+                RepositoryAnalyzedAt TEXT NULL,
+                RepositoryFingerprint TEXT NULL,
+                PlanCreatedAt TEXT NULL
             );
             """;
         await command.ExecuteNonQueryAsync(cancellationToken);
         await EnsureColumnAsync(connection, "RequirementRevisionNotes", "TEXT NOT NULL DEFAULT '[]'", cancellationToken);
         await EnsureColumnAsync(connection, "ModelCalls", "TEXT NOT NULL DEFAULT '[]'", cancellationToken);
+        await EnsureColumnAsync(connection, "RepositorySnapshot", "TEXT NULL", cancellationToken);
+        await EnsureColumnAsync(connection, "EvidenceItems", "TEXT NOT NULL DEFAULT '[]'", cancellationToken);
+        await EnsureColumnAsync(connection, "EvidenceFilesInspected", "INTEGER NOT NULL DEFAULT 0", cancellationToken);
+        await EnsureColumnAsync(connection, "EvidenceFilesSelected", "INTEGER NOT NULL DEFAULT 0", cancellationToken);
+        await EnsureColumnAsync(connection, "TotalEvidenceCharacters", "INTEGER NOT NULL DEFAULT 0", cancellationToken);
+        await EnsureColumnAsync(connection, "ImplementationPlan", "TEXT NULL", cancellationToken);
+        await EnsureColumnAsync(connection, "RepositoryAnalyzedAt", "TEXT NULL", cancellationToken);
+        await EnsureColumnAsync(connection, "RepositoryFingerprint", "TEXT NULL", cancellationToken);
+        await EnsureColumnAsync(connection, "PlanCreatedAt", "TEXT NULL", cancellationToken);
     }
 
     private static async Task EnsureColumnAsync(

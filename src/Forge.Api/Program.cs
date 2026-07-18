@@ -21,10 +21,12 @@ var configuredDataSource = builder.Configuration.GetValue<string>("Forge:Databas
 var databasePath = Path.GetFullPath(configuredDataSource, builder.Environment.ContentRootPath);
 var connectionString = $"Data Source={databasePath}";
 var aiOptions = builder.Configuration.GetSection("Forge:AI").Get<ForgeAiOptions>() ?? new ForgeAiOptions();
+var analysisLimits = builder.Configuration.GetSection("Forge:RepositoryAnalysis").Get<RepositoryAnalysisLimits>() ?? new RepositoryAnalysisLimits();
 var apiKey = Environment.GetEnvironmentVariable("OPENAI_API_KEY");
 
 builder.Services.AddSingleton(TimeProvider.System);
 builder.Services.AddSingleton(aiOptions);
+builder.Services.AddSingleton(analysisLimits);
 builder.Services.AddSingleton(new OpenAIConfigurationState(!string.IsNullOrWhiteSpace(apiKey)));
 builder.Services.AddSingleton(new ModelCostCalculator(aiOptions.Pricing));
 builder.Services.AddSingleton<IClarificationEngine>(services => aiOptions.Mode switch
@@ -38,6 +40,10 @@ builder.Services.AddSingleton<IClarificationEngine>(services => aiOptions.Mode s
     _ => throw new InvalidOperationException($"Unsupported Forge AI mode '{aiOptions.Mode}'. Use 'Fake' or 'OpenAI'.")
 });
 builder.Services.AddSingleton<IEngineeringTaskRepository>(_ => new SqliteEngineeringTaskRepository(connectionString));
+builder.Services.AddSingleton<IRepositoryDiscoveryService, RepositoryDiscoveryService>();
+builder.Services.AddSingleton<IEvidenceSelectionService, DeterministicEvidenceSelectionService>();
+if (string.Equals(aiOptions.Mode, ForgeAiModes.Fake, StringComparison.OrdinalIgnoreCase))
+    builder.Services.AddSingleton<IPlanningEngine, FakePlanningEngine>();
 builder.Services.AddSingleton(new SqliteDatabaseInitializer(connectionString));
 builder.Services.AddScoped<EngineeringTaskService>();
 

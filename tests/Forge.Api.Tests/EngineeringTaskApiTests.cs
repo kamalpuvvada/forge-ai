@@ -13,8 +13,13 @@ namespace Forge.Api.Tests;
 public sealed class EngineeringTaskApiTests : IClassFixture<FakeModeFactory>
 {
     private readonly HttpClient _client;
+    private readonly FakeModeFactory _factory;
 
-    public EngineeringTaskApiTests(FakeModeFactory factory) => _client = factory.CreateClient();
+    public EngineeringTaskApiTests(FakeModeFactory factory)
+    {
+        _factory = factory;
+        _client = factory.CreateClient();
+    }
 
     [Fact]
     public async Task Complete_requirement_returns_immediate_summary()
@@ -92,9 +97,78 @@ public sealed class EngineeringTaskApiTests : IClassFixture<FakeModeFactory>
         Assert.DoesNotContain("sensitive-test-value", text);
     }
 
-    private async Task<JsonElement> CreateAsync(string requirement)
+    [Fact]
+    public async Task Approved_requirement_can_be_analyzed_planned_approved_and_read_back()
     {
-        var response = await _client.PostAsJsonAsync("/api/tasks", new { repository = "C:/repo", requirement });
+        var created = await CreateAsync("""
+            Add report export. Acceptance criteria: export is available. Validation: run focused tests.
+            """, _factory.TargetRepositoryPath);
+        var id = created.GetProperty("id").GetGuid();
+        (await _client.PostAsync($"/api/tasks/{id}/requirement-approval", null)).EnsureSuccessStatusCode();
+
+        var analysisResponse = await _client.PostAsync($"/api/tasks/{id}/repository-analysis", null);
+        analysisResponse.EnsureSuccessStatusCode();
+        var analyzed = await analysisResponse.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Equal("Planning", analyzed.GetProperty("status").GetString());
+        Assert.True(analyzed.GetProperty("repositorySnapshot").GetProperty("eligibleTextFileCount").GetInt32() > 0);
+        Assert.True(analyzed.GetProperty("evidenceItems").GetArrayLength() > 0);
+
+        var planResponse = await _client.PostAsync($"/api/tasks/{id}/plan", null);
+        planResponse.EnsureSuccessStatusCode();
+        var planned = await planResponse.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Equal("AwaitingPlanApproval", planned.GetProperty("status").GetString());
+        Assert.True(planned.GetProperty("implementationPlan").GetProperty("isDeterministicFake").GetBoolean());
+
+        var approvalResponse = await _client.PostAsync($"/api/tasks/{id}/plan-approval", null);
+        approvalResponse.EnsureSuccessStatusCode();
+        var approved = await approvalResponse.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Equal("Implementing", approved.GetProperty("status").GetString());
+        Assert.NotEqual(JsonValueKind.Null, approved.GetProperty("planApprovedAt").ValueKind);
+
+        var persisted = await _client.GetFromJsonAsync<JsonElement>($"/api/tasks/{id}");
+        Assert.Equal("Implementing", persisted.GetProperty("status").GetString());
+        Assert.True(persisted.GetProperty("evidenceItems").GetArrayLength() > 0);
+    }
+
+    [Fact]
+    public async Task Analysis_before_requirement_approval_returns_conflict()
+    {
+        var created = await CreateAsync("Add report export.", _factory.TargetRepositoryPath);
+        var response = await _client.PostAsync($"/api/tasks/{created.GetProperty("id").GetGuid()}/repository-analysis", null);
+        Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task Missing_repository_path_returns_safe_problem_details()
+    {
+        var missing = Path.Combine(_factory.TargetRepositoryPath, "does-not-exist");
+        var created = await CreateAsync("Add report export. Acceptance criteria: export works. Validation: run tests.", missing);
+        var id = created.GetProperty("id").GetGuid();
+        (await _client.PostAsync($"/api/tasks/{id}/requirement-approval", null)).EnsureSuccessStatusCode();
+
+        var response = await _client.PostAsync($"/api/tasks/{id}/repository-analysis", null);
+        var problem = await response.Content.ReadFromJsonAsync<JsonElement>();
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.Equal("repository_missing_path", problem.GetProperty("code").GetString());
+        Assert.DoesNotContain(missing, problem.GetProperty("detail").GetString());
+    }
+
+    [Fact]
+    public async Task Capabilities_truthfully_report_read_only_fake_planning()
+    {
+        var capabilities = await _client.GetFromJsonAsync<JsonElement>("/api/system/capabilities");
+        Assert.True(capabilities.GetProperty("repositoryInspectionAvailable").GetBoolean());
+        Assert.True(capabilities.GetProperty("planningAvailable").GetBoolean());
+        Assert.False(capabilities.GetProperty("targetModificationAvailable").GetBoolean());
+        Assert.False(capabilities.GetProperty("validationAvailable").GetBoolean());
+        Assert.False(capabilities.GetProperty("reviewAvailable").GetBoolean());
+        Assert.False(capabilities.GetProperty("pullRequestCreationAvailable").GetBoolean());
+    }
+
+    private async Task<JsonElement> CreateAsync(string requirement, string repository = "C:/repo")
+    {
+        var response = await _client.PostAsJsonAsync("/api/tasks", new { repository, requirement });
         response.EnsureSuccessStatusCode();
         return await response.Content.ReadFromJsonAsync<JsonElement>();
     }
@@ -103,6 +177,19 @@ public sealed class EngineeringTaskApiTests : IClassFixture<FakeModeFactory>
 public class FakeModeFactory : WebApplicationFactory<Program>
 {
     private readonly string _directory = Path.Combine(Path.GetTempPath(), $"forge-api-tests-{Guid.NewGuid():N}");
+    public string TargetRepositoryPath
+    {
+        get
+        {
+            var path = Path.Combine(_directory, "target-repository");
+            Directory.CreateDirectory(Path.Combine(path, "src"));
+            var source = Path.Combine(path, "src", "ReportExportService.cs");
+            if (!File.Exists(source)) File.WriteAllText(source, "public sealed class ReportExportService { }\n");
+            var project = Path.Combine(path, "Forge.Sample.csproj");
+            if (!File.Exists(project)) File.WriteAllText(project, "<Project Sdk=\"Microsoft.NET.Sdk\" />\n");
+            return path;
+        }
+    }
 
     protected override void ConfigureWebHost(IWebHostBuilder builder)
     {
