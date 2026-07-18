@@ -30,6 +30,9 @@ public sealed class OpenAIPlanningEngine(
         the full approved requirement, quote evidence excerpts, or copy repository content. Objective,
         repository understanding, and summary should each normally be one concise paragraph. Keep
         affected-file purposes and step descriptions brief. Refer to evidence only by ID.
+        When a plan correction is supplied, directly address it, preserve valid portions of the previous plan,
+        and add missing domain or persistence work when supported by refreshed evidence. State when evidence
+        remains insufficient, and do not merely reword the previous plan.
         """;
 
     internal const string ResponseSchema = """
@@ -228,7 +231,6 @@ public sealed class OpenAIPlanningEngine(
         var snapshot = context.Snapshot;
         var payload = new
         {
-            originalRequirement = Safe(context.OriginalRequirement, snapshot.NormalizedRoot),
             approvedRequirementSummary = Safe(context.ApprovedRequirementSummary, snapshot.NormalizedRoot),
             clarificationAnswers = context.ClarificationAnswers.Select(answer => new
             {
@@ -236,6 +238,12 @@ public sealed class OpenAIPlanningEngine(
                 answer = Safe(answer.Answer, snapshot.NormalizedRoot)
             }),
             revisionNotes = context.RevisionNotes.Select(note => Safe(note.Correction, snapshot.NormalizedRoot)),
+            latestPlanCorrection = context.LatestPlanRevision is null
+                ? null
+                : Safe(context.LatestPlanRevision.Correction, snapshot.NormalizedRoot),
+            previousPlanAffectedPaths = (context.PreviousPlanAffectedPaths ?? [])
+                .Select(path => Safe(path, snapshot.NormalizedRoot))
+                .Distinct(StringComparer.OrdinalIgnoreCase),
             repositorySnapshot = new
             {
                 snapshot.TotalDiscoveredFiles,

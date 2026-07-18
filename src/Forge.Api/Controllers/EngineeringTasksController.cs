@@ -87,6 +87,21 @@ public sealed class EngineeringTasksController(EngineeringTaskService service) :
         return Ok(EngineeringTaskResponse.FromDomain(task));
     }
 
+    [HttpPost("{id:guid}/plan-revision")]
+    [ProducesResponseType<EngineeringTaskResponse>(StatusCodes.Status200OK)]
+    [ProducesResponseType<ValidationProblemDetails>(StatusCodes.Status400BadRequest)]
+    [ProducesResponseType<ProblemDetails>(StatusCodes.Status409Conflict)]
+    [ProducesResponseType<ProblemDetails>(StatusCodes.Status422UnprocessableEntity)]
+    [ProducesResponseType<ProblemDetails>(StatusCodes.Status502BadGateway)]
+    public async Task<ActionResult<EngineeringTaskResponse>> RequestPlanRevision(
+        Guid id,
+        RequestPlanRevisionRequest request,
+        CancellationToken cancellationToken)
+    {
+        var task = await service.RequestPlanRevisionAsync(id, request.Correction, cancellationToken);
+        return Ok(EngineeringTaskResponse.FromDomain(task));
+    }
+
     [HttpPost("{id:guid}/plan-approval")]
     [ProducesResponseType<EngineeringTaskResponse>(StatusCodes.Status200OK)]
     [ProducesResponseType<ProblemDetails>(StatusCodes.Status409Conflict)]

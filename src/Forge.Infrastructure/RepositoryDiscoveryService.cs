@@ -30,6 +30,56 @@ public sealed class RepositoryDiscoveryService(
         ".mov", ".avi", ".db", ".sqlite", ".sqlite3"
     };
 
+    public async Task<RepositorySnapshotReadResult> ReadSnapshotAsync(
+        RepositorySnapshot snapshot,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(snapshot);
+        cancellationToken.ThrowIfCancellationRequested();
+        var root = Path.GetFullPath(snapshot.NormalizedRoot)
+            .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        if (!Directory.Exists(root)) return new RepositorySnapshotReadResult(false, []);
+
+        if (snapshot.IsGitRepository)
+        {
+            var head = (await RunGitAsync(root, ["rev-parse", "HEAD"], cancellationToken))?.Output.Trim();
+            var status = (await RunGitAsync(root, ["status", "--short"], cancellationToken))?.Output.TrimEnd() ?? string.Empty;
+            var state = string.IsNullOrWhiteSpace(status) ? "clean" : "dirty";
+            if (!string.Equals(head, snapshot.FullHeadSha, StringComparison.Ordinal) ||
+                !string.Equals(state, snapshot.WorkingTreeStatus, StringComparison.Ordinal) ||
+                snapshot.GitStatusHash is null ||
+                !string.Equals(Hash(status), snapshot.GitStatusHash, StringComparison.Ordinal))
+                return new RepositorySnapshotReadResult(false, []);
+        }
+
+        var textFiles = new List<RepositoryTextFile>(snapshot.Files.Count);
+        foreach (var metadata in snapshot.Files)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var fullPath = ResolveContainedPath(root, metadata.RelativePath);
+            FileInfo info;
+            try { info = new FileInfo(fullPath); }
+            catch (Exception exception) when (exception is UnauthorizedAccessException or IOException)
+            {
+                return new RepositorySnapshotReadResult(false, []);
+            }
+            if (!info.Exists || (info.Attributes & FileAttributes.ReparsePoint) != 0 ||
+                info.Length != metadata.SizeBytes || info.LastWriteTimeUtc > snapshot.AnalyzedAt.UtcDateTime)
+                return new RepositorySnapshotReadResult(false, []);
+
+            string content;
+            try { content = await File.ReadAllTextAsync(fullPath, cancellationToken); }
+            catch (Exception exception) when (exception is UnauthorizedAccessException or IOException or DecoderFallbackException)
+            {
+                return new RepositorySnapshotReadResult(false, []);
+            }
+            if (content.IndexOf('\0') >= 0) return new RepositorySnapshotReadResult(false, []);
+            textFiles.Add(new RepositoryTextFile(metadata, content));
+        }
+
+        return new RepositorySnapshotReadResult(true, textFiles);
+    }
+
     public async Task<RepositoryDiscoveryResult> DiscoverAsync(
         string repositoryPath,
         CancellationToken cancellationToken = default)
@@ -208,7 +258,8 @@ public sealed class RepositoryDiscoveryService(
             warnings.Distinct().ToArray(),
             analyzedAt,
             Hash(fingerprintMaterial),
-            metadata);
+            metadata,
+            isGit ? Hash(gitStatus) : null);
         return new RepositoryDiscoveryResult(snapshot, textFiles);
     }
 

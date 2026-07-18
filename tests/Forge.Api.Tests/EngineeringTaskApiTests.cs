@@ -140,6 +140,56 @@ public sealed class EngineeringTaskApiTests : IClassFixture<FakeModeFactory>
     }
 
     [Fact]
+    public async Task Fake_plan_correction_endpoint_preserves_previous_plan_and_requires_explicit_approval()
+    {
+        var created = await CreateAsync("""
+            Add report export with pricing telemetry. Acceptance criteria: export is available. Validation: run focused tests.
+            """, _factory.TargetRepositoryPath);
+        var id = created.GetProperty("id").GetGuid();
+        (await _client.PostAsync($"/api/tasks/{id}/requirement-approval", null)).EnsureSuccessStatusCode();
+        (await _client.PostAsync($"/api/tasks/{id}/repository-analysis", null)).EnsureSuccessStatusCode();
+        var initialPlanResponse = await _client.PostAsync($"/api/tasks/{id}/plan", null);
+        initialPlanResponse.EnsureSuccessStatusCode();
+        var initialPlan = await initialPlanResponse.Content.ReadFromJsonAsync<JsonElement>();
+        var previousTitle = initialPlan.GetProperty("implementationPlan").GetProperty("title").GetString();
+
+        var correctionResponse = await _client.PostAsJsonAsync($"/api/tasks/{id}/plan-revision", new
+        {
+            correction = "Include model call pricing persistence and SQLite tests."
+        });
+        Assert.True(correctionResponse.IsSuccessStatusCode, await correctionResponse.Content.ReadAsStringAsync());
+        var revised = await correctionResponse.Content.ReadFromJsonAsync<JsonElement>();
+
+        Assert.Equal("AwaitingPlanApproval", revised.GetProperty("status").GetString());
+        Assert.Equal(JsonValueKind.Null, revised.GetProperty("planApprovedAt").ValueKind);
+        var history = Assert.Single(revised.GetProperty("planRevisionNotes").EnumerateArray());
+        Assert.Equal(previousTitle, history.GetProperty("previousPlanTitle").GetString());
+        Assert.Contains("src/", history.GetProperty("previousAffectedPaths")[0].GetString(), StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("revised", revised.GetProperty("implementationPlan").GetProperty("title").GetString(), StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(0, revised.GetProperty("telemetry").GetProperty("totalCalls").GetInt32());
+
+        var approval = await _client.PostAsync($"/api/tasks/{id}/plan-approval", null);
+        approval.EnsureSuccessStatusCode();
+        Assert.Equal("PlanApproved", (await approval.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("status").GetString());
+    }
+
+    [Fact]
+    public async Task Plan_correction_endpoint_rejects_invalid_state_and_empty_input_safely()
+    {
+        var created = await CreateAsync("Add report export.", _factory.TargetRepositoryPath);
+        var id = created.GetProperty("id").GetGuid();
+
+        var conflict = await _client.PostAsJsonAsync($"/api/tasks/{id}/plan-revision", new { correction = "Add persistence." });
+        Assert.Equal(HttpStatusCode.Conflict, conflict.StatusCode);
+        var conflictProblem = await conflict.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Equal("workflow_conflict", conflictProblem.GetProperty("code").GetString());
+
+        var empty = await _client.PostAsJsonAsync($"/api/tasks/{id}/plan-revision", new { correction = "   " });
+        Assert.Equal(HttpStatusCode.BadRequest, empty.StatusCode);
+        Assert.DoesNotContain(_factory.TargetRepositoryPath, await empty.Content.ReadAsStringAsync(), StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public async Task Analysis_before_requirement_approval_returns_conflict()
     {
         var created = await CreateAsync("Add report export.", _factory.TargetRepositoryPath);

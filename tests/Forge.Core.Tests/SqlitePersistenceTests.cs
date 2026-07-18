@@ -65,6 +65,7 @@ public sealed class SqlitePersistenceTests : IDisposable
         var columns = new List<string>();
         while (await reader.ReadAsync()) columns.Add(reader.GetString(1));
         Assert.Contains("RequirementRevisionNotes", columns);
+        Assert.Contains("PlanRevisionNotes", columns);
         Assert.Contains("ModelCalls", columns);
         Assert.Contains("RepositorySnapshot", columns);
         Assert.Contains("EvidenceItems", columns);
@@ -102,6 +103,40 @@ public sealed class SqlitePersistenceTests : IDisposable
         Assert.Null(loaded.ImplementationPlan?.PlanningModel);
         Assert.Equal(now.AddMinutes(1), loaded.PlanApprovedAt);
         Assert.Equal(WorkflowStatus.PlanApproved, loaded.Status);
+    }
+
+    [Fact]
+    public async Task Plan_revision_history_previous_plan_and_revised_plan_round_trip()
+    {
+        await new SqliteDatabaseInitializer(ConnectionString).InitializeAsync();
+        var repository = new SqliteEngineeringTaskRepository(ConnectionString);
+        var now = DateTimeOffset.UtcNow;
+        var task = EngineeringTask.Create("C:/repo", "Add report export", now);
+        task.ApplyClarificationEvaluation(ClarificationEvaluation.Summarize("Add report export"), now);
+        task.ApproveRequirementSummary(now);
+        task.BeginRepositoryAnalysis(now);
+        var snapshot = PlanningWorkflowTests.Snapshot(now);
+        var evidence = PlanningWorkflowTests.Evidence();
+        task.StoreRepositorySnapshot(snapshot, now);
+        task.StoreEvidence(new EvidenceSelection([evidence], 1, 1, evidence.Excerpt.Length), now);
+        var previousPlan = PlanningWorkflowTests.Plan(snapshot, [evidence]);
+        task.StoreImplementationPlan(previousPlan, now, TimeSpan.FromMinutes(30));
+        task.RequestPlanRevision("Persist per-call pricing snapshots.", now.AddMinutes(1));
+        task.StoreEvidence(new EvidenceSelection([evidence], 1, 1, evidence.Excerpt.Length), now.AddMinutes(1));
+        var revisedPlan = PlanningWorkflowTests.Plan(snapshot, [evidence]) with { Title = "Revised pricing snapshot plan" };
+        task.StoreImplementationPlan(revisedPlan, now.AddMinutes(2), TimeSpan.FromMinutes(30));
+        await repository.SaveAsync(task);
+
+        var loaded = await repository.GetAsync(task.Id);
+
+        Assert.NotNull(loaded);
+        var revision = Assert.Single(loaded.PlanRevisionNotes);
+        Assert.Equal("Persist per-call pricing snapshots.", revision.Correction);
+        Assert.Equal(previousPlan.Title, revision.PreviousPlanTitle);
+        Assert.Equal(previousPlan.Summary, revision.PreviousPlan.Summary);
+        Assert.Equal(snapshot.Fingerprint, revision.PreviousRepositoryFingerprint);
+        Assert.Equal("Revised pricing snapshot plan", loaded.ImplementationPlan?.Title);
+        Assert.Equal(WorkflowStatus.AwaitingPlanApproval, loaded.Status);
     }
 
     [Fact]

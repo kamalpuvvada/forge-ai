@@ -36,13 +36,18 @@ public sealed class FakePlanningEngine : IPlanningEngine
 
         var allPaths = affected.Select(file => file.Path).ToArray();
         var allEvidence = affected.SelectMany(file => file.EvidenceIds).Distinct().ToArray();
+        var isRevision = context.LatestPlanRevision is not null;
         var plan = new ImplementationPlan(
-            "Deterministic Fake plan — approved requirement",
-            "Implement the approved requirement using only the selected repository evidence.",
+            isRevision ? "Deterministic Fake revised plan" : "Deterministic Fake plan — approved requirement",
+            isRevision
+                ? "Revise the implementation plan to address the focused correction using refreshed evidence."
+                : "Implement the approved requirement using only the selected repository evidence.",
             $"Read-only analysis found {context.Snapshot.TotalDiscoveredFiles} files, {context.Snapshot.EligibleTextFileCount} eligible text files, and selected {context.Evidence.Count} evidence items. No repository content was modified.",
             affected,
             [
-                new ImplementationStep(1, "Review the approved requirement and cited evidence before editing.", allPaths, allEvidence, "The implementation scope and evidence-backed file set are confirmed."),
+                new ImplementationStep(1, isRevision
+                    ? "Review the focused plan correction, previous affected paths, and refreshed evidence before editing."
+                    : "Review the approved requirement and cited evidence before editing.", allPaths, allEvidence, "The implementation scope and evidence-backed file set are confirmed."),
                 new ImplementationStep(2, limited ? "Resolve the evidence gap before choosing concrete edits." : "Implement only the approved behavior in the evidence-backed affected files.", allPaths, allEvidence, "The approved behavior is represented by a focused change set."),
                 new ImplementationStep(3, "Add or update focused tests for the approved acceptance criteria.", allPaths, allEvidence, "Focused automated coverage describes the expected behavior."),
                 new ImplementationStep(4, "Run the proposed validation commands and review the resulting diff.", allPaths, allEvidence, "Actual validation results and final scope are available for review.")
@@ -57,7 +62,9 @@ public sealed class FakePlanningEngine : IPlanningEngine
             limited ? ["Which concrete file should own the behavior after the evidence gap is resolved?"] : [],
             limited
                 ? "Deterministic Fake-mode plan created with limited evidence; confirm locations before implementation."
-                : "Deterministic Fake-mode plan grounded in the selected repository evidence. No code was changed.",
+                : isRevision
+                    ? "Deterministic Fake-mode revised plan grounded in refreshed repository evidence. No code was changed."
+                    : "Deterministic Fake-mode plan grounded in the selected repository evidence. No code was changed.",
             PlanningSource.DeterministicFake,
             null,
             context.CreatedAt,

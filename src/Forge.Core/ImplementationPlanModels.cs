@@ -54,7 +54,9 @@ public sealed record PlanningContext(
     IReadOnlyList<RequirementRevisionNote> RevisionNotes,
     RepositorySnapshot Snapshot,
     IReadOnlyList<EvidenceItem> Evidence,
-    DateTimeOffset CreatedAt);
+    DateTimeOffset CreatedAt,
+    PlanRevisionNote? LatestPlanRevision = null,
+    IReadOnlyList<string>? PreviousPlanAffectedPaths = null);
 
 public sealed record PlanningEvaluation(
     ImplementationPlan Plan,

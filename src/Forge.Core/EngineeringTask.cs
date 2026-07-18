@@ -4,6 +4,7 @@ public sealed class EngineeringTask
 {
     private readonly List<ClarificationAnswer> _clarificationAnswers = [];
     private readonly List<RequirementRevisionNote> _requirementRevisionNotes = [];
+    private readonly List<PlanRevisionNote> _planRevisionNotes = [];
     private readonly List<ModelCallRecord> _modelCalls = [];
 
     private EngineeringTask() { }
@@ -14,6 +15,7 @@ public sealed class EngineeringTask
     public string CurrentClarifiedRequirement { get; private set; } = string.Empty;
     public IReadOnlyList<ClarificationAnswer> ClarificationAnswers => _clarificationAnswers;
     public IReadOnlyList<RequirementRevisionNote> RequirementRevisionNotes => _requirementRevisionNotes;
+    public IReadOnlyList<PlanRevisionNote> PlanRevisionNotes => _planRevisionNotes;
     public IReadOnlyList<ModelCallRecord> ModelCalls => _modelCalls;
     public string? CurrentPendingQuestion { get; private set; }
     public string? RequirementSummary { get; private set; }
@@ -197,6 +199,33 @@ public sealed class EngineeringTask
         UpdatedAt = now;
     }
 
+    public void RequestPlanRevision(string correction, DateTimeOffset now)
+    {
+        EnsurePlanRevisionCanBeRequested(correction);
+        var previousPlan = ImplementationPlan!;
+        var previousFingerprint = RepositoryFingerprint!;
+
+        _planRevisionNotes.Add(new PlanRevisionNote(
+            correction.Trim(),
+            now,
+            previousPlan.Title,
+            previousFingerprint,
+            previousPlan));
+        ImplementationPlan = null;
+        PlanCreatedAt = null;
+        PlanApprovedAt = null;
+        Status = WorkflowStatus.Planning;
+        UpdatedAt = now;
+    }
+
+    public void EnsurePlanRevisionCanBeRequested(string correction)
+    {
+        EnsureStatus(WorkflowStatus.AwaitingPlanApproval);
+        ArgumentException.ThrowIfNullOrWhiteSpace(correction);
+        if (ImplementationPlan is null || RepositorySnapshot is null || string.IsNullOrWhiteSpace(RepositoryFingerprint))
+            throw new WorkflowException("A current implementation plan and repository snapshot are required before requesting a correction.");
+    }
+
     public void RecordModelCall(ModelCallRecord call, DateTimeOffset now)
     {
         ArgumentNullException.ThrowIfNull(call);
@@ -229,7 +258,8 @@ public sealed class EngineeringTask
         ImplementationPlan? implementationPlan = null,
         DateTimeOffset? repositoryAnalyzedAt = null,
         string? repositoryFingerprint = null,
-        DateTimeOffset? planCreatedAt = null)
+        DateTimeOffset? planCreatedAt = null,
+        IEnumerable<PlanRevisionNote>? planRevisionNotes = null)
     {
         var task = new EngineeringTask
         {
@@ -258,6 +288,7 @@ public sealed class EngineeringTask
         };
         task._clarificationAnswers.AddRange(answers);
         task._requirementRevisionNotes.AddRange(revisionNotes);
+        task._planRevisionNotes.AddRange(planRevisionNotes ?? []);
         task._modelCalls.AddRange(modelCalls);
         return task;
     }

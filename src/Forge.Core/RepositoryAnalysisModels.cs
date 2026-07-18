@@ -38,12 +38,17 @@ public sealed record RepositorySnapshot(
     IReadOnlyList<string> Warnings,
     DateTimeOffset AnalyzedAt,
     string Fingerprint,
-    IReadOnlyList<RepositoryFileMetadata> Files);
+    IReadOnlyList<RepositoryFileMetadata> Files,
+    string? GitStatusHash = null);
 
 public sealed record RepositoryTextFile(RepositoryFileMetadata Metadata, string Content);
 
 public sealed record RepositoryDiscoveryResult(
     RepositorySnapshot Snapshot,
+    IReadOnlyList<RepositoryTextFile> TextFiles);
+
+public sealed record RepositorySnapshotReadResult(
+    bool IsFresh,
     IReadOnlyList<RepositoryTextFile> TextFiles);
 
 public sealed record EvidenceItem(
@@ -67,6 +72,16 @@ public interface IRepositoryDiscoveryService
     Task<RepositoryDiscoveryResult> DiscoverAsync(
         string repositoryPath,
         CancellationToken cancellationToken = default);
+
+    async Task<RepositorySnapshotReadResult> ReadSnapshotAsync(
+        RepositorySnapshot snapshot,
+        CancellationToken cancellationToken = default)
+    {
+        var current = await DiscoverAsync(snapshot.NormalizedRoot, cancellationToken);
+        return new RepositorySnapshotReadResult(
+            string.Equals(current.Snapshot.Fingerprint, snapshot.Fingerprint, StringComparison.Ordinal),
+            current.TextFiles);
+    }
 }
 
 public interface IEvidenceSelectionService
@@ -77,6 +92,13 @@ public interface IEvidenceSelectionService
         string originalRequirement,
         string approvedRequirementSummary,
         IReadOnlyList<ClarificationAnswer> clarificationAnswers);
+
+    EvidenceSelection SelectForPlanRevision(
+        RepositorySnapshot snapshot,
+        IReadOnlyList<RepositoryTextFile> textFiles,
+        string approvedRequirementSummary,
+        string correction) =>
+        Select(snapshot, textFiles, string.Empty, $"{approvedRequirementSummary} {correction}", []);
 }
 
 public sealed class RepositoryDiscoveryException(string category, string safeMessage, Exception? inner = null)

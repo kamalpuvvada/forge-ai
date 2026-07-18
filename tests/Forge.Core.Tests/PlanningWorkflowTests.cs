@@ -55,6 +55,57 @@ public sealed class PlanningWorkflowTests
     }
 
     [Fact]
+    public void Focused_plan_correction_archives_plan_preserves_requirement_and_requires_new_approval()
+    {
+        var task = ApprovedTask();
+        task.BeginRepositoryAnalysis(Now);
+        var snapshot = Snapshot(Now);
+        var evidence = Evidence();
+        task.StoreRepositorySnapshot(snapshot, Now);
+        task.StoreEvidence(new EvidenceSelection([evidence], 1, 1, evidence.Excerpt.Length), Now);
+        var previousPlan = Plan(snapshot, [evidence]);
+        task.StoreImplementationPlan(previousPlan, Now, TimeSpan.FromMinutes(30));
+        var approvedRequirement = task.RequirementSummary;
+        var approvedAt = task.RequirementApprovedAt;
+
+        task.RequestPlanRevision("Include the model-call record and persistence path.", Now.AddMinutes(1));
+
+        Assert.Equal(WorkflowStatus.Planning, task.Status);
+        Assert.Null(task.ImplementationPlan);
+        Assert.Null(task.PlanApprovedAt);
+        Assert.Equal(approvedRequirement, task.RequirementSummary);
+        Assert.Equal(approvedAt, task.RequirementApprovedAt);
+        var revision = Assert.Single(task.PlanRevisionNotes);
+        Assert.Equal(previousPlan, revision.PreviousPlan);
+        Assert.Equal(snapshot.Fingerprint, revision.PreviousRepositoryFingerprint);
+        Assert.Throws<WorkflowException>(() => task.ApproveImplementationPlan(Now.AddMinutes(2)));
+
+        task.StoreImplementationPlan(Plan(snapshot, [evidence]), Now.AddMinutes(2), TimeSpan.FromMinutes(30));
+        Assert.Equal(WorkflowStatus.AwaitingPlanApproval, task.Status);
+        Assert.Null(task.PlanApprovedAt);
+        task.ApproveImplementationPlan(Now.AddMinutes(3));
+        Assert.Equal(WorkflowStatus.PlanApproved, task.Status);
+    }
+
+    [Fact]
+    public void Plan_correction_is_rejected_outside_review_and_when_empty()
+    {
+        Assert.Throws<WorkflowException>(() => ApprovedTask().RequestPlanRevision("Add persistence", Now));
+
+        var task = ApprovedTask();
+        task.BeginRepositoryAnalysis(Now);
+        var snapshot = Snapshot(Now);
+        var evidence = Evidence();
+        task.StoreRepositorySnapshot(snapshot, Now);
+        task.StoreEvidence(new EvidenceSelection([evidence], 1, 1, evidence.Excerpt.Length), Now);
+        task.StoreImplementationPlan(Plan(snapshot, [evidence]), Now, TimeSpan.FromMinutes(30));
+
+        Assert.Throws<ArgumentException>(() => task.RequestPlanRevision("   ", Now));
+        Assert.NotNull(task.ImplementationPlan);
+        Assert.Empty(task.PlanRevisionNotes);
+    }
+
+    [Fact]
     public void No_public_transition_bypass_exists()
     {
         Assert.Null(typeof(EngineeringTask).GetMethod("TransitionTo", BindingFlags.Instance | BindingFlags.Public));

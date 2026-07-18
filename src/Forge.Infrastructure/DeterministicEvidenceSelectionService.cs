@@ -11,11 +11,19 @@ public sealed class DeterministicEvidenceSelectionService(RepositoryAnalysisLimi
     {
         "the", "and", "for", "with", "that", "this", "from", "into", "should", "must", "will",
         "add", "allow", "create", "implement", "requirement", "users", "user", "forge", "please",
-        "current", "existing", "model", "status", "code", "file", "files", "feature", "support"
+        "current", "existing", "model", "status", "code", "file", "files", "feature", "support",
+        "plan", "include", "only", "not", "per", "solve", "omits"
     };
     private static readonly HashSet<string> WeakTerms = new(StringComparer.OrdinalIgnoreCase)
     {
-        "task", "data", "service", "application", "repository", "result", "response", "request"
+        "task", "data", "service", "application", "repository", "result", "response", "request",
+        "model", "status", "requirement", "existing", "current"
+    };
+    private static readonly HashSet<string> PhraseStopWords = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "the", "and", "for", "with", "that", "this", "from", "into", "should", "must", "will",
+        "add", "allow", "create", "implement", "users", "user", "forge", "please",
+        "include", "only", "not", "per", "solve", "omits"
     };
     private static readonly string[] SensitiveKeys =
     [
@@ -33,13 +41,30 @@ public sealed class DeterministicEvidenceSelectionService(RepositoryAnalysisLimi
         ArgumentNullException.ThrowIfNull(snapshot);
         var requirementText = string.Join(' ', new[] { originalRequirement, approvedRequirementSummary }
             .Concat(clarificationAnswers.SelectMany(answer => new[] { answer.Question, answer.Answer })));
+        return SelectCore(snapshot, textFiles, requirementText, null);
+    }
+
+    public EvidenceSelection SelectForPlanRevision(
+        RepositorySnapshot snapshot,
+        IReadOnlyList<RepositoryTextFile> textFiles,
+        string approvedRequirementSummary,
+        string correction) =>
+        SelectCore(snapshot, textFiles, $"{approvedRequirementSummary} {correction}", ExtractSignals(correction));
+
+    private EvidenceSelection SelectCore(
+        RepositorySnapshot snapshot,
+        IReadOnlyList<RepositoryTextFile> textFiles,
+        string requirementText,
+        RequirementSignals? prioritySignals)
+    {
         var signals = ExtractSignals(requirementText);
         var seeksClarificationWork = signals.Terms.Any(term => term.StartsWith("clarif", StringComparison.Ordinal)) ||
             signals.Terms.Any(term => term.StartsWith("question", StringComparison.Ordinal));
+        var seeksPlanningWork = signals.Phrases.Any(phrase => phrase is "planning engine" or "plan revision" or "plan correction");
 
         var ranked = textFiles
             .Where(file => IsSafeRelative(file.Metadata.RelativePath) && !RepositoryDiscoveryService.IsSecretFile(file.Metadata.RelativePath))
-            .Select(file => Rank(file, signals, seeksClarificationWork))
+            .Select(file => Rank(file, signals, prioritySignals, seeksClarificationWork, seeksPlanningWork))
             .OrderByDescending(item => item.Score)
             .ThenBy(item => item.File.Metadata.RelativePath, StringComparer.OrdinalIgnoreCase)
             .ToArray();
@@ -97,14 +122,17 @@ public sealed class DeterministicEvidenceSelectionService(RepositoryAnalysisLimi
             if (candidate is not null) Add(candidate);
         }
 
+        foreach (var candidate in ranked.Where(item => item.PriorityNameMatch))
+        {
+            if (chosen.Count >= maximum) break;
+            if (CanAdd(candidate)) Add(candidate);
+        }
+
         foreach (var candidate in ranked)
         {
             if (chosen.Count >= maximum) break;
             if (candidate.Score <= 0 && chosen.Count > 0) break;
-            if (candidate.Module != "Docs" && chosen.Count(item => item.Module == candidate.Module) >= 3)
-                continue;
-            if (candidate.Module == "Docs" && chosen.Any(item => item.Module != "Docs") && chosen.Count(item => item.Module == "Docs") >= 1)
-                continue;
+            if (!CanAdd(candidate)) continue;
             Add(candidate);
         }
 
@@ -114,37 +142,67 @@ public sealed class DeterministicEvidenceSelectionService(RepositoryAnalysisLimi
         {
             if (chosen.Count < maximum && paths.Add(candidate.File.Metadata.RelativePath)) chosen.Add(candidate);
         }
+
+
+        bool CanAdd(RankedFile candidate)
+        {
+            if (paths.Contains(candidate.File.Metadata.RelativePath)) return false;
+            if (candidate.Module != "Docs" && chosen.Count(item => item.Module == candidate.Module) >= 3) return false;
+            return candidate.Module != "Docs" || !chosen.Any(item => item.Module != "Docs") ||
+                chosen.Count(item => item.Module == "Docs") < 1;
+        }
     }
 
-    private static RankedFile Rank(RepositoryTextFile file, RequirementSignals signals, bool seeksClarificationWork)
+    private static RankedFile Rank(
+        RepositoryTextFile file,
+        RequirementSignals signals,
+        RequirementSignals? prioritySignals,
+        bool seeksClarificationWork,
+        bool seeksPlanningWork)
     {
-        var path = file.Metadata.RelativePath.ToLowerInvariant();
-        var symbols = string.Join(' ', file.Metadata.DeclaredSymbols).ToLowerInvariant();
-        var content = file.Content.ToLowerInvariant();
-        var module = ClassifyModule(path);
+        var rawPath = file.Metadata.RelativePath.ToLowerInvariant();
+        var path = NormalizeSearchText(file.Metadata.RelativePath);
+        var symbols = NormalizeSearchText(string.Join(' ', file.Metadata.DeclaredSymbols));
+        var content = NormalizeSearchText(file.Content);
+        var module = ClassifyModule(rawPath);
         var phrasePath = signals.Phrases.Count(path.Contains);
         var phraseSymbols = signals.Phrases.Count(symbols.Contains);
         var phraseContent = signals.Phrases.Sum(phrase => Math.Min(3, Regex.Matches(content, Regex.Escape(phrase)).Count));
-        var strongPath = signals.Terms.Count(term => !WeakTerms.Contains(term) && path.Contains(term));
-        var strongSymbols = signals.Terms.Count(term => !WeakTerms.Contains(term) && symbols.Contains(term));
-        var contentMatches = signals.Terms.Sum(term => Math.Min(5, Regex.Matches(content, Regex.Escape(term)).Count) * (WeakTerms.Contains(term) ? 1 : 2));
+        var strongPath = signals.Terms.Count(term => !WeakTerms.Contains(term) && ContainsTerm(path, term));
+        var strongSymbols = signals.Terms.Count(term => !WeakTerms.Contains(term) && ContainsTerm(symbols, term));
+        var contentMatches = signals.Terms.Sum(term => Math.Min(5, CountTermMatches(content, term)) * (WeakTerms.Contains(term) ? 1 : 2));
+        var priorityPhrasePath = prioritySignals?.Phrases.Count(path.Contains) ?? 0;
+        var priorityPhraseSymbols = prioritySignals?.Phrases.Count(symbols.Contains) ?? 0;
+        var priorityPhraseContent = prioritySignals?.Phrases.Sum(phrase => Math.Min(2, Regex.Matches(content, Regex.Escape(phrase)).Count)) ?? 0;
+        var priorityStrongPath = prioritySignals?.Terms.Count(term => !WeakTerms.Contains(term) && ContainsTerm(path, term)) ?? 0;
+        var priorityStrongSymbols = prioritySignals?.Terms.Count(term => !WeakTerms.Contains(term) && ContainsTerm(symbols, term)) ?? 0;
+        var priorityContent = prioritySignals?.Terms.Sum(term => Math.Min(3, CountTermMatches(content, term)) * (WeakTerms.Contains(term) ? 1 : 2)) ?? 0;
+        var priorityCoverage = prioritySignals?.Terms.Count(term => ContainsTerm(path, term) || ContainsTerm(symbols, term) || ContainsTerm(content, term)) ?? 0;
         var roleBonus = file.Metadata.ProbableRole is "entry point" or "configuration" or "project manifest" ? 4 : 0;
-        var companionBonus = IsCompanion(file.Metadata, path) && (phraseContent + contentMatches + strongSymbols > 0) ? 7 : 0;
+        var companionBonus = IsCompanion(file.Metadata, rawPath) && (phraseContent + contentMatches + strongSymbols > 0) ? 7 : 0;
         var docsPenalty = module == "Docs" && phrasePath == 0 && phraseContent == 0 ? 14 : 0;
-        var clarificationPenalty = !seeksClarificationWork && (path.Contains("clarification") || symbols.Contains("clarification")) ? 20 : 0;
+        var clarificationPenalty = !seeksClarificationWork && (rawPath.Contains("clarification") || symbols.Contains("clarification")) ? 300 : 0;
+        var planningPenalty = !seeksPlanningWork &&
+            (rawPath.Contains("openaiplanning") || rawPath.Contains("fakeplanning") || symbols.Contains("planning engine")) ? 300 : 0;
         var score = phrasePath * 34 + phraseSymbols * 28 + phraseContent * 9 + strongPath * 15 +
-            strongSymbols * 12 + contentMatches * 2 + roleBonus + companionBonus + (file.Metadata.IsTest ? 3 : 0) -
-            docsPenalty - clarificationPenalty;
+            strongSymbols * 12 + contentMatches * 2 + priorityPhrasePath * 50 + priorityPhraseSymbols * 40 +
+            priorityPhraseContent * 12 + priorityStrongPath * 20 + priorityStrongSymbols * 16 + priorityContent * 3 +
+            Math.Min(5, priorityCoverage) * 20 + roleBonus + companionBonus + (file.Metadata.IsTest ? 3 : 0) -
+            docsPenalty - clarificationPenalty - planningPenalty;
         var reasons = new List<string>();
         if (phrasePath + phraseSymbols > 0) reasons.Add("strong requirement phrase in path or symbol");
         if (phraseContent > 0) reasons.Add("strong requirement phrase in content");
         if (strongPath + strongSymbols > 0) reasons.Add("specific requirement term in path or symbol");
         if (contentMatches > 0) reasons.Add("requirement terms in content");
+        if (priorityPhrasePath + priorityPhraseSymbols + priorityPhraseContent > 0) reasons.Add("latest correction phrase match");
+        if (priorityStrongPath + priorityStrongSymbols + priorityContent > 0) reasons.Add("latest correction term match");
         if (companionBonus > 0) reasons.Add("related contract, entry point, or test companion");
         reasons.Add($"{module.ToLowerInvariant()} layer");
         if (docsPenalty > 0) reasons.Add("generic documentation de-prioritized");
         if (clarificationPenalty > 0) reasons.Add("unrelated clarification subsystem de-prioritized");
-        return new RankedFile(file, score, string.Join(", ", reasons), module);
+        if (planningPenalty > 0) reasons.Add("unrelated planning adapter de-prioritized");
+        var priorityNameMatch = priorityPhrasePath + priorityPhraseSymbols + priorityStrongPath + priorityStrongSymbols > 0;
+        return new RankedFile(file, score, string.Join(", ", reasons), module, priorityNameMatch);
     }
 
     private static bool IsCompanion(RepositoryFileMetadata metadata, string path) => metadata.IsTest ||
@@ -165,7 +223,11 @@ public sealed class DeterministicEvidenceSelectionService(RepositoryAnalysisLimi
     private static Snippet CreateSnippet(string content, IReadOnlyList<string> signals, int maximumCharacters)
     {
         var lines = content.Replace("\r\n", "\n").Replace('\r', '\n').Split('\n');
-        var matchIndex = Array.FindIndex(lines, line => signals.Any(signal => line.Contains(signal, StringComparison.OrdinalIgnoreCase)));
+        var matchIndex = Array.FindIndex(lines, line =>
+        {
+            var searchable = NormalizeSearchText(line);
+            return signals.Any(searchable.Contains);
+        });
         if (matchIndex < 0) matchIndex = 0;
         var start = Math.Max(0, matchIndex - 4);
         var end = Math.Min(lines.Length - 1, matchIndex + 10);
@@ -177,13 +239,13 @@ public sealed class DeterministicEvidenceSelectionService(RepositoryAnalysisLimi
 
     private static RequirementSignals ExtractSignals(string value)
     {
-        var raw = Regex.Matches(value.ToLowerInvariant(), "[a-z0-9]+")
+        var raw = Regex.Matches(NormalizeSearchText(value), "[a-z0-9]+")
             .Select(match => match.Value)
             .Where(term => term.Length >= 3)
             .ToArray();
         var terms = raw.Where(term => !StopWords.Contains(term))
             .Distinct(StringComparer.OrdinalIgnoreCase).Order(StringComparer.Ordinal).ToArray();
-        var phraseTokens = raw.Select(term => StopWords.Contains(term) ? string.Empty : term).ToArray();
+        var phraseTokens = raw.Select(term => PhraseStopWords.Contains(term) ? string.Empty : term).ToArray();
         var phrases = Enumerable.Range(0, phraseTokens.Length)
             .SelectMany(index => new[] { 3, 2 }.Where(length => index + length <= phraseTokens.Length)
                 .Select(length => phraseTokens[index..(index + length)]))
@@ -195,6 +257,18 @@ public sealed class DeterministicEvidenceSelectionService(RepositoryAnalysisLimi
             .ToArray();
         return new RequirementSignals(terms, phrases, phrases.Concat(terms).ToArray());
     }
+
+    internal static string NormalizeSearchText(string value)
+    {
+        var splitAcronyms = Regex.Replace(value, "([A-Z]+)([A-Z][a-z])", "$1 $2");
+        var splitWords = Regex.Replace(splitAcronyms, "([a-z0-9])([A-Z])", "$1 $2");
+        return Regex.Replace(splitWords.ToLowerInvariant(), "[^a-z0-9]+", " ").Trim();
+    }
+
+    private static bool ContainsTerm(string normalizedText, string term) => CountTermMatches(normalizedText, term) > 0;
+
+    private static int CountTermMatches(string normalizedText, string term) =>
+        Regex.Matches(normalizedText, $@"(?:^| ){Regex.Escape(term)}[a-z0-9]*(?= |$)").Count;
 
     private static int FindValueSeparator(string line)
     {
@@ -208,6 +282,6 @@ public sealed class DeterministicEvidenceSelectionService(RepositoryAnalysisLimi
     private static bool IsSafeRelative(string path) => !Path.IsPathRooted(path) && !path.Split('/', '\\').Contains("..");
     private static string Hash(string value) => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(value))).ToLowerInvariant();
     private sealed record RequirementSignals(IReadOnlyList<string> Terms, IReadOnlyList<string> Phrases, IReadOnlyList<string> SearchSignals);
-    private sealed record RankedFile(RepositoryTextFile File, int Score, string Reason, string Module);
+    private sealed record RankedFile(RepositoryTextFile File, int Score, string Reason, string Module, bool PriorityNameMatch);
     private sealed record Snippet(int StartLine, int EndLine, string Excerpt);
 }

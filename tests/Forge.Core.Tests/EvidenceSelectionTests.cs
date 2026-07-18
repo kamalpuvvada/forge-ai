@@ -137,6 +137,69 @@ public sealed class EvidenceSelectionTests(ITestOutputHelper output)
         Assert.True(result.Items.Count(item => item.RelativePath.EndsWith(".md", StringComparison.OrdinalIgnoreCase)) <= 1);
     }
 
+    [Fact]
+    public void Pricing_snapshot_correction_uses_identifier_tokens_and_cross_layer_phrases()
+    {
+        var files = new[]
+        {
+            TextFile("src/Forge.Core/ModelCallRecord.cs", "public sealed record ModelCallRecord(decimal EstimatedCostUsd, int CachedInputTokens);"),
+            TextFile("src/Forge.Infrastructure/ModelCostCalculator.cs", "public sealed class ModelCostCalculator { decimal EstimateCost() => 0; }") ,
+            TextFile("src/Forge.Infrastructure/SqliteEngineeringTaskRepository.cs", "class SqliteEngineeringTaskRepository { void PersistModelCallPricingSnapshot() {} }") ,
+            TextFile("src/Forge.Api/Contracts/EngineeringTaskResponse.cs", "record ModelCallResponse(decimal EstimatedCostUsd, string LegacyFallbackLabel);"),
+            TextFile("tests/Forge.Core.Tests/SqlitePersistenceTests.cs", "class SqlitePersistenceTests { void PricingSnapshotRoundTrips() {} }") ,
+            TextFile("src/Forge.Infrastructure/OpenAIClarificationEngine.cs", "class OpenAIClarificationEngine { string model; string requirement; }") ,
+            TextFile("src/Forge.Infrastructure/OpenAIPlanningEngine.cs", "class OpenAIPlanningEngine { string model; string task; string status; }")
+        };
+        const string correction = "The plan omits persistence of per-call pricing snapshots. Include the model-call domain record, cost capture, SQLite migration/persistence, API/export representation, and legacy fallback labels. Do not solve this only in the PDF exporter.";
+
+        var result = Selector().SelectForPlanRevision(Snapshot(files), files, "Export the approved task report as a PDF.", correction);
+        var paths = result.Items.Select(item => item.RelativePath).ToArray();
+
+        Assert.Contains("src/Forge.Core/ModelCallRecord.cs", paths);
+        Assert.Contains("src/Forge.Infrastructure/ModelCostCalculator.cs", paths);
+        Assert.Contains("src/Forge.Infrastructure/SqliteEngineeringTaskRepository.cs", paths);
+        Assert.Contains("src/Forge.Api/Contracts/EngineeringTaskResponse.cs", paths);
+        Assert.Contains("tests/Forge.Core.Tests/SqlitePersistenceTests.cs", paths);
+        Assert.True(paths.Count(path => path.Contains("Clarification", StringComparison.OrdinalIgnoreCase) ||
+            path.Contains("PlanningEngine", StringComparison.OrdinalIgnoreCase)) <= 1);
+        var lastTargetedIndex = new[]
+        {
+            "src/Forge.Core/ModelCallRecord.cs",
+            "src/Forge.Infrastructure/ModelCostCalculator.cs",
+            "src/Forge.Infrastructure/SqliteEngineeringTaskRepository.cs",
+            "src/Forge.Api/Contracts/EngineeringTaskResponse.cs",
+            "tests/Forge.Core.Tests/SqlitePersistenceTests.cs"
+        }.Max(path => Array.IndexOf(paths, path));
+        var adapterIndex = Array.FindIndex(paths, path => path.Contains("Clarification", StringComparison.OrdinalIgnoreCase) ||
+            path.Contains("PlanningEngine", StringComparison.OrdinalIgnoreCase));
+        Assert.True(adapterIndex < 0 || adapterIndex > lastTargetedIndex);
+    }
+
+    [Fact]
+    public async Task Forge_pricing_snapshot_correction_selects_targeted_bounded_evidence()
+    {
+        const string correction = "The plan omits persistence of per-call pricing snapshots. Include the model-call domain record, cost capture, SQLite migration/persistence, API/export representation, and legacy fallback labels. Do not solve this only in the PDF exporter.";
+        var repositoryRoot = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", ".."));
+        var limits = new RepositoryAnalysisLimits();
+        var discovery = await new RepositoryDiscoveryService(limits, TimeProvider.System).DiscoverAsync(repositoryRoot);
+
+        var result = Selector(limits).SelectForPlanRevision(discovery.Snapshot, discovery.TextFiles,
+            "Export the approved task report as a PDF with model-call telemetry.", correction);
+        output.WriteLine($"SUMMARY inspected={result.FilesInspected} selected={result.FilesSelected} characters={result.TotalCharacters}");
+        foreach (var item in result.Items)
+            output.WriteLine($"{item.Id} {item.RelativePath} score={item.Score} reason={item.ReasonSelected}");
+
+        Assert.InRange(result.Items.Count, 5, 12);
+        Assert.True(result.TotalCharacters <= 60_000);
+        Assert.Contains(result.Items, item => item.RelativePath == "src/Forge.Core/ModelCallRecord.cs");
+        Assert.Contains(result.Items, item => item.RelativePath == "src/Forge.Infrastructure/ModelCostCalculator.cs");
+        Assert.Contains(result.Items, item => item.RelativePath == "src/Forge.Infrastructure/SqliteEngineeringTaskRepository.cs");
+        Assert.Contains(result.Items, item => item.RelativePath == "src/Forge.Api/Contracts/EngineeringTaskResponse.cs");
+        Assert.Contains(result.Items, item => item.RelativePath == "tests/Forge.Core.Tests/SqlitePersistenceTests.cs");
+        Assert.True(result.Items.Count(item => item.RelativePath.Contains("Clarification", StringComparison.OrdinalIgnoreCase) ||
+            item.RelativePath.Contains("PlanningEngine", StringComparison.OrdinalIgnoreCase)) <= 1);
+    }
+
     private static DeterministicEvidenceSelectionService Selector(RepositoryAnalysisLimits? limits = null) => new(limits ?? new RepositoryAnalysisLimits());
 
     private static RepositoryTextFile TextFile(string path, string content) => new(

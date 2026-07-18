@@ -11,3 +11,6 @@ public sealed record AnswerClarificationRequest(
 
 public sealed record RequestRequirementRevisionRequest(
     [Required, StringLength(5000)] string Correction);
+
+public sealed record RequestPlanRevisionRequest(
+    [Required, StringLength(5000)] string Correction);

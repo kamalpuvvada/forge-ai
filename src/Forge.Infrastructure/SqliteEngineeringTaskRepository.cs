@@ -21,6 +21,7 @@ public sealed class SqliteEngineeringTaskRepository(string connectionString) : I
 
         var answers = JsonSerializer.Deserialize<List<ClarificationAnswer>>(reader.GetString(reader.GetOrdinal("ClarificationAnswers")), JsonOptions) ?? [];
         var revisionNotes = JsonSerializer.Deserialize<List<RequirementRevisionNote>>(reader.GetString(reader.GetOrdinal("RequirementRevisionNotes")), JsonOptions) ?? [];
+        var planRevisionNotes = JsonSerializer.Deserialize<List<PlanRevisionNote>>(reader.GetString(reader.GetOrdinal("PlanRevisionNotes")), JsonOptions) ?? [];
         var modelCalls = JsonSerializer.Deserialize<List<ModelCallRecord>>(reader.GetString(reader.GetOrdinal("ModelCalls")), JsonOptions) ?? [];
         var snapshot = DeserializeNullable<RepositorySnapshot>(reader, "RepositorySnapshot");
         var evidenceItems = JsonSerializer.Deserialize<List<EvidenceItem>>(reader.GetString(reader.GetOrdinal("EvidenceItems")), JsonOptions) ?? [];
@@ -48,7 +49,8 @@ public sealed class SqliteEngineeringTaskRepository(string connectionString) : I
             plan,
             ReadNullableDate(reader, "RepositoryAnalyzedAt"),
             ReadNullableString(reader, "RepositoryFingerprint"),
-            ReadNullableDate(reader, "PlanCreatedAt"));
+            ReadNullableDate(reader, "PlanCreatedAt"),
+            planRevisionNotes);
     }
 
     public async Task SaveAsync(EngineeringTask task, CancellationToken cancellationToken = default)
@@ -59,13 +61,13 @@ public sealed class SqliteEngineeringTaskRepository(string connectionString) : I
         command.CommandText = """
             INSERT INTO EngineeringTasks (
                 Id, Repository, OriginalRequirement, CurrentClarifiedRequirement,
-                ClarificationAnswers, RequirementRevisionNotes, ModelCalls,
+                ClarificationAnswers, RequirementRevisionNotes, PlanRevisionNotes, ModelCalls,
                 CurrentPendingQuestion, RequirementSummary,
                 Status, CreatedAt, UpdatedAt, RequirementApprovedAt, PlanApprovedAt,
                 RepositorySnapshot, EvidenceItems, EvidenceFilesInspected, EvidenceFilesSelected,
                 TotalEvidenceCharacters, ImplementationPlan, RepositoryAnalyzedAt, RepositoryFingerprint, PlanCreatedAt)
             VALUES (
-                $id, $repository, $original, $clarified, $answers, $revisions, $modelCalls, $question, $summary,
+                $id, $repository, $original, $clarified, $answers, $revisions, $planRevisions, $modelCalls, $question, $summary,
                 $status, $created, $updated, $requirementApproved, $planApproved,
                 $snapshot, $evidence, $evidenceInspected, $evidenceSelected, $evidenceCharacters,
                 $plan, $repositoryAnalyzed, $repositoryFingerprint, $planCreated)
@@ -75,6 +77,7 @@ public sealed class SqliteEngineeringTaskRepository(string connectionString) : I
                 CurrentClarifiedRequirement = excluded.CurrentClarifiedRequirement,
                 ClarificationAnswers = excluded.ClarificationAnswers,
                 RequirementRevisionNotes = excluded.RequirementRevisionNotes,
+                PlanRevisionNotes = excluded.PlanRevisionNotes,
                 ModelCalls = excluded.ModelCalls,
                 CurrentPendingQuestion = excluded.CurrentPendingQuestion,
                 RequirementSummary = excluded.RequirementSummary,
@@ -99,6 +102,7 @@ public sealed class SqliteEngineeringTaskRepository(string connectionString) : I
         command.Parameters.AddWithValue("$clarified", task.CurrentClarifiedRequirement);
         command.Parameters.AddWithValue("$answers", JsonSerializer.Serialize(task.ClarificationAnswers, JsonOptions));
         command.Parameters.AddWithValue("$revisions", JsonSerializer.Serialize(task.RequirementRevisionNotes, JsonOptions));
+        command.Parameters.AddWithValue("$planRevisions", JsonSerializer.Serialize(task.PlanRevisionNotes, JsonOptions));
         command.Parameters.AddWithValue("$modelCalls", JsonSerializer.Serialize(task.ModelCalls, JsonOptions));
         command.Parameters.AddWithValue("$question", (object?)task.CurrentPendingQuestion ?? DBNull.Value);
         command.Parameters.AddWithValue("$summary", (object?)task.RequirementSummary ?? DBNull.Value);

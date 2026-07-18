@@ -4,6 +4,12 @@ namespace Forge.Api.Contracts;
 
 public sealed record ClarificationAnswerResponse(string Question, string Answer, DateTimeOffset AnsweredAt);
 public sealed record RequirementRevisionResponse(string Correction, string PreviousSummary, DateTimeOffset SubmittedAt);
+public sealed record PlanRevisionResponse(
+    string Correction,
+    DateTimeOffset SubmittedAt,
+    string PreviousPlanTitle,
+    string PreviousRepositoryFingerprint,
+    IReadOnlyList<string> PreviousAffectedPaths);
 
 public sealed record ModelCallResponse(
     Guid Id,
@@ -67,6 +73,7 @@ public sealed record EngineeringTaskResponse(
     string CurrentClarifiedRequirement,
     IReadOnlyList<ClarificationAnswerResponse> ClarificationAnswers,
     IReadOnlyList<RequirementRevisionResponse> RequirementRevisionNotes,
+    IReadOnlyList<PlanRevisionResponse> PlanRevisionNotes,
     string? CurrentPendingQuestion,
     string? RequirementSummary,
     WorkflowStatus Status,
@@ -148,6 +155,13 @@ public sealed record EngineeringTaskResponse(
                 answer.Question, answer.Answer, answer.AnsweredAt)).ToList(),
             task.RequirementRevisionNotes.Select(note => new RequirementRevisionResponse(
                 note.Correction, note.PreviousSummary, note.SubmittedAt)).ToList(),
+            task.PlanRevisionNotes.Select(note => new PlanRevisionResponse(
+                note.Correction,
+                note.SubmittedAt,
+                note.PreviousPlanTitle,
+                note.PreviousRepositoryFingerprint,
+                note.PreviousPlan.AffectedFiles.Select(file => file.Path)
+                    .Distinct(StringComparer.OrdinalIgnoreCase).ToArray())).ToList(),
             task.CurrentPendingQuestion,
             task.RequirementSummary,
             task.Status,

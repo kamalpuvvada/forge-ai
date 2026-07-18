@@ -203,13 +203,17 @@ public sealed class OpenAIPlanningEngineTests
     public void Canonical_context_omits_absolute_root_and_redacts_secrets()
     {
         const string secret = "do-not-send-this";
-        var context = Context(original: $"Export reports. api_key={secret}");
+        var context = Context(original: "UNAPPROVED ORIGINAL REQUIREMENT") with
+        {
+            ApprovedRequirementSummary = $"Export reports. api_key={secret}"
+        };
 
         var serialized = OpenAIPlanningEngine.BuildCanonicalContext(context);
 
         Assert.DoesNotContain(context.Snapshot.NormalizedRoot, serialized, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain(secret, serialized, StringComparison.Ordinal);
         Assert.Contains("[REDACTED]", serialized, StringComparison.Ordinal);
+        Assert.DoesNotContain("UNAPPROVED ORIGINAL REQUIREMENT", serialized, StringComparison.Ordinal);
         Assert.Contains("src/App.cs", serialized, StringComparison.Ordinal);
         Assert.Contains("Forge.slnx", serialized, StringComparison.Ordinal);
         Assert.Contains("tests", serialized, StringComparison.Ordinal);
@@ -217,6 +221,33 @@ public sealed class OpenAIPlanningEngineTests
         Assert.DoesNotContain("src/NotSelected.cs", serialized, StringComparison.Ordinal);
         Assert.DoesNotContain("declaredSymbols", serialized, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("fullHeadSha", serialized, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task Revision_context_contains_correction_and_only_compact_previous_plan_paths()
+    {
+        var context = Context();
+        var previousPlan = (await new FakePlanningEngine().CreatePlanAsync(context)).Plan;
+        var revision = new PlanRevisionNote(
+            "Include pricing snapshot persistence and legacy fallback labels.",
+            Now,
+            "UNIQUE PREVIOUS PLAN TITLE",
+            context.Snapshot.Fingerprint,
+            previousPlan with { Summary = "UNIQUE FULL PREVIOUS PLAN SUMMARY" });
+        context = context with
+        {
+            LatestPlanRevision = revision,
+            PreviousPlanAffectedPaths = ["src/App.cs", "src/PricingSnapshot.cs"]
+        };
+
+        var serialized = OpenAIPlanningEngine.BuildCanonicalContext(context);
+
+        Assert.Contains("Include pricing snapshot persistence and legacy fallback labels.", serialized, StringComparison.Ordinal);
+        Assert.Contains("src/App.cs", serialized, StringComparison.Ordinal);
+        Assert.Contains("src/PricingSnapshot.cs", serialized, StringComparison.Ordinal);
+        Assert.DoesNotContain("UNIQUE PREVIOUS PLAN TITLE", serialized, StringComparison.Ordinal);
+        Assert.DoesNotContain("UNIQUE FULL PREVIOUS PLAN SUMMARY", serialized, StringComparison.Ordinal);
+        Assert.DoesNotContain("previousPlan\"", serialized, StringComparison.Ordinal);
     }
 
     [Theory]

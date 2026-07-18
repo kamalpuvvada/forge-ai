@@ -1,6 +1,13 @@
 export type WorkflowStatus = 'Draft' | 'Clarifying' | 'RequirementSummaryReady' | 'AwaitingRequirementApproval' | 'ReadyForPlanning' | 'Planning' | 'AwaitingPlanApproval' | 'PlanApproved' | 'Implementing' | 'Validating' | 'Reviewing' | 'Completed' | 'Failed'
 export interface ClarificationAnswer { question: string; answer: string; answeredAt: string }
 export interface RequirementRevision { correction: string; previousSummary: string; submittedAt: string }
+export interface PlanRevision {
+  correction: string
+  submittedAt: string
+  previousPlanTitle: string
+  previousRepositoryFingerprint: string
+  previousAffectedPaths: string[]
+}
 export interface ModelCall {
   id: string
   stage: string
@@ -49,6 +56,7 @@ export interface EngineeringTask {
   currentClarifiedRequirement: string
   clarificationAnswers: ClarificationAnswer[]
   requirementRevisionNotes: RequirementRevision[]
+  planRevisionNotes: PlanRevision[]
   currentPendingQuestion: string | null
   requirementSummary: string | null
   status: WorkflowStatus

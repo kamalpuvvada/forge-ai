@@ -77,21 +77,69 @@ public sealed class EngineeringTaskService(
 
         if (discoveryService is null)
             throw new PlanningException("planning_configuration", "Repository freshness validation is not configured.");
-        var current = await discoveryService.DiscoverAsync(task.Repository, cancellationToken);
-        if (!string.Equals(current.Snapshot.Fingerprint, task.RepositorySnapshot.Fingerprint, StringComparison.Ordinal))
-            throw new PlanningException("stale_snapshot", "The repository changed after analysis. Re-analyze it before creating a plan.");
+        if (task.PlanRevisionNotes.Count > 0 && task.Status == WorkflowStatus.Planning)
+        {
+            await EnsureSnapshotFreshForRevisionAsync(task, cancellationToken);
+        }
+        else
+        {
+            var current = await discoveryService.DiscoverAsync(task.Repository, cancellationToken);
+            if (!string.Equals(current.Snapshot.Fingerprint, task.RepositorySnapshot.Fingerprint, StringComparison.Ordinal))
+                throw new PlanningException("stale_snapshot", "The repository changed after analysis. Re-analyze it before creating a plan.");
+        }
 
+        return await GenerateAndStorePlanAsync(task, cancellationToken);
+    }
+
+    public async Task<EngineeringTask> RequestPlanRevisionAsync(
+        Guid id,
+        string correction,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var task = await GetRequiredAsync(id, cancellationToken);
+        task.EnsurePlanRevisionCanBeRequested(correction);
+        if (planningEngine is null || discoveryService is null || evidenceSelectionService is null)
+            throw new PlanningException("planning_configuration", "Plan correction requires repository evidence and implementation planning.");
+
+        var snapshotRead = await EnsureSnapshotFreshForRevisionAsync(task, cancellationToken);
+        var selection = evidenceSelectionService.SelectForPlanRevision(
+            task.RepositorySnapshot!,
+            snapshotRead.TextFiles,
+            task.RequirementSummary!,
+            correction);
+
+        task.RequestPlanRevision(correction, timeProvider.GetUtcNow());
+        task.StoreEvidence(selection, timeProvider.GetUtcNow());
+        await repository.SaveAsync(task, cancellationToken);
+        if (selection.Items.Count == 0)
+            throw new PlanningException("insufficient_evidence", "The plan correction did not match sufficient repository evidence.");
+
+        return await GenerateAndStorePlanAsync(task, cancellationToken);
+    }
+
+    private async Task<EngineeringTask> GenerateAndStorePlanAsync(
+        EngineeringTask task,
+        CancellationToken cancellationToken)
+    {
         var now = timeProvider.GetUtcNow();
+        var engine = planningEngine ?? throw new PlanningException("planning_configuration", "Implementation planning is not configured.");
+        var summary = task.RequirementSummary ?? throw new WorkflowException("An approved requirement is required before planning.");
+        var snapshot = task.RepositorySnapshot ?? throw new WorkflowException("A repository snapshot is required before planning.");
         try
         {
-            var evaluation = await planningEngine.CreatePlanAsync(new PlanningContext(
+            var latestRevision = task.PlanRevisionNotes.LastOrDefault();
+            var evaluation = await engine.CreatePlanAsync(new PlanningContext(
                 task.OriginalRequirement,
-                task.RequirementSummary,
+                summary,
                 task.ClarificationAnswers,
                 task.RequirementRevisionNotes,
-                task.RepositorySnapshot,
+                snapshot,
                 task.EvidenceItems,
-                now), cancellationToken);
+                now,
+                latestRevision,
+                latestRevision?.PreviousPlan.AffectedFiles.Select(file => file.Path)
+                    .Distinct(StringComparer.OrdinalIgnoreCase).ToArray()), cancellationToken);
             if (evaluation.ModelCall is not null) task.RecordModelCall(evaluation.ModelCall, timeProvider.GetUtcNow());
             var maximumAge = TimeSpan.FromMinutes((analysisLimits ?? new RepositoryAnalysisLimits()).SnapshotMaximumAgeMinutes);
             task.StoreImplementationPlan(evaluation.Plan, timeProvider.GetUtcNow(), maximumAge);
@@ -105,6 +153,22 @@ public sealed class EngineeringTaskService(
             await repository.SaveAsync(task, CancellationToken.None);
             throw;
         }
+    }
+
+    private async Task<RepositorySnapshotReadResult> EnsureSnapshotFreshForRevisionAsync(
+        EngineeringTask task,
+        CancellationToken cancellationToken)
+    {
+        if (discoveryService is null || task.RepositorySnapshot is null || task.RepositoryAnalyzedAt is null)
+            throw new PlanningException("planning_configuration", "Repository snapshot refresh is not configured.");
+        var maximumAge = TimeSpan.FromMinutes((analysisLimits ?? new RepositoryAnalysisLimits()).SnapshotMaximumAgeMinutes);
+        if (timeProvider.GetUtcNow() - task.RepositoryAnalyzedAt > maximumAge)
+            throw new PlanningException("stale_snapshot", "The repository snapshot is stale. Re-analyze it before correcting the plan.");
+
+        var snapshotRead = await discoveryService.ReadSnapshotAsync(task.RepositorySnapshot, cancellationToken);
+        if (!snapshotRead.IsFresh)
+            throw new PlanningException("stale_snapshot", "The repository changed after analysis. Re-analyze it before correcting the plan.");
+        return snapshotRead;
     }
 
     public async Task<EngineeringTask> ApprovePlanAsync(Guid id, CancellationToken cancellationToken = default)

@@ -24,6 +24,7 @@ public sealed class SqliteDatabaseInitializer(string connectionString)
                 CurrentClarifiedRequirement TEXT NOT NULL,
                 ClarificationAnswers TEXT NOT NULL,
                 RequirementRevisionNotes TEXT NOT NULL DEFAULT '[]',
+                PlanRevisionNotes TEXT NOT NULL DEFAULT '[]',
                 ModelCalls TEXT NOT NULL DEFAULT '[]',
                 CurrentPendingQuestion TEXT NULL,
                 RequirementSummary TEXT NULL,
@@ -45,6 +46,7 @@ public sealed class SqliteDatabaseInitializer(string connectionString)
             """;
         await command.ExecuteNonQueryAsync(cancellationToken);
         await EnsureColumnAsync(connection, "RequirementRevisionNotes", "TEXT NOT NULL DEFAULT '[]'", cancellationToken);
+        await EnsureColumnAsync(connection, "PlanRevisionNotes", "TEXT NOT NULL DEFAULT '[]'", cancellationToken);
         await EnsureColumnAsync(connection, "ModelCalls", "TEXT NOT NULL DEFAULT '[]'", cancellationToken);
         await EnsureColumnAsync(connection, "RepositorySnapshot", "TEXT NULL", cancellationToken);
         await EnsureColumnAsync(connection, "EvidenceItems", "TEXT NOT NULL DEFAULT '[]'", cancellationToken);

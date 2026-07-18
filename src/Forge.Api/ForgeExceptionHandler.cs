@@ -32,6 +32,7 @@ public sealed class ForgeExceptionHandler(
             PlanningException planning => planning.Category switch
             {
                 "stale_snapshot" => (409, "Repository snapshot is stale", planning.Message, "stale_snapshot"),
+                "insufficient_evidence" => (422, "Insufficient repository evidence", planning.Message, "insufficient_evidence"),
                 "planning_configuration" => (503, "Planning unavailable", planning.Message, "planning_configuration"),
                 _ => (422, "Invalid implementation plan", planning.Message, "invalid_plan")
             },

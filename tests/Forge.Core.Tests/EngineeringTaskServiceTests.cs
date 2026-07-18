@@ -122,6 +122,59 @@ public sealed class EngineeringTaskServiceTests
         });
     }
 
+    [Fact]
+    public async Task Plan_correction_reuses_snapshot_refreshes_evidence_and_calls_planner_once()
+    {
+        var repository = new InMemoryRepository();
+        var now = DateTimeOffset.UtcNow;
+        var task = ReviewTask(now);
+        await repository.SaveAsync(task);
+        var snapshot = task.RepositorySnapshot!;
+        var textFile = new RepositoryTextFile(snapshot.Files[0], "public class App { void PersistPricingSnapshot() {} }");
+        var discovery = new FixedDiscovery(snapshot, [textFile]);
+        var planner = new CapturingPlanningEngine();
+        var service = new EngineeringTaskService(repository, new ScriptedEngine(ClarificationEvaluation.Summarize("unused")),
+            TimeProvider.System, discovery, new DeterministicEvidenceSelectionService(new RepositoryAnalysisLimits()), planner, new RepositoryAnalysisLimits());
+
+        var revised = await service.RequestPlanRevisionAsync(task.Id, "Include App pricing snapshot persistence.");
+
+        Assert.Equal(0, discovery.CallCount);
+        Assert.Equal(1, discovery.ReadCount);
+        Assert.Equal(1, planner.CallCount);
+        Assert.Equal(WorkflowStatus.AwaitingPlanApproval, revised.Status);
+        Assert.Single(revised.PlanRevisionNotes);
+        Assert.NotNull(revised.ImplementationPlan);
+        Assert.Equal("Include App pricing snapshot persistence.", planner.Contexts[0].LatestPlanRevision?.Correction);
+        Assert.Equal("src/App.cs", Assert.Single(planner.Contexts[0].PreviousPlanAffectedPaths!));
+        Assert.Contains(revised.EvidenceItems, item => item.Excerpt.Contains("PersistPricingSnapshot", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task Failed_plan_correction_persists_history_refreshed_evidence_and_telemetry_without_retry()
+    {
+        var repository = new InMemoryRepository();
+        var now = DateTimeOffset.UtcNow;
+        var task = ReviewTask(now);
+        await repository.SaveAsync(task);
+        var snapshot = task.RepositorySnapshot!;
+        var textFile = new RepositoryTextFile(snapshot.Files[0], "public class App { void PersistPricingSnapshot() {} }");
+        var failed = new ModelCallRecord(Guid.NewGuid(), ModelCallStage.Planning, "OpenAI", "gpt-5.6-sol", "medium",
+            now, now, false, null, 20, 0, 0, null, 0m, "provider_error");
+        var planner = new FailingPlanningEngine(failed);
+        var service = new EngineeringTaskService(repository, new ScriptedEngine(ClarificationEvaluation.Summarize("unused")),
+            TimeProvider.System, new FixedDiscovery(snapshot, [textFile]), new DeterministicEvidenceSelectionService(new RepositoryAnalysisLimits()), planner, new RepositoryAnalysisLimits());
+
+        await Assert.ThrowsAsync<PlanningProviderException>(() =>
+            service.RequestPlanRevisionAsync(task.Id, "Include App pricing snapshot persistence."));
+        var persisted = await repository.GetAsync(task.Id);
+
+        Assert.Equal(1, planner.CallCount);
+        Assert.Equal(WorkflowStatus.Planning, persisted!.Status);
+        Assert.Single(persisted.PlanRevisionNotes);
+        Assert.Contains(persisted.EvidenceItems, item => item.Excerpt.Contains("PersistPricingSnapshot", StringComparison.Ordinal));
+        Assert.Equal(failed.Id, Assert.Single(persisted.ModelCalls).Id);
+    }
+
     private static EngineeringTaskService CreateService(IClarificationEngine engine) =>
         new(new InMemoryRepository(), engine, TimeProvider.System);
 
@@ -148,13 +201,33 @@ public sealed class EngineeringTaskServiceTests
         }
     }
 
-    private sealed class FixedDiscovery(RepositorySnapshot snapshot) : IRepositoryDiscoveryService
+    private static EngineeringTask ReviewTask(DateTimeOffset now)
+    {
+        var task = EngineeringTask.Create("C:/repo", "Add pricing snapshot export", now);
+        task.ApplyClarificationEvaluation(ClarificationEvaluation.Summarize("Add pricing snapshot export"), now);
+        task.ApproveRequirementSummary(now);
+        task.BeginRepositoryAnalysis(now);
+        var snapshot = PlanningWorkflowTests.Snapshot(now);
+        var evidence = PlanningWorkflowTests.Evidence();
+        task.StoreRepositorySnapshot(snapshot, now);
+        task.StoreEvidence(new EvidenceSelection([evidence], 1, 1, evidence.Excerpt.Length), now);
+        task.StoreImplementationPlan(PlanningWorkflowTests.Plan(snapshot, [evidence]), now, TimeSpan.FromMinutes(30));
+        return task;
+    }
+
+    private sealed class FixedDiscovery(RepositorySnapshot snapshot, IReadOnlyList<RepositoryTextFile>? textFiles = null) : IRepositoryDiscoveryService
     {
         public int CallCount { get; private set; }
+        public int ReadCount { get; private set; }
         public Task<RepositoryDiscoveryResult> DiscoverAsync(string repositoryPath, CancellationToken cancellationToken = default)
         {
             CallCount++;
-            return Task.FromResult(new RepositoryDiscoveryResult(snapshot, []));
+            return Task.FromResult(new RepositoryDiscoveryResult(snapshot, textFiles ?? []));
+        }
+        public Task<RepositorySnapshotReadResult> ReadSnapshotAsync(RepositorySnapshot existingSnapshot, CancellationToken cancellationToken = default)
+        {
+            ReadCount++;
+            return Task.FromResult(new RepositorySnapshotReadResult(true, textFiles ?? []));
         }
     }
 
@@ -183,6 +256,18 @@ public sealed class EngineeringTaskServiceTests
                     "The planning response reached its output limit before the structured plan was complete.",
                     "output_truncated", failed));
             return new FakePlanningEngine().CreatePlanAsync(context, cancellationToken);
+        }
+    }
+
+    private sealed class CapturingPlanningEngine : IPlanningEngine
+    {
+        public int CallCount { get; private set; }
+        public List<PlanningContext> Contexts { get; } = [];
+        public async Task<PlanningEvaluation> CreatePlanAsync(PlanningContext context, CancellationToken cancellationToken = default)
+        {
+            CallCount++;
+            Contexts.Add(context);
+            return await new FakePlanningEngine().CreatePlanAsync(context, cancellationToken);
         }
     }
 
