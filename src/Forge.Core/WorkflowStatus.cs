@@ -9,6 +9,7 @@ public enum WorkflowStatus
     ReadyForPlanning,
     Planning,
     AwaitingPlanApproval,
+    PlanApproved,
     Implementing,
     Validating,
     Reviewing,

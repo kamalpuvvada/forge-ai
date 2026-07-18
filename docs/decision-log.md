@@ -77,3 +77,15 @@
 **Decision:** Normalize and contain repository paths, use only read-only Git/file APIs, select bounded redacted evidence deterministically, and create an explicitly labelled Fake implementation plan with a separate approval gate.
 **Reason:** The demo can ground planning in real repository facts without billable calls or allowing target mutation.
 **Trade-off:** Lightweight symbol extraction, keyword scoring, and key-name redaction are explainable but cannot provide complete semantic understanding or comprehensive secret detection.
+
+## 014 — Evidence-backed OpenAI planning behind the existing gateway
+
+**Decision:** Make planning asynchronous and mode-specific, use one strict-schema Responses call for OpenAI planning, enrich provenance internally, and validate every returned path/evidence/step invariant independently.
+**Reason:** Model reasoning can connect bounded cross-layer evidence while deterministic validation prevents invented paths and unsupported claims from becoming workflow facts.
+**Trade-off:** Insufficient or malformed output fails visibly with no repair, retry, or Fake fallback.
+
+## 015 — Approval is not implementation
+
+**Decision:** Explicit plan approval ends at `PlanApproved`; legacy `Implementing` rows from the plan-only slice migrate to that state.
+**Reason:** Workflow state must describe completed work truthfully, and approval alone does not authorize or imply repository mutation.
+**Trade-off:** The demo stops at a clear gate until a later implementation milestone is built.

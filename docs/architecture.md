@@ -24,6 +24,9 @@ flowchart LR
     Service --> Discovery[IRepositoryDiscoveryService]
     Service --> Evidence[IEvidenceSelectionService]
     Service --> Planner[IPlanningEngine]
+    FakePlanner[FakePlanningEngine] --> Planner
+    OpenAIPlanner[OpenAIPlanningEngine] --> Planner
+    OpenAIPlanner --> Gateway
     Discovery --> Git[read-only Git commands]
 ```
 
@@ -45,7 +48,8 @@ stateDiagram-v2
     AwaitingRequirementApproval --> ReadyForPlanning: explicit approval
     ReadyForPlanning --> Planning
     Planning --> AwaitingPlanApproval
-    AwaitingPlanApproval --> Implementing
+    AwaitingPlanApproval --> PlanApproved: explicit approval
+    PlanApproved --> Implementing: future milestone
     Implementing --> Validating
     Validating --> Reviewing
     Reviewing --> Completed
@@ -59,13 +63,13 @@ After requirement approval, purpose-specific aggregate operations begin analysis
 
 Discovery normalizes the root, contains every inspected path, skips reparse points, and uses `ProcessStartInfo.ArgumentList` for read-only Git commands. It never invokes repository scripts. Common dependency/build folders, generated/minified/binary files, and likely secret files are excluded. Configurable defaults cap discovery at 5,000 files, text at 256 KB per file and 20 MB total, and evidence at 12 files/60,000 characters. Limit warnings make partial inspection visible.
 
-Evidence selection deterministically scores paths, lightweight C#/TypeScript symbols, content, roles, tests, and configuration relevance against approved requirement terms. Excerpts retain line numbers, are de-duplicated, hashed, and redact obvious sensitive key/value lines before persistence. Redaction is not a comprehensive secret scanner.
+Evidence selection deterministically scores strong phrases, paths, lightweight C#/TypeScript symbols, content, roles, related tests/contracts, and module diversity. Generic documentation and unrelated clarification code receive penalties. Excerpts retain line numbers, are de-duplicated, hashed, and redact obvious sensitive key/value lines before persistence. Redaction is not a comprehensive secret scanner.
 
-`FakePlanningEngine` creates a labelled plan using only snapshot metadata and selected evidence. Affected files cite evidence IDs; validation commands are proposals only. Plan approval moves the workflow to `Implementing`, where the UI truthfully stops because target modification is unavailable.
+`FakePlanningEngine` creates a labelled plan without a model call. `OpenAIPlanningEngine` makes exactly one Responses request using `gpt-5.6-sol`, medium reasoning, a 2,400-token limit, and strict schema. Both produce structured affected files and sequential steps. Existing paths must cite evidence from that path, creates must be absent from the snapshot, validation commands remain proposals, and absolute/traversal paths are rejected. Plan approval moves the workflow to `PlanApproved`; implementation is a future milestone.
 
-## OpenAI structured-output boundary
+## OpenAI structured-output boundaries
 
-OpenAI mode uses `gpt-5.6-terra`, low reasoning effort, and a bounded 800-token output through the Responses API. `CreateResponseOptions.TextOptions` specifies `ResponseTextFormat.CreateJsonSchemaFormat(..., jsonSchemaIsStrict: true)`. The schema contains:
+Clarification uses `gpt-5.6-terra`, low reasoning effort, and a bounded 800-token output. Planning uses `gpt-5.6-sol`, medium reasoning effort, and a bounded 2,400-token output. Both use the Responses API with `ResponseTextFormat.CreateJsonSchemaFormat(..., jsonSchemaIsStrict: true)`. The clarification schema contains:
 
 - `decision`: `ask` or `summarize`;
 - nullable `question`, internal `questionFocus`, and `summary`;
@@ -77,6 +81,8 @@ After deserialization the adapter independently enforces:
 - summarize: one non-empty summary and null question/focus.
 
 Questions with multiple marks, newlines, list syntax, excessive length, or a structurally combined focus are invalid provider responses. Semantic atomicity remains primarily prompt- and focus-driven. Forge never repairs output, makes a second model call, free-form parses, or silently invokes Fake mode.
+
+The planning schema requires title, objective, repository understanding, affected files, ordered structured steps, proposed validation commands, risks, assumptions, unresolved questions, and summary. Source, model, timestamp, and repository fingerprint are enriched internally. The canonical planning context excludes the normalized root, full file contents, raw responses, credentials, and hidden reasoning.
 
 The developer instruction prefix is stable. Each turn reconstructs one compact JSON context containing only the repository identifier, original requirement, previous question/answer pairs, and correction notes. Repository content is never implied. `previous_response_id` is intentionally unused.
 
@@ -101,7 +107,7 @@ sequenceDiagram
 
 ## Telemetry and estimated cost
 
-Each real provider attempt records call ID, clarification stage, provider, model, reasoning effort, timestamps, success, response ID, input/cached/output/reasoning tokens, estimated cost, and a non-sensitive failure category. Fake mode produces no model-call record.
+Each real provider attempt records call ID, clarification or planning stage, provider, model, reasoning effort, timestamps, success, response ID, input/cached/output/reasoning tokens, estimated cost, and a non-sensitive failure category. Failed planning attempts are persisted before their safe error is returned. Fake mode produces no model-call record.
 
 The estimate subtracts cached tokens from total input, prices uncached and cached input separately, then adds output pricing. Output already contains reasoning tokens, so reasoning usage is not double-counted. Rates are bound from `Forge:AI:Pricing`.
 
@@ -120,8 +126,8 @@ Development startup uses `PRAGMA table_info(EngineeringTasks)` and adds only mis
 
 Central exception handling maps missing tasks, invalid workflow operations, configuration faults, provider faults, and unexpected failures to safe Problem Details. Provider exception bodies and logs never include credentials or raw responses.
 
-`GET /api/system/capabilities` reports repository inspection and Fake planning as available, while target modification, validation, review, and pull-request creation remain false. It exposes no key or secret-derived data.
+`GET /api/system/capabilities` reports clarification and planning provider/model/readiness independently, while target modification, validation, review, and pull-request creation remain false. OpenAI mode starts without a key and reports both AI stages unavailable. It exposes no key or secret-derived data.
 
 ## Current boundaries
 
-Target-repository changes/tests, review, repair, pull-request creation, authentication, production migrations, and live planning providers are not part of this slice.
+Target-repository changes/tests, review, repair, pull-request creation, authentication, production migrations, and provider retry policy are not part of this slice.

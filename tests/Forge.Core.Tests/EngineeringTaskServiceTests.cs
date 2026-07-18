@@ -56,6 +56,32 @@ public sealed class EngineeringTaskServiceTests
         Assert.Equal(source.Token, engine.ObservedToken);
     }
 
+    [Fact]
+    public async Task Failed_planning_call_is_persisted_before_safe_provider_error_is_rethrown()
+    {
+        var repository = new InMemoryRepository();
+        var now = DateTimeOffset.UtcNow;
+        var task = EngineeringTask.Create("C:/repo", "Add report export", now);
+        task.ApplyClarificationEvaluation(ClarificationEvaluation.Summarize("Add report export"), now);
+        task.ApproveRequirementSummary(now);
+        task.BeginRepositoryAnalysis(now);
+        var snapshot = PlanningWorkflowTests.Snapshot(now);
+        var evidence = PlanningWorkflowTests.Evidence();
+        task.StoreRepositorySnapshot(snapshot, now);
+        task.StoreEvidence(new EvidenceSelection([evidence], 1, 1, evidence.Excerpt.Length), now);
+        await repository.SaveAsync(task);
+        var failed = new ModelCallRecord(Guid.NewGuid(), ModelCallStage.Planning, "OpenAI", "gpt-5.6-sol", "medium",
+            now, now, false, null, 0, 0, 0, null, 0m, "provider_error");
+        var service = new EngineeringTaskService(repository, new ScriptedEngine(ClarificationEvaluation.Summarize("unused")),
+            TimeProvider.System, new FixedDiscovery(snapshot), null, new FailingPlanningEngine(failed), new RepositoryAnalysisLimits());
+
+        await Assert.ThrowsAsync<PlanningProviderException>(() => service.CreatePlanAsync(task.Id));
+        var persisted = await repository.GetAsync(task.Id);
+
+        Assert.Equal(failed.Id, Assert.Single(persisted!.ModelCalls).Id);
+        Assert.Equal(WorkflowStatus.Planning, persisted.Status);
+    }
+
     private static EngineeringTaskService CreateService(IClarificationEngine engine) =>
         new(new InMemoryRepository(), engine, TimeProvider.System);
 
@@ -80,6 +106,19 @@ public sealed class EngineeringTaskServiceTests
             ObservedToken = cancellationToken;
             return Task.FromResult(ClarificationEvaluation.Summarize("Summary"));
         }
+    }
+
+    private sealed class FixedDiscovery(RepositorySnapshot snapshot) : IRepositoryDiscoveryService
+    {
+        public Task<RepositoryDiscoveryResult> DiscoverAsync(string repositoryPath, CancellationToken cancellationToken = default) =>
+            Task.FromResult(new RepositoryDiscoveryResult(snapshot, []));
+    }
+
+    private sealed class FailingPlanningEngine(ModelCallRecord failed) : IPlanningEngine
+    {
+        public Task<PlanningEvaluation> CreatePlanAsync(PlanningContext context, CancellationToken cancellationToken = default) =>
+            Task.FromException<PlanningEvaluation>(new PlanningProviderException(
+                "OpenAI could not complete the planning request.", "provider_error", failed, new Exception("secret")));
     }
 
     private sealed class InMemoryRepository : IEngineeringTaskRepository

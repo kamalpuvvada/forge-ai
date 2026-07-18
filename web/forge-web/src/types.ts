@@ -1,4 +1,4 @@
-export type WorkflowStatus = 'Draft' | 'Clarifying' | 'RequirementSummaryReady' | 'AwaitingRequirementApproval' | 'ReadyForPlanning' | 'Planning' | 'AwaitingPlanApproval' | 'Implementing' | 'Validating' | 'Reviewing' | 'Completed' | 'Failed'
+export type WorkflowStatus = 'Draft' | 'Clarifying' | 'RequirementSummaryReady' | 'AwaitingRequirementApproval' | 'ReadyForPlanning' | 'Planning' | 'AwaitingPlanApproval' | 'PlanApproved' | 'Implementing' | 'Validating' | 'Reviewing' | 'Completed' | 'Failed'
 export interface ClarificationAnswer { question: string; answer: string; answeredAt: string }
 export interface RequirementRevision { correction: string; previousSummary: string; submittedAt: string }
 export interface ModelCall {
@@ -36,10 +36,11 @@ export interface RepositorySnapshot {
 export interface EvidenceItem { id: string; relativePath: string; startLine: number; endLine: number; excerpt: string; reasonSelected: string; score: number; contentHash: string }
 export type PlannedFileAction = 'Modify' | 'Create' | 'Delete' | 'Inspect'
 export interface PlannedFile { path: string; action: PlannedFileAction; purpose: string; evidenceIds: string[]; confidence: number }
+export interface ImplementationStep { order: number; description: string; affectedPaths: string[]; evidenceIds: string[]; expectedResult: string }
 export interface ImplementationPlan {
-  title: string; objective: string; repositoryUnderstanding: string; affectedFiles: PlannedFile[]; orderedSteps: string[]
-  proposedValidationCommands: string[]; risks: string[]; assumptions: string[]; summary: string
-  isDeterministicFake: boolean; createdAt: string; repositoryFingerprint: string
+  title: string; objective: string; repositoryUnderstanding: string; affectedFiles: PlannedFile[]; orderedSteps: ImplementationStep[]
+  proposedValidationCommands: string[]; risks: string[]; assumptions: string[]; unresolvedQuestions: string[]; summary: string
+  source: 'DeterministicFake' | 'OpenAI'; planningModel: string | null; isDeterministicFake: boolean; createdAt: string; repositoryFingerprint: string
 }
 export interface EngineeringTask {
   id: string
@@ -68,8 +69,14 @@ export interface EngineeringTask {
 }
 export interface SystemCapabilities {
   aiMode: 'Fake' | 'OpenAI' | string
+  clarificationProvider: string
   clarificationModel: string
   reasoningEffort: string
+  clarificationConfigured: boolean
+  planningProvider: string
+  planningModel: string
+  planningReasoningEffort: string
+  planningConfigured: boolean
   aiConfigured: boolean
   repositoryInspectionAvailable: boolean
   planningAvailable: boolean

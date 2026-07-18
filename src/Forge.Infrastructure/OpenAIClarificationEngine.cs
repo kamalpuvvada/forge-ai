@@ -69,7 +69,7 @@ public sealed class OpenAIClarificationEngine(
             throw new ClarificationConfigurationException("The OpenAI clarification adapter is not the active AI mode.");
         if (gateway is null)
             throw new ClarificationConfigurationException("OpenAI mode requires the OPENAI_API_KEY environment variable.");
-        if (!options.IsOpenAiConfigurationComplete(true))
+        if (!options.IsClarificationConfigurationComplete(true))
             throw new ClarificationConfigurationException("OpenAI mode requires a model, supported reasoning effort, positive output limit, and configured pricing.");
 
         var callId = Guid.NewGuid();

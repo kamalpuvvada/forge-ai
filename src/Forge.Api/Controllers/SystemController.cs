@@ -10,19 +10,31 @@ public sealed class SystemController(ForgeAiOptions options, OpenAIConfiguration
 {
     [HttpGet("capabilities")]
     [ProducesResponseType<SystemCapabilitiesResponse>(StatusCodes.Status200OK)]
-    public ActionResult<SystemCapabilitiesResponse> GetCapabilities() => Ok(new SystemCapabilitiesResponse(
-        options.Mode,
-        options.ClarificationModel,
-        options.ClarificationReasoningEffort,
-        string.Equals(options.Mode, ForgeAiModes.Fake, StringComparison.OrdinalIgnoreCase) ||
-            (string.Equals(options.Mode, ForgeAiModes.OpenAI, StringComparison.OrdinalIgnoreCase) &&
-             options.IsOpenAiConfigurationComplete(configurationState.HasApiKey)),
-        true,
-        string.Equals(options.Mode, ForgeAiModes.Fake, StringComparison.OrdinalIgnoreCase),
-        false,
-        false,
-        false,
-        false));
+    public ActionResult<SystemCapabilitiesResponse> GetCapabilities()
+    {
+        var isFake = string.Equals(options.Mode, ForgeAiModes.Fake, StringComparison.OrdinalIgnoreCase);
+        var isOpenAi = string.Equals(options.Mode, ForgeAiModes.OpenAI, StringComparison.OrdinalIgnoreCase);
+        var clarificationConfigured = isFake || isOpenAi && options.IsClarificationConfigurationComplete(configurationState.HasApiKey);
+        var planningConfigured = isFake || isOpenAi && options.IsPlanningConfigurationComplete(configurationState.HasApiKey);
+        var provider = isFake ? "Fake" : isOpenAi ? "OpenAI" : "Unavailable";
+        return Ok(new SystemCapabilitiesResponse(
+            options.Mode,
+            provider,
+            options.ClarificationModel,
+            options.ClarificationReasoningEffort,
+            clarificationConfigured,
+            provider,
+            options.PlanningModel,
+            options.PlanningReasoningEffort,
+            planningConfigured,
+            clarificationConfigured && planningConfigured,
+            true,
+            isFake || isOpenAi && planningConfigured,
+            false,
+            false,
+            false,
+            false));
+    }
 }
 
 public sealed record OpenAIConfigurationState(bool HasApiKey);

@@ -180,7 +180,7 @@ public sealed class EngineeringTask
         if (!string.Equals(plan.RepositoryFingerprint, RepositoryFingerprint, StringComparison.Ordinal))
             throw new PlanningException("stale_snapshot", "The plan does not match the current repository snapshot.");
 
-        ValidatePlan(plan);
+        ImplementationPlanValidator.Validate(plan, RepositorySnapshot, EvidenceItems);
         ImplementationPlan = plan;
         PlanCreatedAt = plan.CreatedAt;
         Status = WorkflowStatus.AwaitingPlanApproval;
@@ -193,7 +193,7 @@ public sealed class EngineeringTask
         if (ImplementationPlan is null)
             throw new WorkflowException("An implementation plan is required before approval.");
         PlanApprovedAt = now;
-        Status = WorkflowStatus.Implementing;
+        Status = WorkflowStatus.PlanApproved;
         UpdatedAt = now;
     }
 
@@ -239,7 +239,9 @@ public sealed class EngineeringTask
             CurrentClarifiedRequirement = currentClarifiedRequirement,
             CurrentPendingQuestion = currentPendingQuestion,
             RequirementSummary = requirementSummary,
-            Status = status,
+            Status = status == WorkflowStatus.Implementing && planApprovedAt is not null && implementationPlan is not null
+                ? WorkflowStatus.PlanApproved
+                : status,
             CreatedAt = createdAt,
             UpdatedAt = updatedAt,
             RequirementApprovedAt = requirementApprovedAt,
@@ -259,34 +261,6 @@ public sealed class EngineeringTask
         task._modelCalls.AddRange(modelCalls);
         return task;
     }
-
-    private void ValidatePlan(ImplementationPlan plan)
-    {
-        if (!plan.IsDeterministicFake || string.IsNullOrWhiteSpace(plan.Title) || string.IsNullOrWhiteSpace(plan.Objective) ||
-            string.IsNullOrWhiteSpace(plan.Summary) || plan.OrderedSteps.Count == 0)
-            throw new PlanningException("invalid_plan", "The implementation plan is incomplete or not labelled as deterministic Fake output.");
-
-        var snapshotPaths = RepositorySnapshot!.Files.Select(file => file.RelativePath).ToHashSet(StringComparer.OrdinalIgnoreCase);
-        var evidenceIds = EvidenceItems.Select(item => item.Id).ToHashSet(StringComparer.Ordinal);
-        foreach (var file in plan.AffectedFiles)
-        {
-            if (!IsSafeRelativePath(file.Path))
-                throw new PlanningException("invalid_plan", "The implementation plan contains an unsafe repository path.");
-            if (file.Action is PlannedFileAction.Modify or PlannedFileAction.Delete or PlannedFileAction.Inspect && !snapshotPaths.Contains(file.Path))
-                throw new PlanningException("invalid_plan", $"Planned {file.Action.ToString().ToLowerInvariant()} path '{file.Path}' does not exist in the snapshot.");
-            if (file.Action == PlannedFileAction.Create && snapshotPaths.Contains(file.Path))
-                throw new PlanningException("invalid_plan", $"Planned create path '{file.Path}' already exists in the snapshot.");
-            if (file.EvidenceIds.Any(id => !evidenceIds.Contains(id)))
-                throw new PlanningException("invalid_plan", $"Planned file '{file.Path}' references unknown evidence.");
-            if (file.Confidence is < 0 or > 1)
-                throw new PlanningException("invalid_plan", "Plan confidence must be between zero and one.");
-        }
-    }
-
-    private static bool IsSafeRelativePath(string path) =>
-        !string.IsNullOrWhiteSpace(path) &&
-        !Path.IsPathRooted(path) &&
-        !path.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar).Contains("..");
 
     private void EnsureStatus(WorkflowStatus expected)
     {

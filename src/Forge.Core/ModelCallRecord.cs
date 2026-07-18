@@ -2,7 +2,8 @@ namespace Forge.Core;
 
 public enum ModelCallStage
 {
-    Clarification
+    Clarification,
+    Planning
 }
 
 public sealed record ModelCallRecord(

@@ -6,6 +6,9 @@
 - [x] Automated core workflow tests
 - [x] Read-only repository snapshot and deterministic evidence retrieval
 - [x] Evidence-backed deterministic Fake planning and explicit plan approval
+- [x] Strict-schema OpenAI evidence-backed planning with non-billable adapter tests
+- [x] Explicit `PlanApproved` gate with legacy approved-plan compatibility
+- [x] Stage-specific clarification/planning telemetry and truthful capabilities
 - [x] README setup and validation commands
 - [ ] Curated demo repository and demo data
 - [ ] Publicly accessible submission repository

@@ -24,6 +24,11 @@ public sealed class ForgeExceptionHandler(
                 "analysis_limits" => (422, "Repository analysis limit", discovery.Message, "repository_analysis_limit"),
                 _ => (400, "Repository path invalid", discovery.Message, "repository_missing_path")
             },
+            PlanningProviderException provider => (
+                provider.Category is "rate_limit" or "timeout" ? 503 : 502,
+                "AI planning failure",
+                provider.Message,
+                $"planning_{provider.Category}"),
             PlanningException planning => planning.Category switch
             {
                 "stale_snapshot" => (409, "Repository snapshot is stale", planning.Message, "stale_snapshot"),

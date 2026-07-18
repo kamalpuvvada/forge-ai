@@ -1,6 +1,6 @@
 # Forge AI
 
-Forge AI is a trustworthy, explainable, and cost-aware software-engineering workflow. The current slice clarifies and approves requirements, inspects a local repository read-only, selects bounded evidence deterministically, creates a labelled Fake-mode implementation plan, and requires explicit plan approval.
+Forge AI is a trustworthy, explainable, and cost-aware software-engineering workflow. The current slice clarifies and approves requirements, inspects a local repository read-only, selects bounded evidence deterministically, creates an evidence-backed implementation plan through either Fake or OpenAI mode, and requires explicit plan approval.
 
 Target-repository modification, validation execution, review, and pull-request creation remain explicitly unavailable.
 
@@ -60,7 +60,7 @@ The deterministic clarification adapter asks up to three development questions. 
 
 Default limits are 5,000 discovered files, 256 KB per text file, 20 MB of considered text, 12 evidence files, and 60,000 evidence characters. Generated/minified/binary content, common build/dependency folders, and likely secret files such as `.env`, private keys, and credential files are excluded. Obvious sensitive key/value lines are replaced with `[REDACTED]`; this is a conservative safeguard, not a guarantee that a repository contains no secrets.
 
-Evidence ranking combines requirement terms with paths, declared symbols, content, project/module context, tests, configuration, and entry points. The Fake planner cites evidence IDs, labels validation commands as proposals, and stops after explicit plan approval without modifying the target.
+Evidence ranking gives strong multiword phrases more weight than generic terms, diversifies across frontend/API/core/infrastructure/test layers, boosts related contracts and tests, and lowers generic documentation and unrelated clarification code. This is requirement-driven rather than feature-keyword hardcoding. Both planners cite evidence IDs, label validation commands as proposals, and stop at `PlanApproved` without modifying the target.
 
 ## Run in OpenAI mode
 
@@ -73,7 +73,7 @@ $env:Forge__AI__Mode = 'OpenAI'
 dotnet run --project .\src\Forge.Api --launch-profile http
 ```
 
-The clarification model is `gpt-5.6-terra`, reasoning effort is `low`, and output is limited to 800 tokens. Clear the current shell values when finished:
+The clarification model is `gpt-5.6-terra` with `low` reasoning and an 800-token output limit. The planning model is `gpt-5.6-sol` with `medium` reasoning and a 2,400-token output limit. OpenAI planning sends only approved requirement context, compact repository metadata, and bounded redacted evidence; it excludes the absolute repository root and unrestricted file contents. Clear the current shell values when finished:
 
 ```powershell
 Remove-Item Env:OPENAI_API_KEY -ErrorAction SilentlyContinue
@@ -85,17 +85,18 @@ This implementation task did **not** make a live or billable OpenAI request.
 ## AI boundary and failure behavior
 
 - `IClarificationEngine.EvaluateAsync` is asynchronous and cancellation-aware.
+- `IPlanningEngine.CreatePlanAsync` is asynchronous and cancellation-aware and returns a plan plus optional model-call telemetry.
 - Every evaluation returns exactly one decision: ask one question or provide a summary. One question means one atomic decision dimension.
 - The OpenAI adapter uses official `OpenAI` 2.12.0 and the Responses API.
-- Strict JSON Schema structured output requires an internal `questionFocus`; the ask/summarize and atomic-question invariants are validated again after deserialization.
-- Each turn sends compact canonical context: repository identifier, original requirement, answers, and revision notes. `previous_response_id` is not used.
+- Strict JSON Schema structured output is used for clarification and planning; domain validation independently enforces evidence IDs, existing/create path truth, sequential steps, safe relative paths, and proposal-only validation language.
+- Planning sends the original and approved requirements once, answers, correction notes, compact snapshot metadata, and selected excerpts. Absolute roots, full files, raw responses, secrets, and hidden reasoning are excluded. `previous_response_id` is not used.
 - Fake mode records no model usage.
 - OpenAI mode never falls back to Fake mode. Configuration, authentication, timeout, rate-limit, malformed-output, and provider failures return safe Problem Details.
 - API keys, authorization headers, complete raw responses, hidden reasoning, and user-input secrets are not stored in model-call records.
 
 ## Token and estimated-cost telemetry
 
-Forge stores call identity, stage, provider/model, reasoning effort, timestamps, outcome, response ID when available, input/cached/output/reasoning tokens, safe failure category, and estimated USD cost. The API returns task totals and the UI provides expandable details.
+Forge stores call identity, clarification/planning stage, provider/model, reasoning effort, timestamps, outcome, response ID when available, input/cached/output/reasoning tokens, safe failure category, and estimated USD cost. The API returns task totals and the UI separates clarification and planning call counts and planning cost.
 
 Costs are estimates based on configurable per-million-token rates. Cached input is not charged twice:
 
@@ -130,7 +131,7 @@ The capabilities endpoint returns only safe mode/model/feature availability and 
 
 ## SQLite development schema
 
-The Development API creates the database automatically. Existing databases gain known clarification, snapshot, evidence, plan, fingerprint, and planning-timestamp columns through `PRAGMA table_info` and narrowly scoped `ALTER TABLE ADD COLUMN` commands. Snapshot, evidence, and plan payloads are bounded JSON.
+The Development API creates the database automatically. Existing databases gain known clarification, snapshot, evidence, plan, fingerprint, and planning-timestamp columns through `PRAGMA table_info` and narrowly scoped `ALTER TABLE ADD COLUMN` commands. Legacy approved plans stored as `Implementing` are read as structured `PlanApproved` plans because no implementation artifacts existed in that slice. Snapshot, evidence, and plan payloads are bounded JSON.
 
 After stopping the API, reset local data with:
 
@@ -142,7 +143,7 @@ Remove-Item -LiteralPath .\src\Forge.Api\data\forge.db-wal -Force -ErrorAction S
 
 ## Current limitations
 
-- Fake clarification remains generic, and Fake planning uses ranking heuristics rather than semantic model reasoning.
+- Fake clarification remains generic, and deterministic evidence selection still uses explainable lexical/structural heuristics rather than semantic embeddings.
 - No automated test sends a real OpenAI request.
 - Redaction covers obvious sensitive key names but cannot guarantee that every secret pattern is detected.
 - Git evidence uses tracked files returned by `git ls-files`; ignored and untracked content is not selected.

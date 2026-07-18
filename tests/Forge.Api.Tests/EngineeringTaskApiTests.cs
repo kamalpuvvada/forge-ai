@@ -1,7 +1,10 @@
 using System.Net;
 using System.Net.Http.Json;
 using System.Text.Json;
+using Forge.Api.Contracts;
+using Forge.Api.Controllers;
 using Forge.Core;
+using Forge.Infrastructure;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.Extensions.Configuration;
@@ -114,20 +117,26 @@ public sealed class EngineeringTaskApiTests : IClassFixture<FakeModeFactory>
         Assert.True(analyzed.GetProperty("evidenceItems").GetArrayLength() > 0);
 
         var planResponse = await _client.PostAsync($"/api/tasks/{id}/plan", null);
-        planResponse.EnsureSuccessStatusCode();
+        Assert.True(planResponse.IsSuccessStatusCode, await planResponse.Content.ReadAsStringAsync());
         var planned = await planResponse.Content.ReadFromJsonAsync<JsonElement>();
         Assert.Equal("AwaitingPlanApproval", planned.GetProperty("status").GetString());
         Assert.True(planned.GetProperty("implementationPlan").GetProperty("isDeterministicFake").GetBoolean());
+        Assert.Equal("DeterministicFake", planned.GetProperty("implementationPlan").GetProperty("source").GetString());
+        Assert.Equal(JsonValueKind.Null, planned.GetProperty("implementationPlan").GetProperty("planningModel").ValueKind);
+        Assert.True(planned.GetProperty("implementationPlan").GetProperty("orderedSteps")[0].TryGetProperty("expectedResult", out _));
+        Assert.Equal(0, planned.GetProperty("telemetry").GetProperty("totalCalls").GetInt32());
+        Assert.Equal(0m, planned.GetProperty("telemetry").GetProperty("totalEstimatedCostUsd").GetDecimal());
 
         var approvalResponse = await _client.PostAsync($"/api/tasks/{id}/plan-approval", null);
         approvalResponse.EnsureSuccessStatusCode();
         var approved = await approvalResponse.Content.ReadFromJsonAsync<JsonElement>();
-        Assert.Equal("Implementing", approved.GetProperty("status").GetString());
+        Assert.Equal("PlanApproved", approved.GetProperty("status").GetString());
         Assert.NotEqual(JsonValueKind.Null, approved.GetProperty("planApprovedAt").ValueKind);
 
         var persisted = await _client.GetFromJsonAsync<JsonElement>($"/api/tasks/{id}");
-        Assert.Equal("Implementing", persisted.GetProperty("status").GetString());
+        Assert.Equal("PlanApproved", persisted.GetProperty("status").GetString());
         Assert.True(persisted.GetProperty("evidenceItems").GetArrayLength() > 0);
+        Assert.Equal("DeterministicFake", persisted.GetProperty("implementationPlan").GetProperty("source").GetString());
     }
 
     [Fact]
@@ -160,10 +169,75 @@ public sealed class EngineeringTaskApiTests : IClassFixture<FakeModeFactory>
         var capabilities = await _client.GetFromJsonAsync<JsonElement>("/api/system/capabilities");
         Assert.True(capabilities.GetProperty("repositoryInspectionAvailable").GetBoolean());
         Assert.True(capabilities.GetProperty("planningAvailable").GetBoolean());
+        Assert.Equal("Fake", capabilities.GetProperty("clarificationProvider").GetString());
+        Assert.Equal("Fake", capabilities.GetProperty("planningProvider").GetString());
+        Assert.True(capabilities.GetProperty("clarificationConfigured").GetBoolean());
+        Assert.True(capabilities.GetProperty("planningConfigured").GetBoolean());
         Assert.False(capabilities.GetProperty("targetModificationAvailable").GetBoolean());
         Assert.False(capabilities.GetProperty("validationAvailable").GetBoolean());
         Assert.False(capabilities.GetProperty("reviewAvailable").GetBoolean());
         Assert.False(capabilities.GetProperty("pullRequestCreationAvailable").GetBoolean());
+    }
+
+    [Fact]
+    public async Task Planning_provider_failure_returns_safe_problem_details_and_persists_failed_call()
+    {
+        await using var factory = new PlanningProviderFailureFactory();
+        using var client = factory.CreateClient();
+        var createdResponse = await client.PostAsJsonAsync("/api/tasks", new
+        {
+            repository = factory.TargetRepositoryPath,
+            requirement = "Add report export. Acceptance criteria: export is available. Validation: run focused tests."
+        });
+        createdResponse.EnsureSuccessStatusCode();
+        var created = await createdResponse.Content.ReadFromJsonAsync<JsonElement>();
+        var id = created.GetProperty("id").GetGuid();
+        (await client.PostAsync($"/api/tasks/{id}/requirement-approval", null)).EnsureSuccessStatusCode();
+        (await client.PostAsync($"/api/tasks/{id}/repository-analysis", null)).EnsureSuccessStatusCode();
+
+        var response = await client.PostAsync($"/api/tasks/{id}/plan", null);
+        var text = await response.Content.ReadAsStringAsync();
+
+        Assert.Equal(HttpStatusCode.BadGateway, response.StatusCode);
+        Assert.Contains("planning_provider_error", text);
+        Assert.DoesNotContain("sensitive-planning-value", text);
+        var persisted = await client.GetFromJsonAsync<JsonElement>($"/api/tasks/{id}");
+        var call = Assert.Single(persisted.GetProperty("telemetry").GetProperty("calls").EnumerateArray());
+        Assert.Equal("Planning", call.GetProperty("stage").GetString());
+        Assert.False(call.GetProperty("succeeded").GetBoolean());
+    }
+
+    [Fact]
+    public async Task OpenAI_mode_starts_without_key_and_reports_both_ai_stages_unavailable()
+    {
+        await using var factory = new OpenAiNoKeyFactory();
+        using var client = factory.CreateClient();
+
+        var capabilities = await client.GetFromJsonAsync<JsonElement>("/api/system/capabilities");
+
+        Assert.Equal("OpenAI", capabilities.GetProperty("aiMode").GetString());
+        Assert.Equal("OpenAI", capabilities.GetProperty("clarificationProvider").GetString());
+        Assert.Equal("OpenAI", capabilities.GetProperty("planningProvider").GetString());
+        Assert.False(capabilities.GetProperty("clarificationConfigured").GetBoolean());
+        Assert.False(capabilities.GetProperty("planningConfigured").GetBoolean());
+        Assert.False(capabilities.GetProperty("planningAvailable").GetBoolean());
+        Assert.False(capabilities.GetProperty("aiConfigured").GetBoolean());
+    }
+
+    [Fact]
+    public void OpenAI_capabilities_report_both_configured_models_when_key_is_available()
+    {
+        var result = new SystemController(
+            new ForgeAiOptions { Mode = ForgeAiModes.OpenAI },
+            new OpenAIConfigurationState(true)).GetCapabilities();
+        var ok = Assert.IsType<Microsoft.AspNetCore.Mvc.OkObjectResult>(result.Result);
+        var capabilities = Assert.IsType<SystemCapabilitiesResponse>(ok.Value);
+
+        Assert.Equal("gpt-5.6-terra", capabilities.ClarificationModel);
+        Assert.Equal("gpt-5.6-sol", capabilities.PlanningModel);
+        Assert.True(capabilities.ClarificationConfigured);
+        Assert.True(capabilities.PlanningConfigured);
+        Assert.True(capabilities.PlanningAvailable);
     }
 
     private async Task<JsonElement> CreateAsync(string requirement, string repository = "C:/repo")
@@ -233,5 +307,60 @@ public sealed class ProviderFailureFactory : FakeModeFactory
                 failed,
                 new Exception("sensitive-test-value")));
         }
+    }
+}
+
+public sealed class PlanningProviderFailureFactory : FakeModeFactory
+{
+    protected override void ConfigureWebHost(IWebHostBuilder builder)
+    {
+        base.ConfigureWebHost(builder);
+        builder.ConfigureServices(services =>
+        {
+            services.RemoveAll<IPlanningEngine>();
+            services.AddSingleton<IPlanningEngine, FailingPlanningEngine>();
+        });
+    }
+
+    private sealed class FailingPlanningEngine : IPlanningEngine
+    {
+        public Task<PlanningEvaluation> CreatePlanAsync(PlanningContext context, CancellationToken cancellationToken = default)
+        {
+            var now = DateTimeOffset.UtcNow;
+            var failed = new ModelCallRecord(Guid.NewGuid(), ModelCallStage.Planning, "OpenAI", "gpt-5.6-sol", "medium",
+                now, now, false, null, 0, 0, 0, null, 0m, "provider_error");
+            return Task.FromException<PlanningEvaluation>(new PlanningProviderException(
+                "OpenAI could not complete the planning request.", "provider_error", failed,
+                new Exception("sensitive-planning-value")));
+        }
+    }
+}
+
+public sealed class OpenAiNoKeyFactory : WebApplicationFactory<Program>
+{
+    private readonly string _directory = Path.Combine(Path.GetTempPath(), $"forge-openai-no-key-{Guid.NewGuid():N}");
+
+    protected override void ConfigureWebHost(IWebHostBuilder builder)
+    {
+        builder.UseEnvironment("Development");
+        builder.UseSetting("Forge:AI:Mode", "OpenAI");
+        builder.ConfigureAppConfiguration((_, configuration) => configuration.AddInMemoryCollection(
+            new Dictionary<string, string?>
+            {
+                ["Forge:DatabasePath"] = Path.Combine(_directory, "forge.db"),
+                ["Forge:AI:Mode"] = "OpenAI"
+            }));
+        builder.ConfigureServices(services =>
+        {
+            services.RemoveAll<Forge.Api.Controllers.OpenAIConfigurationState>();
+            services.AddSingleton(new Forge.Api.Controllers.OpenAIConfigurationState(false));
+        });
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        base.Dispose(disposing);
+        Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+        if (Directory.Exists(_directory)) Directory.Delete(_directory, true);
     }
 }

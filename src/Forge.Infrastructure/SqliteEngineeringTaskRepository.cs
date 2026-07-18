@@ -24,7 +24,7 @@ public sealed class SqliteEngineeringTaskRepository(string connectionString) : I
         var modelCalls = JsonSerializer.Deserialize<List<ModelCallRecord>>(reader.GetString(reader.GetOrdinal("ModelCalls")), JsonOptions) ?? [];
         var snapshot = DeserializeNullable<RepositorySnapshot>(reader, "RepositorySnapshot");
         var evidenceItems = JsonSerializer.Deserialize<List<EvidenceItem>>(reader.GetString(reader.GetOrdinal("EvidenceItems")), JsonOptions) ?? [];
-        var plan = DeserializeNullable<ImplementationPlan>(reader, "ImplementationPlan");
+        var plan = DeserializePlan(reader);
         return EngineeringTask.Rehydrate(
             Guid.Parse(reader.GetString(reader.GetOrdinal("Id"))),
             reader.GetString(reader.GetOrdinal("Repository")),
@@ -135,6 +135,41 @@ public sealed class SqliteEngineeringTaskRepository(string connectionString) : I
     {
         var value = ReadNullableString(reader, name);
         return value is null ? null : JsonSerializer.Deserialize<T>(value, JsonOptions);
+    }
+
+    private static ImplementationPlan? DeserializePlan(SqliteDataReader reader)
+    {
+        var value = ReadNullableString(reader, "ImplementationPlan");
+        if (value is null) return null;
+
+        using var document = JsonDocument.Parse(value);
+        var root = document.RootElement;
+        if (root.TryGetProperty("source", out _))
+            return JsonSerializer.Deserialize<ImplementationPlan>(value, JsonOptions);
+
+        var affectedFiles = root.GetProperty("affectedFiles").Deserialize<List<PlannedFileChange>>(JsonOptions) ?? [];
+        var evidenceIds = affectedFiles.SelectMany(file => file.EvidenceIds).Distinct(StringComparer.Ordinal).ToArray();
+        var affectedPaths = affectedFiles.Select(file => file.Path).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+        var descriptions = root.GetProperty("orderedSteps").Deserialize<List<string>>(JsonOptions) ?? [];
+        var steps = descriptions.Select((description, index) => new ImplementationStep(
+            index + 1, description, affectedPaths, evidenceIds,
+            "The described repository change is ready for later validation.")).ToArray();
+
+        return new ImplementationPlan(
+            root.GetProperty("title").GetString() ?? "Migrated implementation plan",
+            root.GetProperty("objective").GetString() ?? string.Empty,
+            root.GetProperty("repositoryUnderstanding").GetString() ?? string.Empty,
+            affectedFiles,
+            steps,
+            root.GetProperty("proposedValidationCommands").Deserialize<List<string>>(JsonOptions) ?? [],
+            root.GetProperty("risks").Deserialize<List<string>>(JsonOptions) ?? [],
+            root.GetProperty("assumptions").Deserialize<List<string>>(JsonOptions) ?? [],
+            [],
+            root.GetProperty("summary").GetString() ?? string.Empty,
+            PlanningSource.DeterministicFake,
+            null,
+            root.GetProperty("createdAt").GetDateTimeOffset(),
+            root.GetProperty("repositoryFingerprint").GetString() ?? string.Empty);
     }
 
     private static string FormatDate(DateTimeOffset date) => date.ToString("O", CultureInfo.InvariantCulture);

@@ -24,6 +24,8 @@
 - Do not modify a target repository before both the requirement summary and implementation plan receive explicit approval.
 - Repository analysis is read-only: contain every path, skip reparse points and likely secrets, never execute repository code, and keep persisted evidence bounded and redacted.
 - Deterministic Fake plans must cite real evidence, label proposed validation as unexecuted, and never claim implementation occurred.
+- Plan approval transitions only to `PlanApproved`; it never implies implementation or authorizes target-repository mutation.
+- OpenAI planning receives only compact snapshot metadata and bounded redacted evidence. Strict output must be revalidated for evidence IDs, path truth, sequential steps, and unexecuted validation claims.
 - Never commit secrets, API keys, tokens, credentials, or sensitive local paths. Use configuration and ignored local files.
 - OpenAI mode reads only `OPENAI_API_KEY`. Never log or persist keys, authorization headers, raw provider responses, or hidden reasoning.
 - Never silently fall back from OpenAI to Fake mode. Provider and configuration failures remain visible and safe.

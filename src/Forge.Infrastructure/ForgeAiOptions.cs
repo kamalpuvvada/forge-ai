@@ -17,14 +17,27 @@ public sealed class ForgeAiOptions
     public string ClarificationModel { get; set; } = "gpt-5.6-terra";
     public string ClarificationReasoningEffort { get; set; } = "low";
     public int ClarificationMaxOutputTokens { get; set; } = 800;
+    public string PlanningModel { get; set; } = "gpt-5.6-sol";
+    public string PlanningReasoningEffort { get; set; } = "medium";
+    public int PlanningMaxOutputTokens { get; set; } = 2400;
     public Dictionary<string, ModelPricing> Pricing { get; set; } = DefaultPricing();
 
-    public bool IsOpenAiConfigurationComplete(bool hasApiKey) =>
+    public bool IsClarificationConfigurationComplete(bool hasApiKey) =>
         hasApiKey &&
         !string.IsNullOrWhiteSpace(ClarificationModel) &&
         SupportedReasoningEfforts.Contains(ClarificationReasoningEffort) &&
         ClarificationMaxOutputTokens > 0 &&
         Pricing.ContainsKey(ClarificationModel);
+
+    public bool IsPlanningConfigurationComplete(bool hasApiKey) =>
+        hasApiKey &&
+        !string.IsNullOrWhiteSpace(PlanningModel) &&
+        SupportedReasoningEfforts.Contains(PlanningReasoningEffort) &&
+        PlanningMaxOutputTokens > 0 &&
+        Pricing.ContainsKey(PlanningModel);
+
+    public bool IsOpenAiConfigurationComplete(bool hasApiKey) =>
+        IsClarificationConfigurationComplete(hasApiKey) && IsPlanningConfigurationComplete(hasApiKey);
 
     public static Dictionary<string, ModelPricing> DefaultPricing() => new(StringComparer.OrdinalIgnoreCase)
     {

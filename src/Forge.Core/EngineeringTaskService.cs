@@ -82,16 +82,29 @@ public sealed class EngineeringTaskService(
             throw new PlanningException("stale_snapshot", "The repository changed after analysis. Re-analyze it before creating a plan.");
 
         var now = timeProvider.GetUtcNow();
-        var plan = planningEngine.CreatePlan(new PlanningContext(
-            task.OriginalRequirement,
-            task.RequirementSummary,
-            task.RepositorySnapshot,
-            task.EvidenceItems,
-            now));
-        var maximumAge = TimeSpan.FromMinutes((analysisLimits ?? new RepositoryAnalysisLimits()).SnapshotMaximumAgeMinutes);
-        task.StoreImplementationPlan(plan, now, maximumAge);
-        await repository.SaveAsync(task, cancellationToken);
-        return task;
+        try
+        {
+            var evaluation = await planningEngine.CreatePlanAsync(new PlanningContext(
+                task.OriginalRequirement,
+                task.RequirementSummary,
+                task.ClarificationAnswers,
+                task.RequirementRevisionNotes,
+                task.RepositorySnapshot,
+                task.EvidenceItems,
+                now), cancellationToken);
+            if (evaluation.ModelCall is not null) task.RecordModelCall(evaluation.ModelCall, timeProvider.GetUtcNow());
+            var maximumAge = TimeSpan.FromMinutes((analysisLimits ?? new RepositoryAnalysisLimits()).SnapshotMaximumAgeMinutes);
+            task.StoreImplementationPlan(evaluation.Plan, timeProvider.GetUtcNow(), maximumAge);
+            await repository.SaveAsync(task, cancellationToken);
+            return task;
+        }
+        catch (PlanningProviderException exception)
+        {
+            task.RecordModelCall(exception.FailedCall, timeProvider.GetUtcNow());
+            // Preserve the failed provider audit even when the request token has been cancelled after failure.
+            await repository.SaveAsync(task, CancellationToken.None);
+            throw;
+        }
     }
 
     public async Task<EngineeringTask> ApprovePlanAsync(Guid id, CancellationToken cancellationToken = default)

@@ -50,7 +50,7 @@ public sealed class PlanningWorkflowTests
         Assert.Equal(WorkflowStatus.AwaitingPlanApproval, task.Status);
         Assert.Throws<WorkflowException>(() => ApprovedTask().ApproveImplementationPlan(Now));
         task.ApproveImplementationPlan(Now.AddMinutes(1));
-        Assert.Equal(WorkflowStatus.Implementing, task.Status);
+        Assert.Equal(WorkflowStatus.PlanApproved, task.Status);
         Assert.Equal(Now.AddMinutes(1), task.PlanApprovedAt);
     }
 
@@ -76,5 +76,6 @@ public sealed class PlanningWorkflowTests
     internal static EvidenceItem Evidence() => new("E1", "src/App.cs", 1, 1, "class App", "matching symbol", 20, "hash");
 
     internal static ImplementationPlan Plan(RepositorySnapshot snapshot, IReadOnlyList<EvidenceItem> evidence) =>
-        new FakePlanningEngine().CreatePlan(new PlanningContext("Requirement", "Approved requirement", snapshot, evidence, Now));
+        new FakePlanningEngine().CreatePlanAsync(new PlanningContext(
+            "Requirement", "Approved requirement", [], [], snapshot, evidence, Now)).GetAwaiter().GetResult().Plan;
 }

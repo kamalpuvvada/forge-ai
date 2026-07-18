@@ -49,11 +49,16 @@ public sealed record EvidenceItemResponse(
 public sealed record PlannedFileResponse(
     string Path, PlannedFileAction Action, string Purpose, IReadOnlyList<string> EvidenceIds, decimal Confidence);
 
+public sealed record ImplementationStepResponse(
+    int Order, string Description, IReadOnlyList<string> AffectedPaths,
+    IReadOnlyList<string> EvidenceIds, string ExpectedResult);
+
 public sealed record ImplementationPlanResponse(
     string Title, string Objective, string RepositoryUnderstanding, IReadOnlyList<PlannedFileResponse> AffectedFiles,
-    IReadOnlyList<string> OrderedSteps, IReadOnlyList<string> ProposedValidationCommands, IReadOnlyList<string> Risks,
-    IReadOnlyList<string> Assumptions, string Summary, bool IsDeterministicFake, DateTimeOffset CreatedAt,
-    string RepositoryFingerprint);
+    IReadOnlyList<ImplementationStepResponse> OrderedSteps, IReadOnlyList<string> ProposedValidationCommands,
+    IReadOnlyList<string> Risks, IReadOnlyList<string> Assumptions, IReadOnlyList<string> UnresolvedQuestions,
+    string Summary, PlanningSource Source, string? PlanningModel, bool IsDeterministicFake,
+    DateTimeOffset CreatedAt, string RepositoryFingerprint);
 
 public sealed record EngineeringTaskResponse(
     Guid Id,
@@ -121,11 +126,15 @@ public sealed record EngineeringTaskResponse(
             task.ImplementationPlan.RepositoryUnderstanding,
             task.ImplementationPlan.AffectedFiles.Select(file => new PlannedFileResponse(
                 file.Path, file.Action, file.Purpose, file.EvidenceIds, file.Confidence)).ToArray(),
-            task.ImplementationPlan.OrderedSteps,
+            task.ImplementationPlan.Steps.Select(step => new ImplementationStepResponse(
+                step.Order, step.Description, step.AffectedPaths, step.EvidenceIds, step.ExpectedResult)).ToArray(),
             task.ImplementationPlan.ProposedValidationCommands,
             task.ImplementationPlan.Risks,
             task.ImplementationPlan.Assumptions,
+            task.ImplementationPlan.UnresolvedQuestions,
             task.ImplementationPlan.Summary,
+            task.ImplementationPlan.Source,
+            task.ImplementationPlan.PlanningModel,
             task.ImplementationPlan.IsDeterministicFake,
             task.ImplementationPlan.CreatedAt,
             task.ImplementationPlan.RepositoryFingerprint);

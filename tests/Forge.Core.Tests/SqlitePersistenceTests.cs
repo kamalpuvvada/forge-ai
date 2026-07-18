@@ -98,8 +98,49 @@ public sealed class SqlitePersistenceTests : IDisposable
         Assert.Equal(snapshot.Fingerprint, loaded.RepositoryFingerprint);
         Assert.Equal(evidence.Excerpt, Assert.Single(loaded.EvidenceItems).Excerpt);
         Assert.True(loaded.ImplementationPlan?.IsDeterministicFake);
+        Assert.Equal(PlanningSource.DeterministicFake, loaded.ImplementationPlan?.Source);
+        Assert.Null(loaded.ImplementationPlan?.PlanningModel);
         Assert.Equal(now.AddMinutes(1), loaded.PlanApprovedAt);
-        Assert.Equal(WorkflowStatus.Implementing, loaded.Status);
+        Assert.Equal(WorkflowStatus.PlanApproved, loaded.Status);
+    }
+
+    [Fact]
+    public async Task Legacy_implementing_plan_is_migrated_to_structured_plan_approved_state()
+    {
+        await new SqliteDatabaseInitializer(ConnectionString).InitializeAsync();
+        var repository = new SqliteEngineeringTaskRepository(ConnectionString);
+        var now = DateTimeOffset.UtcNow;
+        var task = EngineeringTask.Create("C:/repo", "Add report export", now);
+        task.ApplyClarificationEvaluation(ClarificationEvaluation.Summarize("Add report export"), now);
+        task.ApproveRequirementSummary(now);
+        task.BeginRepositoryAnalysis(now);
+        var snapshot = PlanningWorkflowTests.Snapshot(now);
+        var evidence = PlanningWorkflowTests.Evidence();
+        task.StoreRepositorySnapshot(snapshot, now);
+        task.StoreEvidence(new EvidenceSelection([evidence], 1, 1, evidence.Excerpt.Length), now);
+        task.StoreImplementationPlan(PlanningWorkflowTests.Plan(snapshot, [evidence]), now, TimeSpan.FromMinutes(30));
+        task.ApproveImplementationPlan(now.AddMinutes(1));
+        await repository.SaveAsync(task);
+
+        var legacyJson = $$"""
+            {"title":"Legacy plan","objective":"Add export","repositoryUnderstanding":"Evidence E1","affectedFiles":[{"path":"src/App.cs","action":0,"purpose":"Add export","evidenceIds":["E1"],"confidence":0.8}],"orderedSteps":["Update the application surface"],"proposedValidationCommands":["dotnet test ForgeAI.slnx"],"risks":[],"assumptions":[],"summary":"Legacy summary","isDeterministicFake":true,"createdAt":"{{now:O}}","repositoryFingerprint":"fingerprint"}
+            """;
+        await using (var connection = new SqliteConnection(ConnectionString))
+        {
+            await connection.OpenAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = "UPDATE EngineeringTasks SET Status = 'Implementing', ImplementationPlan = $plan WHERE Id = $id";
+            command.Parameters.AddWithValue("$plan", legacyJson);
+            command.Parameters.AddWithValue("$id", task.Id.ToString());
+            await command.ExecuteNonQueryAsync();
+        }
+
+        var loaded = await repository.GetAsync(task.Id);
+
+        Assert.NotNull(loaded);
+        Assert.Equal(WorkflowStatus.PlanApproved, loaded.Status);
+        Assert.Equal(PlanningSource.DeterministicFake, loaded.ImplementationPlan?.Source);
+        Assert.Equal(1, Assert.Single(loaded.ImplementationPlan!.Steps).Order);
     }
 
     public void Dispose()

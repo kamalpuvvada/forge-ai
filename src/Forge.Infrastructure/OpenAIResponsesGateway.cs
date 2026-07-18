@@ -9,7 +9,9 @@ public sealed record OpenAIResponseRequest(
     int MaxOutputTokens,
     string DeveloperInstructions,
     string UserInput,
-    string JsonSchema);
+    string JsonSchema,
+    string SchemaName = "forge_clarification_evaluation",
+    string SchemaDescription = "Exactly one clarification decision.");
 
 public sealed record OpenAIResponseEnvelope(
     string ResponseId,
@@ -53,9 +55,9 @@ public sealed class SdkOpenAIResponsesGateway(string apiKey) : IOpenAIResponsesG
             TextOptions = new ResponseTextOptions
             {
                 TextFormat = ResponseTextFormat.CreateJsonSchemaFormat(
-                    "forge_clarification_evaluation",
+                    request.SchemaName,
                     BinaryData.FromString(request.JsonSchema),
-                    "Exactly one clarification decision.",
+                    request.SchemaDescription,
                     true)
             }
         };
@@ -75,7 +77,7 @@ public sealed class SdkOpenAIResponsesGateway(string apiKey) : IOpenAIResponsesG
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
-            throw new OpenAITransportException("timeout", "The OpenAI clarification request timed out.");
+            throw new OpenAITransportException("timeout", "The OpenAI request timed out.");
         }
         catch (ClientResultException exception)
         {
@@ -94,9 +96,9 @@ public sealed class SdkOpenAIResponsesGateway(string apiKey) : IOpenAIResponsesG
     private static string SafeMessage(string category) => category switch
     {
         "authentication" => "OpenAI rejected the configured credentials.",
-        "rate_limit" => "OpenAI rate-limited the clarification request.",
-        "timeout" => "The OpenAI clarification request timed out.",
-        "invalid_request" => "OpenAI rejected the clarification request.",
-        _ => "OpenAI could not complete the clarification request."
+        "rate_limit" => "OpenAI rate-limited the request.",
+        "timeout" => "The OpenAI request timed out.",
+        "invalid_request" => "OpenAI rejected the request.",
+        _ => "OpenAI could not complete the request."
     };
 }

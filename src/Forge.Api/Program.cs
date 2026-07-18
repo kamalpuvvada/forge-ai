@@ -39,11 +39,19 @@ builder.Services.AddSingleton<IClarificationEngine>(services => aiOptions.Mode s
         services.GetRequiredService<TimeProvider>()),
     _ => throw new InvalidOperationException($"Unsupported Forge AI mode '{aiOptions.Mode}'. Use 'Fake' or 'OpenAI'.")
 });
+builder.Services.AddSingleton<IPlanningEngine>(services => aiOptions.Mode switch
+{
+    ForgeAiModes.Fake => new FakePlanningEngine(),
+    ForgeAiModes.OpenAI => new OpenAIPlanningEngine(
+        aiOptions,
+        string.IsNullOrWhiteSpace(apiKey) ? null : new SdkOpenAIResponsesGateway(apiKey),
+        services.GetRequiredService<ModelCostCalculator>(),
+        services.GetRequiredService<TimeProvider>()),
+    _ => throw new InvalidOperationException($"Unsupported Forge AI mode '{aiOptions.Mode}'. Use 'Fake' or 'OpenAI'.")
+});
 builder.Services.AddSingleton<IEngineeringTaskRepository>(_ => new SqliteEngineeringTaskRepository(connectionString));
 builder.Services.AddSingleton<IRepositoryDiscoveryService, RepositoryDiscoveryService>();
 builder.Services.AddSingleton<IEvidenceSelectionService, DeterministicEvidenceSelectionService>();
-if (string.Equals(aiOptions.Mode, ForgeAiModes.Fake, StringComparison.OrdinalIgnoreCase))
-    builder.Services.AddSingleton<IPlanningEngine, FakePlanningEngine>();
 builder.Services.AddSingleton(new SqliteDatabaseInitializer(connectionString));
 builder.Services.AddScoped<EngineeringTaskService>();
 
