@@ -208,6 +208,36 @@ public sealed class EngineeringTaskApiTests : IClassFixture<FakeModeFactory>
     }
 
     [Fact]
+    public async Task Output_truncation_returns_specific_safe_problem_and_persists_costed_failure()
+    {
+        await using var factory = new OutputTruncatedPlanningFactory();
+        using var client = factory.CreateClient();
+        var createdResponse = await client.PostAsJsonAsync("/api/tasks", new
+        {
+            repository = factory.TargetRepositoryPath,
+            requirement = "Add report export. Acceptance criteria: export is available. Validation: run focused tests."
+        });
+        createdResponse.EnsureSuccessStatusCode();
+        var created = await createdResponse.Content.ReadFromJsonAsync<JsonElement>();
+        var id = created.GetProperty("id").GetGuid();
+        (await client.PostAsync($"/api/tasks/{id}/requirement-approval", null)).EnsureSuccessStatusCode();
+        (await client.PostAsync($"/api/tasks/{id}/repository-analysis", null)).EnsureSuccessStatusCode();
+
+        var response = await client.PostAsync($"/api/tasks/{id}/plan", null);
+        var problem = await response.Content.ReadFromJsonAsync<JsonElement>();
+
+        Assert.Equal(HttpStatusCode.BadGateway, response.StatusCode);
+        Assert.Equal("planning_output_truncated", problem.GetProperty("code").GetString());
+        Assert.Equal("The planning response reached its output limit before the structured plan was complete.",
+            problem.GetProperty("detail").GetString());
+        var persisted = await client.GetFromJsonAsync<JsonElement>($"/api/tasks/{id}");
+        var call = Assert.Single(persisted.GetProperty("telemetry").GetProperty("calls").EnumerateArray());
+        Assert.Equal(6000, call.GetProperty("outputTokens").GetInt32());
+        Assert.Equal(0.21005m, call.GetProperty("estimatedCostUsd").GetDecimal());
+        Assert.Equal("output_truncated", call.GetProperty("failureCategory").GetString());
+    }
+
+    [Fact]
     public async Task OpenAI_mode_starts_without_key_and_reports_both_ai_stages_unavailable()
     {
         await using var factory = new OpenAiNoKeyFactory();
@@ -332,6 +362,32 @@ public sealed class PlanningProviderFailureFactory : FakeModeFactory
             return Task.FromException<PlanningEvaluation>(new PlanningProviderException(
                 "OpenAI could not complete the planning request.", "provider_error", failed,
                 new Exception("sensitive-planning-value")));
+        }
+    }
+}
+
+public sealed class OutputTruncatedPlanningFactory : FakeModeFactory
+{
+    protected override void ConfigureWebHost(IWebHostBuilder builder)
+    {
+        base.ConfigureWebHost(builder);
+        builder.ConfigureServices(services =>
+        {
+            services.RemoveAll<IPlanningEngine>();
+            services.AddSingleton<IPlanningEngine, TruncatedPlanningEngine>();
+        });
+    }
+
+    private sealed class TruncatedPlanningEngine : IPlanningEngine
+    {
+        public Task<PlanningEvaluation> CreatePlanAsync(PlanningContext context, CancellationToken cancellationToken = default)
+        {
+            var now = DateTimeOffset.UtcNow;
+            var failed = new ModelCallRecord(Guid.NewGuid(), ModelCallStage.Planning, "OpenAI", "gpt-5.6-sol", "medium",
+                now, now, false, "resp_truncated", 6100, 100, 6000, 2000, 0.21005m, "output_truncated");
+            return Task.FromException<PlanningEvaluation>(new PlanningProviderException(
+                "The planning response reached its output limit before the structured plan was complete.",
+                "output_truncated", failed));
         }
     }
 }

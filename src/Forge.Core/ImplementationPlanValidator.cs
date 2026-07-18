@@ -25,6 +25,11 @@ public static class ImplementationPlanValidator
             string.IsNullOrWhiteSpace(plan.RepositoryUnderstanding) || string.IsNullOrWhiteSpace(plan.Summary) ||
             plan.AffectedFiles.Count == 0 || plan.Steps.Count == 0)
             throw Invalid("The implementation plan is incomplete.");
+        if (plan.AffectedFiles.Count > 6 || plan.Steps.Count > 6 || plan.ProposedValidationCommands.Count > 6 ||
+            plan.Risks.Count > 4 || plan.Assumptions.Count > 4 || plan.UnresolvedQuestions.Count > 4)
+            throw Invalid("The implementation plan exceeds the compact collection limits.");
+        if (FlattenText(plan).Split('\n').Any(value => value.Length > 500))
+            throw Invalid("The implementation plan contains an overlong description.");
         if (plan.Source == PlanningSource.OpenAI && string.IsNullOrWhiteSpace(plan.PlanningModel))
             throw Invalid("An OpenAI plan must identify its planning model.");
         if (!string.Equals(plan.RepositoryFingerprint, snapshot.Fingerprint, StringComparison.Ordinal))
@@ -37,6 +42,8 @@ public static class ImplementationPlanValidator
 
         foreach (var file in plan.AffectedFiles)
         {
+            if (file.EvidenceIds.Count > 6)
+                throw Invalid("An affected file exceeds the compact evidence-reference limit.");
             var path = Normalize(file.Path);
             if (!IsSafeRelativePath(path) || !affectedPaths.Add(path))
                 throw Invalid("The implementation plan contains an unsafe or duplicate affected path.");
@@ -61,6 +68,8 @@ public static class ImplementationPlanValidator
 
         foreach (var step in plan.Steps)
         {
+            if (step.AffectedPaths.Count > 6 || step.EvidenceIds.Count > 6)
+                throw Invalid($"Step {step.Order} exceeds the compact path or evidence-reference limit.");
             if (string.IsNullOrWhiteSpace(step.Description) || string.IsNullOrWhiteSpace(step.ExpectedResult))
                 throw Invalid("Every implementation step requires a description and expected result.");
             ValidateEvidenceIds(step.EvidenceIds, evidenceIds, $"step {step.Order}");

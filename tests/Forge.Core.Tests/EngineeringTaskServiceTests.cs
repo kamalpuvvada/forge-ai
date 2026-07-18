@@ -1,4 +1,5 @@
 using Forge.Core;
+using Forge.Infrastructure;
 
 namespace Forge.Core.Tests;
 
@@ -72,14 +73,53 @@ public sealed class EngineeringTaskServiceTests
         await repository.SaveAsync(task);
         var failed = new ModelCallRecord(Guid.NewGuid(), ModelCallStage.Planning, "OpenAI", "gpt-5.6-sol", "medium",
             now, now, false, null, 0, 0, 0, null, 0m, "provider_error");
+        var planningEngine = new FailingPlanningEngine(failed);
         var service = new EngineeringTaskService(repository, new ScriptedEngine(ClarificationEvaluation.Summarize("unused")),
-            TimeProvider.System, new FixedDiscovery(snapshot), null, new FailingPlanningEngine(failed), new RepositoryAnalysisLimits());
+            TimeProvider.System, new FixedDiscovery(snapshot), null, planningEngine, new RepositoryAnalysisLimits());
 
         await Assert.ThrowsAsync<PlanningProviderException>(() => service.CreatePlanAsync(task.Id));
         var persisted = await repository.GetAsync(task.Id);
 
         Assert.Equal(failed.Id, Assert.Single(persisted!.ModelCalls).Id);
         Assert.Equal(WorkflowStatus.Planning, persisted.Status);
+        Assert.Equal(1, planningEngine.CallCount);
+    }
+
+    [Fact]
+    public async Task User_retry_reuses_fresh_snapshot_and_evidence_without_reanalysis_or_automatic_retry()
+    {
+        var repository = new InMemoryRepository();
+        var now = DateTimeOffset.UtcNow;
+        var task = EngineeringTask.Create("C:/repo", "Add report export", now);
+        task.ApplyClarificationEvaluation(ClarificationEvaluation.Summarize("Add report export"), now);
+        task.ApproveRequirementSummary(now);
+        task.BeginRepositoryAnalysis(now);
+        var snapshot = PlanningWorkflowTests.Snapshot(now);
+        var evidence = PlanningWorkflowTests.Evidence();
+        task.StoreRepositorySnapshot(snapshot, now);
+        task.StoreEvidence(new EvidenceSelection([evidence], 1, 1, evidence.Excerpt.Length), now);
+        await repository.SaveAsync(task);
+        var failed = new ModelCallRecord(Guid.NewGuid(), ModelCallStage.Planning, "OpenAI", "gpt-5.6-sol", "medium",
+            now, now, false, "resp_truncated", 100, 0, 6000, 2000, 0.1805m, "output_truncated");
+        var discovery = new FixedDiscovery(snapshot);
+        var planningEngine = new RetryPlanningEngine(failed);
+        var service = new EngineeringTaskService(repository, new ScriptedEngine(ClarificationEvaluation.Summarize("unused")),
+            TimeProvider.System, discovery, null, planningEngine, new RepositoryAnalysisLimits());
+
+        await Assert.ThrowsAsync<PlanningProviderException>(() => service.CreatePlanAsync(task.Id));
+        Assert.Equal(1, planningEngine.CallCount);
+        var retried = await service.CreatePlanAsync(task.Id);
+
+        Assert.Equal(2, planningEngine.CallCount);
+        Assert.Equal(2, discovery.CallCount);
+        Assert.Equal(WorkflowStatus.AwaitingPlanApproval, retried.Status);
+        Assert.Equal(snapshot.Fingerprint, retried.RepositorySnapshot?.Fingerprint);
+        Assert.Equal(evidence.ContentHash, Assert.Single(retried.EvidenceItems).ContentHash);
+        Assert.All(planningEngine.Contexts, context =>
+        {
+            Assert.Equal(snapshot.Fingerprint, context.Snapshot.Fingerprint);
+            Assert.Equal(evidence.Id, Assert.Single(context.Evidence).Id);
+        });
     }
 
     private static EngineeringTaskService CreateService(IClarificationEngine engine) =>
@@ -110,15 +150,40 @@ public sealed class EngineeringTaskServiceTests
 
     private sealed class FixedDiscovery(RepositorySnapshot snapshot) : IRepositoryDiscoveryService
     {
-        public Task<RepositoryDiscoveryResult> DiscoverAsync(string repositoryPath, CancellationToken cancellationToken = default) =>
-            Task.FromResult(new RepositoryDiscoveryResult(snapshot, []));
+        public int CallCount { get; private set; }
+        public Task<RepositoryDiscoveryResult> DiscoverAsync(string repositoryPath, CancellationToken cancellationToken = default)
+        {
+            CallCount++;
+            return Task.FromResult(new RepositoryDiscoveryResult(snapshot, []));
+        }
     }
 
     private sealed class FailingPlanningEngine(ModelCallRecord failed) : IPlanningEngine
     {
-        public Task<PlanningEvaluation> CreatePlanAsync(PlanningContext context, CancellationToken cancellationToken = default) =>
-            Task.FromException<PlanningEvaluation>(new PlanningProviderException(
+        public int CallCount { get; private set; }
+        public Task<PlanningEvaluation> CreatePlanAsync(PlanningContext context, CancellationToken cancellationToken = default)
+        {
+            CallCount++;
+            return Task.FromException<PlanningEvaluation>(new PlanningProviderException(
                 "OpenAI could not complete the planning request.", "provider_error", failed, new Exception("secret")));
+        }
+    }
+
+    private sealed class RetryPlanningEngine(ModelCallRecord failed) : IPlanningEngine
+    {
+        public int CallCount { get; private set; }
+        public List<PlanningContext> Contexts { get; } = [];
+
+        public Task<PlanningEvaluation> CreatePlanAsync(PlanningContext context, CancellationToken cancellationToken = default)
+        {
+            CallCount++;
+            Contexts.Add(context);
+            if (CallCount == 1)
+                return Task.FromException<PlanningEvaluation>(new PlanningProviderException(
+                    "The planning response reached its output limit before the structured plan was complete.",
+                    "output_truncated", failed));
+            return new FakePlanningEngine().CreatePlanAsync(context, cancellationToken);
+        }
     }
 
     private sealed class InMemoryRepository : IEngineeringTaskRepository

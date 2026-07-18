@@ -48,7 +48,7 @@ public sealed class FakePlanningEngine : IPlanningEngine
                 new ImplementationStep(4, "Run the proposed validation commands and review the resulting diff.", allPaths, allEvidence, "Actual validation results and final scope are available for review.")
             ],
             validations,
-            risks,
+            risks.Take(4).ToArray(),
             [
                 "The approved requirement summary is the authoritative scope.",
                 "Evidence excerpts are bounded and may not represent the entire repository.",

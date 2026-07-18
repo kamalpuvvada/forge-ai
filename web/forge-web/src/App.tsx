@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import type { FormEvent } from 'react'
-import { forgeApi } from './api'
+import { ForgeApiError, forgeApi } from './api'
 import type { EngineeringTask, SystemCapabilities, WorkflowStatus } from './types'
 import './App.css'
 
@@ -18,6 +18,8 @@ function App() {
   const [capabilitiesUnavailable, setCapabilitiesUnavailable] = useState(false)
   const [busy, setBusy] = useState(false)
   const [planningProgress, setPlanningProgress] = useState<number | null>(null)
+  const [planningFailure, setPlanningFailure] = useState<string | null>(null)
+  const [planningSnapshotStale, setPlanningSnapshotStale] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const activeStage = task ? stageByStatus[task.status] : 0
   const answeredCount = task?.clarificationAnswers.length ?? 0
@@ -54,22 +56,47 @@ function App() {
   function approveSummary() { if (task) void run(() => forgeApi.approveRequirement(task.id)) }
   async function analyzeAndPlan() {
     if (!task) return
-    setBusy(true); setError(null); setPlanningProgress(0)
+    let repositoryAnalyzed = false
+    setBusy(true); setError(null); setPlanningFailure(null); setPlanningSnapshotStale(false); setPlanningProgress(0)
     try {
       const analyzed = await forgeApi.analyzeRepository(task.id)
-      setTask(analyzed); setPlanningProgress(2)
+      repositoryAnalyzed = true; setTask(analyzed); setPlanningProgress(2)
       const planned = await forgeApi.createPlan(task.id)
       setTask(planned); setPlanningProgress(3)
-    } catch (caught) { setError(caught instanceof Error ? caught.message : 'Repository analysis could not be completed.') }
+    } catch (caught) {
+      const message = caught instanceof Error ? caught.message : 'Planning could not be completed.'
+      if (repositoryAnalyzed) {
+        try { setTask(await forgeApi.getTask(task.id)) } catch { /* Keep the analyzed task if refresh fails. */ }
+        setPlanningSnapshotStale(caught instanceof ForgeApiError && caught.code === 'stale_snapshot')
+        setPlanningFailure(message)
+      }
+      else setError(message)
+    }
     finally { setBusy(false) }
   }
+  async function retryPlanGeneration() {
+    if (!task || task.status !== 'Planning') return
+    setBusy(true); setError(null); setPlanningFailure(null); setPlanningSnapshotStale(false); setPlanningProgress(2)
+    try {
+      const planned = await forgeApi.createPlan(task.id)
+      setTask(planned); setPlanningProgress(3)
+    } catch (caught) {
+      try { setTask(await forgeApi.getTask(task.id)) } catch { /* Keep the current task if refresh fails. */ }
+      setPlanningSnapshotStale(caught instanceof ForgeApiError && caught.code === 'stale_snapshot')
+      setPlanningFailure(caught instanceof Error ? caught.message : 'Planning could not be completed.')
+    } finally { setBusy(false) }
+  }
   function approvePlan() { if (task) void run(() => forgeApi.approvePlan(task.id)) }
-  function startAnother() { setTask(null); setRepository(''); setRequirement(''); setAnswer(''); setCorrection(''); setCorrectionMode(false); setError(null) }
+  function startAnother() { setTask(null); setRepository(''); setRequirement(''); setAnswer(''); setCorrection(''); setCorrectionMode(false); setPlanningFailure(null); setPlanningSnapshotStale(false); setError(null) }
 
   const telemetry = task?.telemetry ?? { totalCalls: 0, totalInputTokens: 0, totalCachedInputTokens: 0, totalOutputTokens: 0, totalEstimatedCostUsd: 0, calls: [] }
   const clarificationCalls = telemetry.calls.filter(call => call.stage === 'Clarification')
   const planningCalls = telemetry.calls.filter(call => call.stage === 'Planning')
   const planningCost = planningCalls.reduce((total, call) => total + call.estimatedCostUsd, 0)
+  const latestFailedPlanningCall = [...planningCalls].reverse().find(call => !call.succeeded)
+  const planningFailureMessage = planningFailure ?? (task?.status === 'Planning' && latestFailedPlanningCall
+    ? planningFailureForCategory(latestFailedPlanningCall.failureCategory)
+    : null)
   const providerLabel = capabilitiesUnavailable
     ? 'Provider status unavailable'
     : capabilities?.aiMode === 'Fake'
@@ -117,7 +144,8 @@ function App() {
               : <form className="correction-form" onSubmit={submitCorrection}><div><strong>Request a correction</strong><p>The current summary will be preserved in revision history and regenerated.</p></div><label><span>CORRECTION NOTE</span><textarea autoFocus value={correction} onChange={event => setCorrection(event.target.value)} placeholder="State only what should change…" rows={4} maxLength={5000} required /></label><div className="approval-actions"><button type="button" className="secondary-button" onClick={() => { setCorrectionMode(false); setCorrection('') }}>Cancel</button><button className="primary-button compact" disabled={busy || !correction.trim()}>{busy ? 'Regenerating…' : 'Submit correction'}</button></div></form>}
           </div>}
           {task?.status === 'ReadyForPlanning' && <div className="ready-view"><div className="success-seal">✓</div><p className="eyebrow">REQUIREMENT APPROVED</p><h2>Ready for evidence-backed planning</h2><p>Forge will inspect the repository read-only, select bounded evidence, and use the configured planning provider.</p><div className="coming-next"><span>04</span><div><strong>Read-only planning</strong><p>No files, Git state, packages, builds, or tests will be changed.</p></div><button className="primary-button compact" onClick={() => void analyzeAndPlan()} disabled={busy}>Analyze repository and create plan</button></div><button className="text-button" onClick={startAnother}>Start another task</button></div>}
-          {(task?.status === 'Planning' || planningProgress !== null && busy) && <div className="planning-progress"><div className="action-title"><span className="title-icon">04</span><div><h2>Creating an evidence-backed plan</h2><p>The target remains read-only throughout analysis.</p></div></div>{['Inspecting repository', 'Selecting evidence', 'Creating evidence-backed plan', 'Awaiting approval'].map((label, index) => <div className={`planning-progress-step ${index < (planningProgress ?? 0) ? 'complete' : index === (planningProgress ?? 0) ? 'active' : ''}`} key={label}><span>{index < (planningProgress ?? 0) ? '✓' : index + 1}</span><p>{label}</p></div>)}{!busy && <button className="secondary-button" onClick={() => void analyzeAndPlan()}>Re-analyze repository</button>}</div>}
+          {task?.status === 'Planning' && planningFailureMessage && !busy && <div className="planning-failure"><div className="failure-seal">!</div><p className="eyebrow">PLAN GENERATION FAILED</p><h2>{planningSnapshotStale ? 'The repository needs a fresh read-only analysis.' : 'The existing evidence is ready for another attempt.'}</h2><p>{planningFailureMessage}</p>{latestFailedPlanningCall && <div className="failed-call-summary"><strong>{latestFailedPlanningCall.model} · {latestFailedPlanningCall.failureCategory}</strong><span>{latestFailedPlanningCall.outputTokens.toLocaleString()} output tokens · estimated ${latestFailedPlanningCall.estimatedCostUsd.toFixed(6)}</span></div>}{planningSnapshotStale ? <button className="primary-button compact" onClick={() => void analyzeAndPlan()} disabled={busy}>Re-analyze repository and create plan <span>→</span></button> : <button className="primary-button compact" onClick={() => void retryPlanGeneration()} disabled={busy}>Retry plan generation <span>→</span></button>}<small>{planningSnapshotStale ? 'The changed repository invalidated the saved snapshot; analysis must be refreshed first.' : 'Retry uses this snapshot and selected evidence. Repository analysis is not repeated.'}</small></div>}
+          {((task?.status === 'Planning' && !planningFailureMessage) || planningProgress !== null && busy) && <div className="planning-progress"><div className="action-title"><span className="title-icon">04</span><div><h2>Creating an evidence-backed plan</h2><p>The target remains read-only throughout analysis.</p></div></div>{['Inspecting repository', 'Selecting evidence', 'Creating evidence-backed plan', 'Awaiting approval'].map((label, index) => <div className={`planning-progress-step ${index < (planningProgress ?? 0) ? 'complete' : index === (planningProgress ?? 0) ? 'active' : ''}`} key={label}><span>{index < (planningProgress ?? 0) ? '✓' : index + 1}</span><p>{label}</p></div>)}</div>}
           {task?.status === 'AwaitingPlanApproval' && task.implementationPlan && <div className="plan-view">
             <div className="action-title"><span className="title-icon">✓</span><div><h2>Review the evidence-backed plan</h2><p>Every existing file proposal is linked to selected repository evidence.</p></div></div>
             <span className="fake-label">{task.implementationPlan.source === 'OpenAI' ? `OpenAI plan · ${task.implementationPlan.planningModel}` : 'Deterministic Fake plan'} · NO CODE CHANGED</span>
@@ -147,4 +175,9 @@ function App() {
 
 function formatStatus(status: WorkflowStatus) { return status.replace(/([a-z])([A-Z])/g, '$1 $2') }
 function formatTokens(tokens: number) { return tokens.toLocaleString() }
+function planningFailureForCategory(category: string | null) {
+  if (category === 'output_truncated') return 'The planning response reached its output limit before the structured plan was complete.'
+  if (category === 'content_filter') return "The planning response was stopped by the provider's content filter."
+  return 'OpenAI did not return a valid completed planning response.'
+}
 export default App

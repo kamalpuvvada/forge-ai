@@ -89,3 +89,9 @@
 **Decision:** Explicit plan approval ends at `PlanApproved`; legacy `Implementing` rows from the plan-only slice migrate to that state.
 **Reason:** Workflow state must describe completed work truthfully, and approval alone does not authorize or imply repository mutation.
 **Trade-off:** The demo stops at a clear gate until a later implementation milestone is built.
+
+## 016 — Treat response completeness as a planning invariant
+
+**Decision:** Preserve the installed SDK's response status and incomplete reason, parse structured output only when completed, classify output-limit and content-filter incompleteness separately, and raise the planning allowance to 6,000 tokens while capping plan collections.
+**Reason:** A response cut off at its configured allowance is operational truncation, not an ordinary malformed semantic plan. Explicit classification preserves accurate usage/cost and provides a recoverable user-triggered retry without exposing partial output.
+**Trade-off:** The higher allowance can increase worst-case cost; compact prompts, reduced repository metadata, strict collection limits, and no automatic retry bound that risk.

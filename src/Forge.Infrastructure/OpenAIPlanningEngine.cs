@@ -22,6 +22,9 @@ public sealed class OpenAIPlanningEngine(
         Keep the plan narrowly appropriate for the approved requirement. Never emit absolute local paths.
         Return only the supplied strict JSON schema. Step order must start at 1 and increase by 1.
         Every step path must also appear in affectedFiles, and every existing path claim must cite evidence IDs.
+        Keep the output compact: at most 6 affected files, 6 steps, 6 validation commands, 4 risks,
+        4 assumptions, and 4 unresolved questions. Use concise, non-repetitive descriptions. Do not repeat
+        the requirement, quote evidence excerpts, or copy repository content. Refer to evidence only by ID.
         """;
 
     internal const string ResponseSchema = """
@@ -33,13 +36,14 @@ public sealed class OpenAIPlanningEngine(
             "repositoryUnderstanding": { "type": "string" },
             "affectedFiles": {
               "type": "array",
+              "maxItems": 6,
               "items": {
                 "type": "object",
                 "properties": {
                   "path": { "type": "string" },
                   "action": { "type": "string", "enum": ["modify", "create", "delete", "inspect"] },
                   "purpose": { "type": "string" },
-                  "evidenceIds": { "type": "array", "items": { "type": "string" } },
+                  "evidenceIds": { "type": "array", "maxItems": 6, "items": { "type": "string" } },
                   "confidence": { "type": "number", "minimum": 0, "maximum": 1 }
                 },
                 "required": ["path", "action", "purpose", "evidenceIds", "confidence"],
@@ -48,23 +52,24 @@ public sealed class OpenAIPlanningEngine(
             },
             "orderedSteps": {
               "type": "array",
+              "maxItems": 6,
               "items": {
                 "type": "object",
                 "properties": {
                   "order": { "type": "integer" },
                   "description": { "type": "string" },
-                  "affectedPaths": { "type": "array", "items": { "type": "string" } },
-                  "evidenceIds": { "type": "array", "items": { "type": "string" } },
+                  "affectedPaths": { "type": "array", "maxItems": 6, "items": { "type": "string" } },
+                  "evidenceIds": { "type": "array", "maxItems": 6, "items": { "type": "string" } },
                   "expectedResult": { "type": "string" }
                 },
                 "required": ["order", "description", "affectedPaths", "evidenceIds", "expectedResult"],
                 "additionalProperties": false
               }
             },
-            "proposedValidationCommands": { "type": "array", "items": { "type": "string" } },
-            "risks": { "type": "array", "items": { "type": "string" } },
-            "assumptions": { "type": "array", "items": { "type": "string" } },
-            "unresolvedQuestions": { "type": "array", "items": { "type": "string" } },
+            "proposedValidationCommands": { "type": "array", "maxItems": 6, "items": { "type": "string" } },
+            "risks": { "type": "array", "maxItems": 4, "items": { "type": "string" } },
+            "assumptions": { "type": "array", "maxItems": 4, "items": { "type": "string" } },
+            "unresolvedQuestions": { "type": "array", "maxItems": 4, "items": { "type": "string" } },
             "summary": { "type": "string" }
           },
           "required": ["title", "objective", "repositoryUnderstanding", "affectedFiles", "orderedSteps", "proposedValidationCommands", "risks", "assumptions", "unresolvedQuestions", "summary"],
@@ -104,6 +109,9 @@ public sealed class OpenAIPlanningEngine(
                 "forge_implementation_plan",
                 "An evidence-backed implementation plan."), cancellationToken);
 
+            if (response.Status != OpenAIResponseStatus.Completed)
+                throw CreateCompletionFailure(response, callId, startedAt);
+
             var completedAt = timeProvider.GetUtcNow();
             var call = new ModelCallRecord(
                 callId, ModelCallStage.Planning, "OpenAI", options.PlanningModel,
@@ -136,6 +144,32 @@ public sealed class OpenAIPlanningEngine(
                 category);
             throw new PlanningProviderException(safeMessage, category, failed, exception);
         }
+    }
+
+    private PlanningProviderException CreateCompletionFailure(
+        OpenAIResponseEnvelope response,
+        Guid callId,
+        DateTimeOffset startedAt)
+    {
+        var (category, safeMessage) = response.Status == OpenAIResponseStatus.Incomplete
+            ? response.IncompleteReason switch
+            {
+                OpenAIResponseIncompleteReason.MaxOutputTokens => (
+                    "output_truncated",
+                    "The planning response reached its output limit before the structured plan was complete."),
+                OpenAIResponseIncompleteReason.ContentFilter => (
+                    "content_filter",
+                    "The planning response was stopped by the provider's content filter."),
+                _ => ("incomplete_response", "The planning response was incomplete.")
+            }
+            : ("provider_response_incomplete", "OpenAI did not return a completed planning response.");
+        var failed = new ModelCallRecord(
+            callId, ModelCallStage.Planning, "OpenAI", options.PlanningModel,
+            options.PlanningReasoningEffort, startedAt, timeProvider.GetUtcNow(), false, response.ResponseId,
+            response.InputTokens, response.CachedInputTokens, response.OutputTokens, response.ReasoningTokens,
+            costCalculator.Calculate(options.PlanningModel, response.InputTokens, response.CachedInputTokens, response.OutputTokens),
+            category);
+        return new PlanningProviderException(safeMessage, category, failed);
     }
 
     internal static ImplementationPlan ParsePlan(string json, PlanningContext context, string model)
@@ -194,26 +228,16 @@ public sealed class OpenAIPlanningEngine(
             revisionNotes = context.RevisionNotes.Select(note => Safe(note.Correction, snapshot.NormalizedRoot)),
             repositorySnapshot = new
             {
-                snapshot.IsGitRepository,
-                snapshot.Branch,
-                snapshot.ShortHeadSha,
-                snapshot.WorkingTreeStatus,
                 snapshot.TotalDiscoveredFiles,
                 snapshot.EligibleTextFileCount,
                 snapshot.ExcludedFileCount,
                 snapshot.DetectedLanguages,
                 snapshot.DetectedExtensions,
-                snapshot.ProjectFiles,
-                snapshot.TestLocations,
-                snapshot.Warnings,
-                files = snapshot.Files.Select(file => new
-                {
-                    file.RelativePath,
-                    file.ProbableRole,
-                    file.IsTest,
-                    file.Association,
-                    file.DeclaredSymbols
-                })
+                projectFiles = snapshot.ProjectFiles.Select(path => Safe(path, snapshot.NormalizedRoot)),
+                testLocations = snapshot.TestLocations.Select(path => Safe(path, snapshot.NormalizedRoot)),
+                warnings = snapshot.Warnings.Select(warning => Safe(warning, snapshot.NormalizedRoot)),
+                selectedEvidencePaths = context.Evidence.Select(item => item.RelativePath)
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
             },
             evidence = context.Evidence.Select(item => new
             {

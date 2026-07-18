@@ -73,7 +73,7 @@ $env:Forge__AI__Mode = 'OpenAI'
 dotnet run --project .\src\Forge.Api --launch-profile http
 ```
 
-The clarification model is `gpt-5.6-terra` with `low` reasoning and an 800-token output limit. The planning model is `gpt-5.6-sol` with `medium` reasoning and a 2,400-token output limit. OpenAI planning sends only approved requirement context, compact repository metadata, and bounded redacted evidence; it excludes the absolute repository root and unrestricted file contents. Clear the current shell values when finished:
+The clarification model is `gpt-5.6-terra` with `low` reasoning and an 800-token output limit. The planning model is `gpt-5.6-sol` with `medium` reasoning and a 6,000-token output allowance, which includes visible output and reasoning tokens. OpenAI planning sends only approved requirement context, repository totals/stack/project/test metadata, and bounded redacted evidence; it excludes the absolute root, unrestricted file contents, and the complete repository file list. Clear the current shell values when finished:
 
 ```powershell
 Remove-Item Env:OPENAI_API_KEY -ErrorAction SilentlyContinue
@@ -92,6 +92,8 @@ This implementation task did **not** make a live or billable OpenAI request.
 - Planning sends the original and approved requirements once, answers, correction notes, compact snapshot metadata, and selected excerpts. Absolute roots, full files, raw responses, secrets, and hidden reasoning are excluded. `previous_response_id` is not used.
 - Fake mode records no model usage.
 - OpenAI mode never falls back to Fake mode. Configuration, authentication, timeout, rate-limit, malformed-output, and provider failures return safe Problem Details.
+- Incomplete Responses are classified before JSON parsing. Output-limit truncation and content-filter incompleteness retain usage/cost under distinct safe categories; partial output is never persisted or returned.
+- A failed plan remains recoverable with the same fresh snapshot and evidence. `Retry plan generation` makes one new planning request and does not repeat repository analysis; a stale snapshot instead requires an explicitly labelled re-analysis.
 - API keys, authorization headers, complete raw responses, hidden reasoning, and user-input secrets are not stored in model-call records.
 
 ## Token and estimated-cost telemetry

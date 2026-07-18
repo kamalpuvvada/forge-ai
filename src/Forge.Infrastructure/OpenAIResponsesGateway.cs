@@ -19,7 +19,27 @@ public sealed record OpenAIResponseEnvelope(
     int InputTokens,
     int CachedInputTokens,
     int OutputTokens,
-    int? ReasoningTokens);
+    int? ReasoningTokens,
+    OpenAIResponseStatus Status = OpenAIResponseStatus.Completed,
+    OpenAIResponseIncompleteReason? IncompleteReason = null);
+
+public enum OpenAIResponseStatus
+{
+    Unknown,
+    Queued,
+    InProgress,
+    Completed,
+    Incomplete,
+    Failed,
+    Cancelled
+}
+
+public enum OpenAIResponseIncompleteReason
+{
+    Unknown,
+    MaxOutputTokens,
+    ContentFilter
+}
 
 public interface IOpenAIResponsesGateway
 {
@@ -73,7 +93,9 @@ public sealed class SdkOpenAIResponsesGateway(string apiKey) : IOpenAIResponsesG
                 usage?.InputTokenCount ?? 0,
                 usage?.InputTokenDetails?.CachedTokenCount ?? 0,
                 usage?.OutputTokenCount ?? 0,
-                usage?.OutputTokenDetails?.ReasoningTokenCount);
+                usage?.OutputTokenDetails?.ReasoningTokenCount,
+                NormalizeStatus(result.Status),
+                NormalizeIncompleteReason(result.IncompleteStatusDetails?.Reason));
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
@@ -91,6 +113,26 @@ public sealed class SdkOpenAIResponsesGateway(string apiKey) : IOpenAIResponsesG
             };
             throw new OpenAITransportException(category, SafeMessage(category), exception);
         }
+    }
+
+    internal static OpenAIResponseStatus NormalizeStatus(ResponseStatus? status)
+    {
+        if (status is null) return OpenAIResponseStatus.Unknown;
+        if (status == ResponseStatus.Queued) return OpenAIResponseStatus.Queued;
+        if (status == ResponseStatus.InProgress) return OpenAIResponseStatus.InProgress;
+        if (status == ResponseStatus.Completed) return OpenAIResponseStatus.Completed;
+        if (status == ResponseStatus.Incomplete) return OpenAIResponseStatus.Incomplete;
+        if (status == ResponseStatus.Failed) return OpenAIResponseStatus.Failed;
+        if (status == ResponseStatus.Cancelled) return OpenAIResponseStatus.Cancelled;
+        return OpenAIResponseStatus.Unknown;
+    }
+
+    internal static OpenAIResponseIncompleteReason? NormalizeIncompleteReason(ResponseIncompleteStatusReason? reason)
+    {
+        if (reason is null) return null;
+        if (reason == ResponseIncompleteStatusReason.MaxOutputTokens) return OpenAIResponseIncompleteReason.MaxOutputTokens;
+        if (reason == ResponseIncompleteStatusReason.ContentFilter) return OpenAIResponseIncompleteReason.ContentFilter;
+        return OpenAIResponseIncompleteReason.Unknown;
     }
 
     private static string SafeMessage(string category) => category switch
