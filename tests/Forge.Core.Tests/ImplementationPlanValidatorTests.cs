@@ -142,6 +142,96 @@ public sealed class ImplementationPlanValidatorTests
     }
 
     [Theory]
+    [InlineData(7)]
+    [InlineData(10)]
+    public void Seven_through_ten_affected_files_are_accepted(int fileCount)
+    {
+        var plan = ValidPlan();
+        var files = plan.AffectedFiles.Concat(Enumerable.Range(2, fileCount - 1).Select(index =>
+            new PlannedFileChange($"src/New{index}.cs", PlannedFileAction.Create, $"Add component {index}.", [], 0.7m))).ToArray();
+        var firstPaths = files.Take(6).Select(file => file.Path).ToArray();
+        var remainingPaths = files.Skip(6).Select(file => file.Path).ToArray();
+        var steps = new List<ImplementationStep>
+        {
+            plan.Steps[0] with { AffectedPaths = firstPaths }
+        };
+        if (remainingPaths.Length > 0)
+            steps.Add(new ImplementationStep(2, "Add the remaining components.", remainingPaths, [], "The remaining components are represented."));
+
+        Validate(plan with
+        {
+            AffectedFiles = files,
+            Steps = steps,
+            RequirementCoverage = [new RequirementCoverageItem(
+                "Implement the bounded cross-layer change.", files.Select(file => file.Path).ToArray(), steps.Select(step => step.Order).ToArray())]
+        });
+    }
+
+    [Fact]
+    public void More_than_ten_affected_files_are_rejected()
+    {
+        var plan = ValidPlan();
+        var files = plan.AffectedFiles.Concat(Enumerable.Range(2, 10).Select(index =>
+            new PlannedFileChange($"src/New{index}.cs", PlannedFileAction.Create, $"Add component {index}.", [], 0.7m))).ToArray();
+
+        var exception = Assert.Throws<PlanningException>(() => Validate(plan with { AffectedFiles = files }));
+
+        Assert.Equal("The implementation plan exceeds the compact collection limits.", exception.Message);
+    }
+
+    [Fact]
+    public void Eight_steps_and_validation_commands_are_accepted()
+    {
+        var plan = ValidPlan();
+        var steps = Enumerable.Range(1, 8).Select(order => plan.Steps[0] with
+        {
+            Order = order,
+            Description = $"Implement bounded change {order}."
+        }).ToArray();
+
+        Validate(plan with
+        {
+            Steps = steps,
+            ProposedValidationCommands = Enumerable.Range(1, 8).Select(index => $"validate {index}").ToArray(),
+            RequirementCoverage = [new RequirementCoverageItem("Implement and validate the change.", ["src/App.cs"], steps.Select(step => step.Order).ToArray())]
+        });
+    }
+
+    [Fact]
+    public void Requirement_coverage_rejects_undeclared_paths_and_unknown_step_orders()
+    {
+        var plan = ValidPlan();
+
+        var pathError = Assert.Throws<PlanningException>(() => Validate(plan with
+        {
+            RequirementCoverage = [new RequirementCoverageItem("Cover export.", ["src/Missing.cs"], [1])]
+        }));
+        var orderError = Assert.Throws<PlanningException>(() => Validate(plan with
+        {
+            RequirementCoverage = [new RequirementCoverageItem("Cover export.", ["src/App.cs"], [2])]
+        }));
+
+        Assert.Contains("undeclared", pathError.Message, StringComparison.Ordinal);
+        Assert.Contains("unknown", orderError.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Requirement_coverage_accepts_twelve_items_and_rejects_thirteen()
+    {
+        var plan = ValidPlan();
+        var twelve = Enumerable.Range(1, 12).Select(index =>
+            new RequirementCoverageItem($"Cover approved outcome {index}.", ["src/App.cs"], [1])).ToArray();
+
+        Validate(plan with { RequirementCoverage = twelve });
+        var exception = Assert.Throws<PlanningException>(() => Validate(plan with
+        {
+            RequirementCoverage = twelve.Append(new RequirementCoverageItem("Outcome 13.", ["src/App.cs"], [1])).ToArray()
+        }));
+
+        Assert.Equal("The implementation plan requires bounded requirement coverage.", exception.Message);
+    }
+
+    [Theory]
     [InlineData("summary", "The implementation-plan summary exceeds its allowed length.")]
     [InlineData("objective", "The implementation-plan objective exceeds its allowed length.")]
     [InlineData("repository-understanding", "The implementation-plan repository understanding exceeds its allowed length.")]
@@ -156,6 +246,8 @@ public sealed class ImplementationPlanValidatorTests
     [InlineData("file-path", "Affected file 1 contains an overlong path.")]
     [InlineData("step-path", "Implementation step 1 contains an overlong affected path.")]
     [InlineData("evidence-id", "The implementation plan contains an overlong evidence ID.")]
+    [InlineData("coverage-requirement", "Requirement coverage item 1 contains an overlong requirement.")]
+    [InlineData("coverage-path", "Requirement coverage item 1 contains an overlong affected path.")]
     public void Each_field_limit_is_enforced_with_a_safe_specific_error(string field, string expectedMessage)
     {
         var exception = Assert.Throws<PlanningException>(() => Validate(WithOverlongField(ValidPlan(), field)));
@@ -178,6 +270,7 @@ public sealed class ImplementationPlanValidatorTests
     [InlineData("unresolved-question")]
     [InlineData("file-path")]
     [InlineData("evidence-id")]
+    [InlineData("coverage-requirement")]
     public void Required_text_values_reject_whitespace_only_content(string field)
     {
         Assert.Throws<PlanningException>(() => Validate(WithWhitespaceField(ValidPlan(), field)));
@@ -220,6 +313,14 @@ public sealed class ImplementationPlanValidatorTests
         {
             AffectedFiles = [plan.AffectedFiles[0] with { EvidenceIds = [Text(ImplementationPlanValidator.EvidenceIdMaxLength + 1)] }]
         },
+        "coverage-requirement" => plan with
+        {
+            RequirementCoverage = [plan.RequirementCoverage[0] with { Requirement = Text(ImplementationPlanValidator.RequirementCoverageMaxLength + 1) }]
+        },
+        "coverage-path" => plan with
+        {
+            RequirementCoverage = [plan.RequirementCoverage[0] with { AffectedPaths = [Text(ImplementationPlanValidator.FilePathMaxLength + 1)] }]
+        },
         _ => throw new ArgumentOutOfRangeException(nameof(field))
     };
 
@@ -238,6 +339,7 @@ public sealed class ImplementationPlanValidatorTests
         "unresolved-question" => plan with { UnresolvedQuestions = [" "] },
         "file-path" => plan with { AffectedFiles = [plan.AffectedFiles[0] with { Path = " " }] },
         "evidence-id" => plan with { AffectedFiles = [plan.AffectedFiles[0] with { EvidenceIds = [" "] }] },
+        "coverage-requirement" => plan with { RequirementCoverage = [plan.RequirementCoverage[0] with { Requirement = " " }] },
         _ => throw new ArgumentOutOfRangeException(nameof(field))
     };
 
@@ -256,6 +358,7 @@ public sealed class ImplementationPlanValidatorTests
         ["Output size may need a bound."],
         ["The existing API shape remains stable."],
         [],
+        [new RequirementCoverageItem("Provide bounded export behavior.", ["src/App.cs"], [1])],
         "A focused implementation plan.",
         PlanningSource.OpenAI,
         "gpt-5.6-sol",

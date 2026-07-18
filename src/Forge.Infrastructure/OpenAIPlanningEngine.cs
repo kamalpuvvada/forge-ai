@@ -25,7 +25,7 @@ public sealed class OpenAIPlanningEngine(
         Keep the plan narrowly appropriate for the approved requirement. Never emit absolute local paths.
         Return only the supplied strict JSON schema. Step order must start at 1 and increase by 1.
         Every step path must also appear in affectedFiles, and every existing path claim must cite evidence IDs.
-        Keep the output compact: at most 6 affected files, 6 steps, 6 validation commands, 4 risks,
+        Keep the output compact: at most 10 affected files, 8 steps, 8 validation commands, 4 risks,
         4 assumptions, and 4 unresolved questions. Use concise, non-repetitive descriptions. Do not repeat
         the full approved requirement, quote evidence excerpts, or copy repository content. Objective,
         repository understanding, and summary should each normally be one concise paragraph. Keep
@@ -33,6 +33,20 @@ public sealed class OpenAIPlanningEngine(
         When a plan correction is supplied, directly address it, preserve valid portions of the previous plan,
         and add missing domain or persistence work when supported by refreshed evidence. State when evidence
         remains insufficient, and do not merely reword the previous plan.
+        When the approved requirement explicitly requires backend tests, identify an existing or proposed backend
+        test file in affectedFiles and a concrete implementation step that changes it. Apply the same rule for
+        explicitly required frontend tests. Validation commands such as dotnet test, lint, or build describe test
+        execution and do not count as planning test implementation. Existing test files must cite evidence from
+        that path; proposed test files must use create.
+        For a generated artifact such as PDF, CSV, or document export, identify the concrete service or component
+        that generates it, its API endpoint or controller integration, and any required project or package change.
+        If no new dependency is needed, explain the implementation approach in the affected-file purpose or step.
+        Do not defer the core generator to later analysis, and do not treat a controller as the generator unless
+        repository evidence shows that controllers own such logic by design.
+        Follow evidence-backed architectural boundaries, including frontend API helpers, service/application layers,
+        dependency registration, project or package files, and test projects. Do not put page-level networking in a
+        component when evidence identifies an API helper. Add compact requirementCoverage entries for material
+        approved outcomes, required tests, and error handling; each entry must reference declared paths and steps.
         """;
 
     internal const string ResponseSchema = """
@@ -44,7 +58,7 @@ public sealed class OpenAIPlanningEngine(
             "repositoryUnderstanding": { "type": "string" },
             "affectedFiles": {
               "type": "array",
-              "maxItems": 6,
+              "maxItems": 10,
               "items": {
                 "type": "object",
                 "properties": {
@@ -60,7 +74,7 @@ public sealed class OpenAIPlanningEngine(
             },
             "orderedSteps": {
               "type": "array",
-              "maxItems": 6,
+              "maxItems": 8,
               "items": {
                 "type": "object",
                 "properties": {
@@ -74,13 +88,27 @@ public sealed class OpenAIPlanningEngine(
                 "additionalProperties": false
               }
             },
-            "proposedValidationCommands": { "type": "array", "maxItems": 6, "items": { "type": "string" } },
+            "proposedValidationCommands": { "type": "array", "maxItems": 8, "items": { "type": "string" } },
             "risks": { "type": "array", "maxItems": 4, "items": { "type": "string" } },
             "assumptions": { "type": "array", "maxItems": 4, "items": { "type": "string" } },
             "unresolvedQuestions": { "type": "array", "maxItems": 4, "items": { "type": "string" } },
+            "requirementCoverage": {
+              "type": "array",
+              "maxItems": 12,
+              "items": {
+                "type": "object",
+                "properties": {
+                  "requirement": { "type": "string" },
+                  "affectedPaths": { "type": "array", "maxItems": 10, "items": { "type": "string" } },
+                  "stepOrders": { "type": "array", "maxItems": 8, "items": { "type": "integer" } }
+                },
+                "required": ["requirement", "affectedPaths", "stepOrders"],
+                "additionalProperties": false
+              }
+            },
             "summary": { "type": "string" }
           },
-          "required": ["title", "objective", "repositoryUnderstanding", "affectedFiles", "orderedSteps", "proposedValidationCommands", "risks", "assumptions", "unresolvedQuestions", "summary"],
+          "required": ["title", "objective", "repositoryUnderstanding", "affectedFiles", "orderedSteps", "proposedValidationCommands", "risks", "assumptions", "unresolvedQuestions", "requirementCoverage", "summary"],
           "additionalProperties": false
         }
         """;
@@ -192,7 +220,7 @@ public sealed class OpenAIPlanningEngine(
         catch (JsonException exception) { throw new PlanningException("invalid_plan", "Structured planning output was malformed.", exception); }
         if (parsed is null || parsed.AffectedFiles is null || parsed.OrderedSteps is null ||
             parsed.ProposedValidationCommands is null || parsed.Risks is null || parsed.Assumptions is null ||
-            parsed.UnresolvedQuestions is null)
+            parsed.UnresolvedQuestions is null || parsed.RequirementCoverage is null)
             throw new PlanningException("invalid_plan", "Structured planning output omitted required fields.");
 
         var affected = parsed.AffectedFiles.Select(file => new PlannedFileChange(
@@ -207,6 +235,10 @@ public sealed class OpenAIPlanningEngine(
             step.AffectedPaths ?? [],
             step.EvidenceIds ?? [],
             step.ExpectedResult ?? string.Empty)).ToArray();
+        var coverage = parsed.RequirementCoverage.Select(item => new RequirementCoverageItem(
+            item.Requirement ?? string.Empty,
+            item.AffectedPaths ?? [],
+            item.StepOrders ?? [])).ToArray();
         var plan = new ImplementationPlan(
             parsed.Title ?? string.Empty,
             parsed.Objective ?? string.Empty,
@@ -217,6 +249,7 @@ public sealed class OpenAIPlanningEngine(
             parsed.Risks,
             parsed.Assumptions,
             parsed.UnresolvedQuestions,
+            coverage,
             parsed.Summary ?? string.Empty,
             PlanningSource.OpenAI,
             model,
@@ -301,6 +334,7 @@ public sealed class OpenAIPlanningEngine(
         string[]? Risks,
         string[]? Assumptions,
         string[]? UnresolvedQuestions,
+        StructuredRequirementCoverage[]? RequirementCoverage,
         string? Summary);
 
     private sealed record StructuredAffectedFile(
@@ -316,4 +350,9 @@ public sealed class OpenAIPlanningEngine(
         string[]? AffectedPaths,
         string[]? EvidenceIds,
         string? ExpectedResult);
+
+    private sealed record StructuredRequirementCoverage(
+        string? Requirement,
+        string[]? AffectedPaths,
+        int[]? StepOrders);
 }

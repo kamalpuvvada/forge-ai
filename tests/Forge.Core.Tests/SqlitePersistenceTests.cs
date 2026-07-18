@@ -101,6 +101,9 @@ public sealed class SqlitePersistenceTests : IDisposable
         Assert.True(loaded.ImplementationPlan?.IsDeterministicFake);
         Assert.Equal(PlanningSource.DeterministicFake, loaded.ImplementationPlan?.Source);
         Assert.Null(loaded.ImplementationPlan?.PlanningModel);
+        var coverage = Assert.Single(loaded.ImplementationPlan!.RequirementCoverage);
+        Assert.Contains("src/App.cs", coverage.AffectedPaths);
+        Assert.Contains(1, coverage.StepOrders);
         Assert.Equal(now.AddMinutes(1), loaded.PlanApprovedAt);
         Assert.Equal(WorkflowStatus.PlanApproved, loaded.Status);
     }
@@ -176,6 +179,7 @@ public sealed class SqlitePersistenceTests : IDisposable
         Assert.Equal(WorkflowStatus.PlanApproved, loaded.Status);
         Assert.Equal(PlanningSource.DeterministicFake, loaded.ImplementationPlan?.Source);
         Assert.Equal(1, Assert.Single(loaded.ImplementationPlan!.Steps).Order);
+        Assert.Single(loaded.ImplementationPlan.RequirementCoverage);
     }
 
     public void Dispose()

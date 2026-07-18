@@ -59,10 +59,14 @@ public sealed record ImplementationStepResponse(
     int Order, string Description, IReadOnlyList<string> AffectedPaths,
     IReadOnlyList<string> EvidenceIds, string ExpectedResult);
 
+public sealed record RequirementCoverageResponse(
+    string Requirement, IReadOnlyList<string> AffectedPaths, IReadOnlyList<int> StepOrders);
+
 public sealed record ImplementationPlanResponse(
     string Title, string Objective, string RepositoryUnderstanding, IReadOnlyList<PlannedFileResponse> AffectedFiles,
     IReadOnlyList<ImplementationStepResponse> OrderedSteps, IReadOnlyList<string> ProposedValidationCommands,
     IReadOnlyList<string> Risks, IReadOnlyList<string> Assumptions, IReadOnlyList<string> UnresolvedQuestions,
+    IReadOnlyList<RequirementCoverageResponse> RequirementCoverage,
     string Summary, PlanningSource Source, string? PlanningModel, bool IsDeterministicFake,
     DateTimeOffset CreatedAt, string RepositoryFingerprint);
 
@@ -139,6 +143,8 @@ public sealed record EngineeringTaskResponse(
             task.ImplementationPlan.Risks,
             task.ImplementationPlan.Assumptions,
             task.ImplementationPlan.UnresolvedQuestions,
+            task.ImplementationPlan.RequirementCoverage.Select(item => new RequirementCoverageResponse(
+                item.Requirement, item.AffectedPaths, item.StepOrders)).ToArray(),
             task.ImplementationPlan.Summary,
             task.ImplementationPlan.Source,
             task.ImplementationPlan.PlanningModel,

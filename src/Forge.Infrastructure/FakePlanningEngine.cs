@@ -12,7 +12,7 @@ public sealed class FakePlanningEngine : IPlanningEngine
         cancellationToken.ThrowIfCancellationRequested();
         ArgumentNullException.ThrowIfNull(context);
         var evidenceByPath = context.Evidence.GroupBy(item => item.RelativePath, StringComparer.OrdinalIgnoreCase)
-            .Take(6)
+            .Take(ImplementationPlanValidator.MaximumAffectedFiles)
             .ToArray();
         var affected = evidenceByPath.Select(group => new PlannedFileChange(
             group.Key,
@@ -35,7 +35,21 @@ public sealed class FakePlanningEngine : IPlanningEngine
         if (limited) risks.Add("Selected evidence was insufficient to identify high-confidence change locations.");
 
         var allPaths = affected.Select(file => file.Path).ToArray();
-        var allEvidence = affected.SelectMany(file => file.EvidenceIds).Distinct().ToArray();
+        var primaryPaths = allPaths.Take(6).ToArray();
+        var remainingPaths = allPaths.Skip(6).Take(6).ToArray();
+        if (remainingPaths.Length == 0) remainingPaths = primaryPaths;
+        var testPaths = affected.Where(file => context.Snapshot.Files.Any(metadata =>
+                metadata.IsTest && string.Equals(metadata.RelativePath, file.Path, StringComparison.OrdinalIgnoreCase)))
+            .Select(file => file.Path).Take(6).ToArray();
+        if (testPaths.Length == 0) testPaths = primaryPaths;
+        string[] EvidenceFor(IReadOnlyList<string> paths) => affected
+            .Where(file => paths.Contains(file.Path, StringComparer.OrdinalIgnoreCase))
+            .Select(file => file.EvidenceIds.FirstOrDefault())
+            .Where(id => id is not null)
+            .Select(id => id!)
+            .Distinct(StringComparer.Ordinal)
+            .Take(6)
+            .ToArray();
         var isRevision = context.LatestPlanRevision is not null;
         var plan = new ImplementationPlan(
             isRevision ? "Deterministic Fake revised plan" : "Deterministic Fake plan — approved requirement",
@@ -47,10 +61,10 @@ public sealed class FakePlanningEngine : IPlanningEngine
             [
                 new ImplementationStep(1, isRevision
                     ? "Review the focused plan correction, previous affected paths, and refreshed evidence before editing."
-                    : "Review the approved requirement and cited evidence before editing.", allPaths, allEvidence, "The implementation scope and evidence-backed file set are confirmed."),
-                new ImplementationStep(2, limited ? "Resolve the evidence gap before choosing concrete edits." : "Implement only the approved behavior in the evidence-backed affected files.", allPaths, allEvidence, "The approved behavior is represented by a focused change set."),
-                new ImplementationStep(3, "Add or update focused tests for the approved acceptance criteria.", allPaths, allEvidence, "Focused automated coverage describes the expected behavior."),
-                new ImplementationStep(4, "Run the proposed validation commands and review the resulting diff.", allPaths, allEvidence, "Actual validation results and final scope are available for review.")
+                    : "Review the approved requirement and cited evidence before editing.", primaryPaths, EvidenceFor(primaryPaths), "The implementation scope and evidence-backed file set are confirmed."),
+                new ImplementationStep(2, limited ? "Resolve the evidence gap before choosing concrete edits." : "Implement only the approved behavior in the remaining evidence-backed affected files.", remainingPaths, EvidenceFor(remainingPaths), "The approved behavior is represented by a focused change set."),
+                new ImplementationStep(3, "Add or update focused tests for the approved acceptance criteria.", testPaths, EvidenceFor(testPaths), "Focused automated coverage describes the expected behavior."),
+                new ImplementationStep(4, "Run the proposed validation commands and review the resulting diff.", primaryPaths, EvidenceFor(primaryPaths), "Actual validation results and final scope are available for review.")
             ],
             validations,
             risks.Take(4).ToArray(),
@@ -60,6 +74,10 @@ public sealed class FakePlanningEngine : IPlanningEngine
                 "No implementation, validation, or review has occurred in this slice."
             ],
             limited ? ["Which concrete file should own the behavior after the evidence gap is resolved?"] : [],
+            [new RequirementCoverageItem(
+                "Implement the approved behavior with focused automated coverage and proposed validation.",
+                allPaths,
+                [1, 2, 3, 4])],
             limited
                 ? "Deterministic Fake-mode plan created with limited evidence; confirm locations before implementation."
                 : isRevision
@@ -82,7 +100,7 @@ public sealed class FakePlanningEngine : IPlanningEngine
             validations.Add($"dotnet build {Quote(solution)} --configuration Release");
             validations.Add($"dotnet test {Quote(solution)} --configuration Release");
         }
-        foreach (var package in snapshot.ProjectFiles.Where(path => Path.GetFileName(path).Equals("package.json", StringComparison.OrdinalIgnoreCase)).Take(2))
+        foreach (var package in snapshot.ProjectFiles.Where(path => Path.GetFileName(path).Equals("package.json", StringComparison.OrdinalIgnoreCase)).Take(3))
         {
             var directory = Path.GetDirectoryName(package)?.Replace('\\', '/');
             var prefix = string.IsNullOrWhiteSpace(directory) ? string.Empty : $"cd {Quote(directory)} && ";

@@ -28,6 +28,11 @@ public sealed record ImplementationStep(
     IReadOnlyList<string> EvidenceIds,
     string ExpectedResult);
 
+public sealed record RequirementCoverageItem(
+    string Requirement,
+    IReadOnlyList<string> AffectedPaths,
+    IReadOnlyList<int> StepOrders);
+
 public sealed record ImplementationPlan(
     string Title,
     string Objective,
@@ -38,6 +43,7 @@ public sealed record ImplementationPlan(
     IReadOnlyList<string> Risks,
     IReadOnlyList<string> Assumptions,
     IReadOnlyList<string> UnresolvedQuestions,
+    IReadOnlyList<RequirementCoverageItem> RequirementCoverage,
     string Summary,
     PlanningSource Source,
     string? PlanningModel,

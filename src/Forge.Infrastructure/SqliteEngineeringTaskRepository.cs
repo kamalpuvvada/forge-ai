@@ -149,7 +149,10 @@ public sealed class SqliteEngineeringTaskRepository(string connectionString) : I
         using var document = JsonDocument.Parse(value);
         var root = document.RootElement;
         if (root.TryGetProperty("source", out _))
-            return JsonSerializer.Deserialize<ImplementationPlan>(value, JsonOptions);
+        {
+            var plan = JsonSerializer.Deserialize<ImplementationPlan>(value, JsonOptions);
+            return plan is null ? null : plan with { RequirementCoverage = plan.RequirementCoverage ?? [] };
+        }
 
         var affectedFiles = root.GetProperty("affectedFiles").Deserialize<List<PlannedFileChange>>(JsonOptions) ?? [];
         var evidenceIds = affectedFiles.SelectMany(file => file.EvidenceIds).Distinct(StringComparer.Ordinal).ToArray();
@@ -169,6 +172,10 @@ public sealed class SqliteEngineeringTaskRepository(string connectionString) : I
             root.GetProperty("risks").Deserialize<List<string>>(JsonOptions) ?? [],
             root.GetProperty("assumptions").Deserialize<List<string>>(JsonOptions) ?? [],
             [],
+            [new RequirementCoverageItem(
+                "Implement the migrated plan scope.",
+                affectedPaths,
+                steps.Select(step => step.Order).ToArray())],
             root.GetProperty("summary").GetString() ?? string.Empty,
             PlanningSource.DeterministicFake,
             null,

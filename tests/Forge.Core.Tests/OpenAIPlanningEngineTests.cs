@@ -22,12 +22,38 @@ public sealed class OpenAIPlanningEngineTests
         Assert.Equal(6000, gateway.Request?.MaxOutputTokens);
         Assert.Equal("forge_implementation_plan", gateway.Request?.SchemaName);
         Assert.Contains("additionalProperties", gateway.Request?.JsonSchema);
-        Assert.Contains("\"maxItems\": 6", gateway.Request?.JsonSchema);
+        Assert.Contains("\"maxItems\": 10", gateway.Request?.JsonSchema);
+        Assert.Contains("\"maxItems\": 8", gateway.Request?.JsonSchema);
+        Assert.Contains("requirementCoverage", gateway.Request?.JsonSchema);
         Assert.DoesNotContain("\"maxLength\"", gateway.Request?.JsonSchema);
         Assert.Contains("tests must pass", gateway.Request?.DeveloperInstructions);
         Assert.Contains("tests passed", gateway.Request?.DeveloperInstructions);
         Assert.Contains("imperative, future, or", gateway.Request?.DeveloperInstructions);
         Assert.Contains("one concise paragraph", gateway.Request?.DeveloperInstructions);
+        Assert.Contains("do not count as planning test implementation", gateway.Request?.DeveloperInstructions);
+        Assert.Contains("concrete service or component", gateway.Request?.DeveloperInstructions);
+        Assert.Contains("frontend API helpers", gateway.Request?.DeveloperInstructions);
+        Assert.Equal(1, gateway.CallCount);
+    }
+
+    [Fact]
+    public async Task Requirement_for_backend_and_frontend_tests_accepts_concrete_test_implementation_plan()
+    {
+        var context = Context() with
+        {
+            ApprovedRequirementSummary = "Add report export with backend and frontend automated tests."
+        };
+        const string output = """
+            {"title":"Plan tested report export","objective":"Add report export with implementation tests.","repositoryUnderstanding":"Evidence E1 identifies the existing application surface.","affectedFiles":[{"path":"src/App.cs","action":"modify","purpose":"Implement export generation without a new dependency using E1.","evidenceIds":["E1"],"confidence":0.9},{"path":"tests/BackendExportTests.cs","action":"create","purpose":"Add backend implementation coverage.","evidenceIds":[],"confidence":0.7},{"path":"web/src/App.test.tsx","action":"create","purpose":"Add frontend implementation coverage.","evidenceIds":[],"confidence":0.7}],"orderedSteps":[{"order":1,"description":"Implement export generation.","affectedPaths":["src/App.cs"],"evidenceIds":["E1"],"expectedResult":"The export can be generated."},{"order":2,"description":"Add backend export tests.","affectedPaths":["tests/BackendExportTests.cs"],"evidenceIds":[],"expectedResult":"Backend behavior has automated coverage."},{"order":3,"description":"Add frontend export tests.","affectedPaths":["web/src/App.test.tsx"],"evidenceIds":[],"expectedResult":"Frontend behavior has automated coverage."}],"proposedValidationCommands":["dotnet test ForgeAI.slnx","npm test"],"risks":[],"assumptions":["No new export dependency is required."],"unresolvedQuestions":[],"requirementCoverage":[{"requirement":"Generate report exports.","affectedPaths":["src/App.cs"],"stepOrders":[1]},{"requirement":"Implement backend tests.","affectedPaths":["tests/BackendExportTests.cs"],"stepOrders":[2]},{"requirement":"Implement frontend tests.","affectedPaths":["web/src/App.test.tsx"],"stepOrders":[3]}],"summary":"A concrete export and test implementation plan."}
+            """;
+        var gateway = new CapturingGateway(Envelope(output));
+
+        var result = await CreateEngine(gateway).CreatePlanAsync(context);
+
+        Assert.Contains(result.Plan.AffectedFiles, file => file.Path == "tests/BackendExportTests.cs" && file.Action == PlannedFileAction.Create);
+        Assert.Contains(result.Plan.AffectedFiles, file => file.Path == "web/src/App.test.tsx" && file.Action == PlannedFileAction.Create);
+        Assert.Equal(3, result.Plan.RequirementCoverage.Count);
+        Assert.Equal(1, gateway.CallCount);
     }
 
     [Fact]
@@ -302,7 +328,7 @@ public sealed class OpenAIPlanningEngineTests
     private static OpenAIResponseEnvelope Envelope(string output) => new("resp_plan", output, 1000, 200, 100, 25);
 
     private static string ValidJson() => """
-        {"title":"Plan report export","objective":"Add bounded report export behavior.","repositoryUnderstanding":"Evidence E1 identifies the application surface.","affectedFiles":[{"path":"src/App.cs","action":"modify","purpose":"Expose report export behavior backed by E1.","evidenceIds":["E1"],"confidence":0.9}],"orderedSteps":[{"order":1,"description":"Add the report export behavior.","affectedPaths":["src/App.cs"],"evidenceIds":["E1"],"expectedResult":"The report export behavior is represented."}],"proposedValidationCommands":["dotnet test ForgeAI.slnx"],"risks":["Output size needs a bound."],"assumptions":["The current API shape remains stable."],"unresolvedQuestions":[],"summary":"A focused evidence-backed export plan."}
+        {"title":"Plan report export","objective":"Add bounded report export behavior.","repositoryUnderstanding":"Evidence E1 identifies the application surface.","affectedFiles":[{"path":"src/App.cs","action":"modify","purpose":"Expose report export behavior backed by E1 without a new dependency.","evidenceIds":["E1"],"confidence":0.9}],"orderedSteps":[{"order":1,"description":"Add the report export behavior.","affectedPaths":["src/App.cs"],"evidenceIds":["E1"],"expectedResult":"The report export behavior is represented."}],"proposedValidationCommands":["dotnet test ForgeAI.slnx"],"risks":["Output size needs a bound."],"assumptions":["The current API shape remains stable."],"unresolvedQuestions":[],"requirementCoverage":[{"requirement":"Provide bounded report export behavior.","affectedPaths":["src/App.cs"],"stepOrders":[1]}],"summary":"A focused evidence-backed export plan."}
         """;
 
     private static string Mutate(string json, string mutation) => mutation switch
@@ -326,11 +352,11 @@ public sealed class OpenAIPlanningEngineTests
             StringComparison.Ordinal),
         "too_many_validation_commands" => json.Replace(
             "[\"dotnet test ForgeAI.slnx\"]",
-            "[\"validate 1\",\"validate 2\",\"validate 3\",\"validate 4\",\"validate 5\",\"validate 6\",\"validate 7\"]",
+            "[\"validate 1\",\"validate 2\",\"validate 3\",\"validate 4\",\"validate 5\",\"validate 6\",\"validate 7\",\"validate 8\",\"validate 9\"]",
             StringComparison.Ordinal),
         "too_many_steps" => json.Replace(
             "}],\"proposedValidationCommands\"",
-            "},{\"order\":2,\"description\":\"Step 2.\",\"affectedPaths\":[\"src/App.cs\"],\"evidenceIds\":[\"E1\"],\"expectedResult\":\"Result 2.\"},{\"order\":3,\"description\":\"Step 3.\",\"affectedPaths\":[\"src/App.cs\"],\"evidenceIds\":[\"E1\"],\"expectedResult\":\"Result 3.\"},{\"order\":4,\"description\":\"Step 4.\",\"affectedPaths\":[\"src/App.cs\"],\"evidenceIds\":[\"E1\"],\"expectedResult\":\"Result 4.\"},{\"order\":5,\"description\":\"Step 5.\",\"affectedPaths\":[\"src/App.cs\"],\"evidenceIds\":[\"E1\"],\"expectedResult\":\"Result 5.\"},{\"order\":6,\"description\":\"Step 6.\",\"affectedPaths\":[\"src/App.cs\"],\"evidenceIds\":[\"E1\"],\"expectedResult\":\"Result 6.\"},{\"order\":7,\"description\":\"Step 7.\",\"affectedPaths\":[\"src/App.cs\"],\"evidenceIds\":[\"E1\"],\"expectedResult\":\"Result 7.\"}],\"proposedValidationCommands\"",
+            "},{\"order\":2,\"description\":\"Step 2.\",\"affectedPaths\":[\"src/App.cs\"],\"evidenceIds\":[\"E1\"],\"expectedResult\":\"Result 2.\"},{\"order\":3,\"description\":\"Step 3.\",\"affectedPaths\":[\"src/App.cs\"],\"evidenceIds\":[\"E1\"],\"expectedResult\":\"Result 3.\"},{\"order\":4,\"description\":\"Step 4.\",\"affectedPaths\":[\"src/App.cs\"],\"evidenceIds\":[\"E1\"],\"expectedResult\":\"Result 4.\"},{\"order\":5,\"description\":\"Step 5.\",\"affectedPaths\":[\"src/App.cs\"],\"evidenceIds\":[\"E1\"],\"expectedResult\":\"Result 5.\"},{\"order\":6,\"description\":\"Step 6.\",\"affectedPaths\":[\"src/App.cs\"],\"evidenceIds\":[\"E1\"],\"expectedResult\":\"Result 6.\"},{\"order\":7,\"description\":\"Step 7.\",\"affectedPaths\":[\"src/App.cs\"],\"evidenceIds\":[\"E1\"],\"expectedResult\":\"Result 7.\"},{\"order\":8,\"description\":\"Step 8.\",\"affectedPaths\":[\"src/App.cs\"],\"evidenceIds\":[\"E1\"],\"expectedResult\":\"Result 8.\"},{\"order\":9,\"description\":\"Step 9.\",\"affectedPaths\":[\"src/App.cs\"],\"evidenceIds\":[\"E1\"],\"expectedResult\":\"Result 9.\"}],\"proposedValidationCommands\"",
             StringComparison.Ordinal),
         "too_many_file_evidence_ids" => json.Replace(
             "\"evidenceIds\":[\"E1\"],\"confidence\"",

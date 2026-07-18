@@ -17,6 +17,11 @@ public static class ImplementationPlanValidator
     public const int UnresolvedQuestionMaxLength = 500;
     public const int FilePathMaxLength = 300;
     public const int EvidenceIdMaxLength = 40;
+    public const int RequirementCoverageMaxLength = 300;
+    public const int MaximumAffectedFiles = 10;
+    public const int MaximumSteps = 8;
+    public const int MaximumValidationCommands = 8;
+    public const int MaximumRequirementCoverageItems = 12;
 
     public const string ValidationAlreadyPerformedMessage =
         "The implementation plan claimed that validation had already been performed.";
@@ -67,9 +72,12 @@ public static class ImplementationPlanValidator
         ValidateRequiredField(plan.Summary, SummaryMaxLength,
             "The implementation-plan summary is required.",
             "The implementation-plan summary exceeds its allowed length.");
-        if (plan.AffectedFiles.Count > 6 || plan.Steps.Count > 6 || plan.ProposedValidationCommands.Count > 6 ||
+        if (plan.AffectedFiles.Count > MaximumAffectedFiles || plan.Steps.Count > MaximumSteps ||
+            plan.ProposedValidationCommands.Count > MaximumValidationCommands ||
             plan.Risks.Count > 4 || plan.Assumptions.Count > 4 || plan.UnresolvedQuestions.Count > 4)
             throw Invalid("The implementation plan exceeds the compact collection limits.");
+        if (plan.RequirementCoverage.Count == 0 || plan.RequirementCoverage.Count > MaximumRequirementCoverageItems)
+            throw Invalid("The implementation plan requires bounded requirement coverage.");
         ValidateListItems(plan.ProposedValidationCommands, ValidationCommandMaxLength,
             "Proposed validation command", "is required", "exceeds its allowed length");
         ValidateListItems(plan.Risks, RiskMaxLength, "Risk", "is required", "exceeds its allowed length");
@@ -147,6 +155,33 @@ public static class ImplementationPlanValidator
             }
         }
 
+        var validStepOrders = plan.Steps.Select(step => step.Order).ToHashSet();
+        for (var coverageIndex = 0; coverageIndex < plan.RequirementCoverage.Count; coverageIndex++)
+        {
+            var coverage = plan.RequirementCoverage[coverageIndex];
+            ValidateRequiredField(coverage.Requirement, RequirementCoverageMaxLength,
+                $"Requirement coverage item {coverageIndex + 1} requires a requirement.",
+                $"Requirement coverage item {coverageIndex + 1} contains an overlong requirement.");
+            if (coverage.AffectedPaths.Count == 0 || coverage.StepOrders.Count == 0 ||
+                coverage.AffectedPaths.Count > MaximumAffectedFiles || coverage.StepOrders.Count > MaximumSteps)
+                throw Invalid($"Requirement coverage item {coverageIndex + 1} has invalid reference counts.");
+            if (coverage.AffectedPaths.Any(path => path.Length > FilePathMaxLength))
+                throw InvalidField($"Requirement coverage item {coverageIndex + 1} contains an overlong affected path.");
+            var coveragePaths = coverage.AffectedPaths.Select(Normalize).ToArray();
+            if (coveragePaths.Any(path => !IsSafeRelativePath(path) || !affectedPaths.Contains(path)) ||
+                coveragePaths.Distinct(StringComparer.OrdinalIgnoreCase).Count() != coveragePaths.Length)
+                throw Invalid($"Requirement coverage item {coverageIndex + 1} references an undeclared, unsafe, or duplicate affected path.");
+            if (coverage.StepOrders.Any(order => !validStepOrders.Contains(order)) ||
+                coverage.StepOrders.Distinct().Count() != coverage.StepOrders.Count)
+                throw Invalid($"Requirement coverage item {coverageIndex + 1} references an unknown or duplicate step order.");
+            var referencedStepPaths = plan.Steps.Where(step => coverage.StepOrders.Contains(step.Order))
+                .SelectMany(step => step.AffectedPaths)
+                .Select(Normalize)
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            if (coveragePaths.Any(path => !referencedStepPaths.Contains(path)))
+                throw Invalid($"Requirement coverage item {coverageIndex + 1} contains a path not connected to its referenced steps.");
+        }
+
         RejectClaimsThatValidationAlreadyRan(plan);
 
         if (PlanTextValues(plan).Any(value =>
@@ -201,7 +236,8 @@ public static class ImplementationPlanValidator
             .Concat(plan.Steps.Select(step => step.Description))
             .Concat(plan.Assumptions)
             .Concat(plan.Risks)
-            .Concat(plan.UnresolvedQuestions);
+            .Concat(plan.UnresolvedQuestions)
+            .Concat(plan.RequirementCoverage.Select(item => item.Requirement));
         var proposedOutcomeFields = plan.ProposedValidationCommands
             .Concat(plan.Steps.Select(step => step.ExpectedResult));
 
@@ -239,7 +275,8 @@ public static class ImplementationPlanValidator
             .Concat(plan.ProposedValidationCommands)
             .Concat(plan.Risks)
             .Concat(plan.Assumptions)
-            .Concat(plan.UnresolvedQuestions);
+            .Concat(plan.UnresolvedQuestions)
+            .Concat(plan.RequirementCoverage.SelectMany(item => new[] { item.Requirement }.Concat(item.AffectedPaths)));
 
     private static bool IsSafeRelativePath(string path) =>
         !string.IsNullOrWhiteSpace(path) &&

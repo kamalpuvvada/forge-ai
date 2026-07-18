@@ -124,6 +124,9 @@ public sealed class EngineeringTaskApiTests : IClassFixture<FakeModeFactory>
         Assert.Equal("DeterministicFake", planned.GetProperty("implementationPlan").GetProperty("source").GetString());
         Assert.Equal(JsonValueKind.Null, planned.GetProperty("implementationPlan").GetProperty("planningModel").ValueKind);
         Assert.True(planned.GetProperty("implementationPlan").GetProperty("orderedSteps")[0].TryGetProperty("expectedResult", out _));
+        var coverage = Assert.Single(planned.GetProperty("implementationPlan").GetProperty("requirementCoverage").EnumerateArray());
+        Assert.True(coverage.GetProperty("affectedPaths").GetArrayLength() > 0);
+        Assert.True(coverage.GetProperty("stepOrders").GetArrayLength() > 0);
         Assert.Equal(0, planned.GetProperty("telemetry").GetProperty("totalCalls").GetInt32());
         Assert.Equal(0m, planned.GetProperty("telemetry").GetProperty("totalEstimatedCostUsd").GetDecimal());
 

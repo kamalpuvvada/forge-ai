@@ -44,9 +44,10 @@ export interface EvidenceItem { id: string; relativePath: string; startLine: num
 export type PlannedFileAction = 'Modify' | 'Create' | 'Delete' | 'Inspect'
 export interface PlannedFile { path: string; action: PlannedFileAction; purpose: string; evidenceIds: string[]; confidence: number }
 export interface ImplementationStep { order: number; description: string; affectedPaths: string[]; evidenceIds: string[]; expectedResult: string }
+export interface RequirementCoverage { requirement: string; affectedPaths: string[]; stepOrders: number[] }
 export interface ImplementationPlan {
   title: string; objective: string; repositoryUnderstanding: string; affectedFiles: PlannedFile[]; orderedSteps: ImplementationStep[]
-  proposedValidationCommands: string[]; risks: string[]; assumptions: string[]; unresolvedQuestions: string[]; summary: string
+  proposedValidationCommands: string[]; risks: string[]; assumptions: string[]; unresolvedQuestions: string[]; requirementCoverage: RequirementCoverage[]; summary: string
   source: 'DeterministicFake' | 'OpenAI'; planningModel: string | null; isDeterministicFake: boolean; createdAt: string; repositoryFingerprint: string
 }
 export interface EngineeringTask {
