@@ -56,9 +56,9 @@
 
 ## 010 — Strict structured clarification output
 
-**Decision:** Request strict JSON Schema and validate the ask/summarize combination after deserialization.
-**Reason:** Malformed, both, or neither decisions must never become workflow facts.
-**Trade-off:** Readable but schema-invalid output is rejected instead of guessed or repaired.
+**Decision:** Request strict JSON Schema and validate the ask/summarize combination after deserialization. One question means one atomic decision dimension, represented internally by `questionFocus` and guarded by lightweight structural checks.
+**Reason:** Malformed, both, neither, or structurally bundled decisions must never become workflow facts.
+**Trade-off:** Semantic atomicity still depends on model instruction; readable but invalid output is rejected instead of guessed, repaired, or retried.
 
 ## 011 — No silent provider fallback
 

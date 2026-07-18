@@ -77,9 +77,9 @@ This implementation task did **not** make a live or billable OpenAI request.
 ## AI boundary and failure behavior
 
 - `IClarificationEngine.EvaluateAsync` is asynchronous and cancellation-aware.
-- Every evaluation returns exactly one decision: ask one question or provide a summary.
+- Every evaluation returns exactly one decision: ask one question or provide a summary. One question means one atomic decision dimension.
 - The OpenAI adapter uses official `OpenAI` 2.12.0 and the Responses API.
-- Strict JSON Schema structured output is requested and the one-decision invariant is validated again after deserialization.
+- Strict JSON Schema structured output requires an internal `questionFocus`; the ask/summarize and atomic-question invariants are validated again after deserialization.
 - Each turn sends compact canonical context: repository identifier, original requirement, answers, and revision notes. `previous_response_id` is not used.
 - Fake mode records no model usage.
 - OpenAI mode never falls back to Fake mode. Configuration, authentication, timeout, rate-limit, malformed-output, and provider failures return safe Problem Details.

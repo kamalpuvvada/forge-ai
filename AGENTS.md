@@ -17,7 +17,7 @@
 
 ## Product invariants
 
-- Show and request exactly one clarification question at a time. Preserve answers and never ask an answered question again.
+- Show and request exactly one clarification question at a time: one question means one atomic decision dimension. Preserve answers and never ask an answered question again.
 - A clear requirement may produce a summary without questions. Corrections are revision notes, never agent questions, and require a new approval.
 - Never invent repository facts, user intent, model output, tool results, test success, or completed integrations. Separate known facts, assumptions, gaps, and failures.
 - Prefer deterministic code and normal development tools when an LLM is unnecessary. Retrieve only relevant context and reuse stable summaries to control token usage and cost.

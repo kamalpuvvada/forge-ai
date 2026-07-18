@@ -54,15 +54,15 @@ Correction is permitted only while awaiting requirement approval. The correction
 OpenAI mode uses `gpt-5.6-terra`, low reasoning effort, and a bounded 800-token output through the Responses API. `CreateResponseOptions.TextOptions` specifies `ResponseTextFormat.CreateJsonSchemaFormat(..., jsonSchemaIsStrict: true)`. The schema contains:
 
 - `decision`: `ask` or `summarize`;
-- nullable `question` and `summary`;
+- nullable `question`, internal `questionFocus`, and `summary`;
 - arrays for known facts, assumptions, and unresolved gaps.
 
 After deserialization the adapter independently enforces:
 
-- ask: one non-empty question and no summary;
-- summarize: one non-empty summary and no question.
+- ask: one concise question for one atomic decision dimension, one snake-case focus, and no summary;
+- summarize: one non-empty summary and null question/focus.
 
-Malformed, both, neither, and unknown decisions are provider failures. Forge never free-form parses or silently invokes Fake mode.
+Questions with multiple marks, newlines, list syntax, excessive length, or a structurally combined focus are invalid provider responses. Semantic atomicity remains primarily prompt- and focus-driven. Forge never repairs output, makes a second model call, free-form parses, or silently invokes Fake mode.
 
 The developer instruction prefix is stable. Each turn reconstructs one compact JSON context containing only the repository identifier, original requirement, previous question/answer pairs, and correction notes. Repository content is never implied. `previous_response_id` is intentionally unused.
 

@@ -8,9 +8,9 @@ public sealed class FakeClarificationEngine : IClarificationEngine
 {
     private static readonly string[] Questions =
     [
-        "What specific outcome or acceptance criteria will prove this requirement is complete?",
-        "Are there technical constraints, compatibility needs, or files that must remain unchanged?",
-        "Which validation steps should be required before the change is considered ready?"
+        "What result will prove this requirement is complete?",
+        "Which technical constraint has the highest priority?",
+        "Which validation step must pass before this change is ready?"
     ];
 
     public Task<ClarificationEvaluation> EvaluateAsync(

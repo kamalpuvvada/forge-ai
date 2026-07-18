@@ -12,7 +12,7 @@ public sealed class OpenAIClarificationEngineTests
     {
         var gateway = new StubGateway(new OpenAIResponseEnvelope(
             "resp_123",
-            """{"decision":"ask","question":"Who can access it?","summary":null,"knownFacts":["Audit log requested"],"assumptions":[],"unresolvedGaps":["Access"]}""",
+            """{"decision":"ask","question":"Who can access it?","questionFocus":"access_permissions","summary":null,"knownFacts":["Audit log requested"],"assumptions":[],"unresolvedGaps":["Access"]}""",
             1000, 400, 200, 50));
         var engine = CreateEngine(gateway);
 
@@ -30,7 +30,7 @@ public sealed class OpenAIClarificationEngineTests
     public async Task Valid_summarize_structured_response_is_accepted()
     {
         var engine = CreateEngine(new StubGateway(Envelope(
-            """{"decision":"summarize","question":null,"summary":"Implement administrator audit logging.","knownFacts":[],"assumptions":[],"unresolvedGaps":[]}""")));
+            """{"decision":"summarize","question":null,"questionFocus":null,"summary":"Implement administrator audit logging.","knownFacts":[],"assumptions":[],"unresolvedGaps":[]}""")));
         var result = await engine.EvaluateAsync(NewTask());
         Assert.Equal(ClarificationDecision.Summarize, result.Decision);
         Assert.Equal("Implement administrator audit logging.", result.Summary);
@@ -38,14 +38,64 @@ public sealed class OpenAIClarificationEngineTests
 
     [Theory]
     [InlineData("{not-json")]
-    [InlineData("{\"decision\":\"ask\",\"question\":\"Q?\",\"summary\":\"also summary\",\"knownFacts\":[],\"assumptions\":[],\"unresolvedGaps\":[]}")]
-    [InlineData("{\"decision\":\"summarize\",\"question\":null,\"summary\":null,\"knownFacts\":[],\"assumptions\":[],\"unresolvedGaps\":[]}")]
+    [InlineData("{\"decision\":\"ask\",\"question\":\"Q?\",\"questionFocus\":\"scope\",\"summary\":\"also summary\",\"knownFacts\":[],\"assumptions\":[],\"unresolvedGaps\":[]}")]
+    [InlineData("{\"decision\":\"summarize\",\"question\":null,\"questionFocus\":null,\"summary\":null,\"knownFacts\":[],\"assumptions\":[],\"unresolvedGaps\":[]}")]
     public async Task Malformed_or_invalid_decision_is_rejected(string output)
     {
         var exception = await Assert.ThrowsAsync<ClarificationProviderException>(() =>
             CreateEngine(new StubGateway(Envelope(output))).EvaluateAsync(NewTask()));
         Assert.Equal("invalid_response", exception.Category);
         Assert.False(exception.FailedCall.Succeeded);
+    }
+
+    [Theory]
+    [InlineData("{\"decision\":\"ask\",\"question\":\"Which export format should Forge support first?\",\"summary\":null,\"knownFacts\":[],\"assumptions\":[],\"unresolvedGaps\":[]}")]
+    [InlineData("{\"decision\":\"ask\",\"question\":\"Which export format should Forge support first?\",\"questionFocus\":null,\"summary\":null,\"knownFacts\":[],\"assumptions\":[],\"unresolvedGaps\":[]}")]
+    [InlineData("{\"decision\":\"ask\",\"question\":\"Which export format should Forge support first?\",\"questionFocus\":\"export_format_and_destination\",\"summary\":null,\"knownFacts\":[],\"assumptions\":[],\"unresolvedGaps\":[]}")]
+    [InlineData("{\"decision\":\"ask\",\"question\":\"\",\"questionFocus\":\"export_format\",\"summary\":null,\"knownFacts\":[],\"assumptions\":[],\"unresolvedGaps\":[]}")]
+    [InlineData("{\"decision\":\"ask\",\"question\":\"Choose an export format\",\"questionFocus\":\"export_format\",\"summary\":null,\"knownFacts\":[],\"assumptions\":[],\"unresolvedGaps\":[]}")]
+    [InlineData("{\"decision\":\"ask\",\"question\":\"Which format? Which destination?\",\"questionFocus\":\"export_format\",\"summary\":null,\"knownFacts\":[],\"assumptions\":[],\"unresolvedGaps\":[]}")]
+    [InlineData("{\"decision\":\"ask\",\"question\":\"1. Which export format?\",\"questionFocus\":\"export_format\",\"summary\":null,\"knownFacts\":[],\"assumptions\":[],\"unresolvedGaps\":[]}")]
+    [InlineData("{\"decision\":\"ask\",\"question\":\"Which export format?\\n- Which destination?\",\"questionFocus\":\"export_format\",\"summary\":null,\"knownFacts\":[],\"assumptions\":[],\"unresolvedGaps\":[]}")]
+    public async Task Invalid_ask_structure_is_rejected(string output)
+    {
+        var exception = await Assert.ThrowsAsync<ClarificationProviderException>(() =>
+            CreateEngine(new StubGateway(Envelope(output))).EvaluateAsync(NewTask()));
+
+        Assert.Equal("invalid_response", exception.Category);
+    }
+
+    [Fact]
+    public async Task Overlong_question_is_rejected()
+    {
+        var question = $"Which {new string('x', 181)}?";
+        var output = $$"""{"decision":"ask","question":"{{question}}","questionFocus":"export_format","summary":null,"knownFacts":[],"assumptions":[],"unresolvedGaps":[]}""";
+
+        var exception = await Assert.ThrowsAsync<ClarificationProviderException>(() =>
+            CreateEngine(new StubGateway(Envelope(output))).EvaluateAsync(NewTask()));
+
+        Assert.Equal("invalid_response", exception.Category);
+    }
+
+    [Fact]
+    public async Task Summarize_requires_null_question_focus()
+    {
+        const string output = """{"decision":"summarize","question":null,"questionFocus":"scope","summary":"Implement exports.","knownFacts":[],"assumptions":[],"unresolvedGaps":[]}""";
+
+        var exception = await Assert.ThrowsAsync<ClarificationProviderException>(() =>
+            CreateEngine(new StubGateway(Envelope(output))).EvaluateAsync(NewTask()));
+
+        Assert.Equal("invalid_response", exception.Category);
+    }
+
+    [Fact]
+    public async Task Concise_single_focus_question_is_accepted()
+    {
+        const string output = """{"decision":"ask","question":"Which export format should Forge support first?","questionFocus":"export_format","summary":null,"knownFacts":[],"assumptions":[],"unresolvedGaps":["Export format"]}""";
+
+        var result = await CreateEngine(new StubGateway(Envelope(output))).EvaluateAsync(NewTask());
+
+        Assert.Equal("Which export format should Forge support first?", result.Question);
     }
 
     [Fact]
