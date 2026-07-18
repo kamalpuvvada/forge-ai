@@ -23,6 +23,9 @@ public sealed class OpenAIPlanningEngineTests
         Assert.Equal("forge_implementation_plan", gateway.Request?.SchemaName);
         Assert.Contains("additionalProperties", gateway.Request?.JsonSchema);
         Assert.Contains("\"maxItems\": 6", gateway.Request?.JsonSchema);
+        Assert.Contains("tests must pass", gateway.Request?.DeveloperInstructions);
+        Assert.Contains("tests passed", gateway.Request?.DeveloperInstructions);
+        Assert.Contains("imperative, future, or", gateway.Request?.DeveloperInstructions);
     }
 
     [Fact]
@@ -106,6 +109,34 @@ public sealed class OpenAIPlanningEngineTests
         Assert.Equal(ModelCallStage.Planning, exception.FailedCall.Stage);
         Assert.False(exception.FailedCall.Succeeded);
         Assert.Equal("resp_plan", exception.FailedCall.ProviderResponseId);
+    }
+
+    [Fact]
+    public async Task Completed_validation_claim_returns_specific_safe_failure_without_retry_or_raw_output()
+    {
+        var output = Mutate(ValidJson(), "validation_claim");
+        var gateway = new CapturingGateway(Envelope(output));
+
+        var exception = await Assert.ThrowsAsync<PlanningProviderException>(() =>
+            CreateEngine(gateway).CreatePlanAsync(Context()));
+
+        Assert.Equal("invalid_plan_response", exception.Category);
+        Assert.Equal(ImplementationPlanValidator.ValidationAlreadyPerformedMessage, exception.Message);
+        Assert.Equal(1, gateway.CallCount);
+        Assert.DoesNotContain(output, exception.ToString(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Future_validation_language_in_expected_result_remains_valid()
+    {
+        var output = ValidJson().Replace(
+            "The report export behavior is represented.",
+            "All tests must pass, the build should succeed, and the PDF must be manually verified.",
+            StringComparison.Ordinal);
+
+        var result = await CreateEngine(new CapturingGateway(Envelope(output))).CreatePlanAsync(Context());
+
+        Assert.Contains("All tests must pass", result.Plan.Steps[0].ExpectedResult, StringComparison.Ordinal);
     }
 
     [Fact]

@@ -16,8 +16,11 @@ public sealed class OpenAIPlanningEngine(
         Cite supplied evidence IDs for every claim about an existing file. Distinguish existing files from
         proposed new files, and never invent an existing path. Every modify, delete, or inspect item must cite
         evidence. A create item must be a repository-relative path that is absent from the supplied file list.
-        Never claim that code was modified or that builds, tests, commands, or manual checks passed.
-        Validation commands are proposals only. Identify assumptions, unresolved questions, and risks.
+        Never claim that code was modified or that builds, tests, commands, or manual checks already ran.
+        Describe validation only as proposed commands and expected outcomes, using imperative, future, or
+        conditional language. Never use past-tense or present-perfect language implying execution. Say
+        "run the tests", not "tests were run"; "tests must pass", not "tests passed"; and "verify the PDF",
+        not "the PDF was verified". Identify assumptions, unresolved questions, and risks.
         Avoid unrelated refactoring. If evidence is insufficient, state that limitation instead of guessing.
         Keep the plan narrowly appropriate for the approved requirement. Never emit absolute local paths.
         Return only the supplied strict JSON schema. Step order must start at 1 and increase by 1.
@@ -132,9 +135,13 @@ public sealed class OpenAIPlanningEngine(
         catch (Exception exception)
         {
             var category = exception is OpenAITransportException transport ? transport.Category : "invalid_plan_response";
-            var safeMessage = exception is OpenAITransportException
-                ? exception.Message
-                : "OpenAI returned an invalid structured implementation plan.";
+            var safeMessage = exception switch
+            {
+                OpenAITransportException => exception.Message,
+                PlanningException when exception.Message == ImplementationPlanValidator.ValidationAlreadyPerformedMessage =>
+                    ImplementationPlanValidator.ValidationAlreadyPerformedMessage,
+                _ => "OpenAI returned an invalid structured implementation plan."
+            };
             var failed = new ModelCallRecord(
                 callId, ModelCallStage.Planning, "OpenAI", options.PlanningModel,
                 options.PlanningReasoningEffort, startedAt, timeProvider.GetUtcNow(), false, response?.ResponseId,

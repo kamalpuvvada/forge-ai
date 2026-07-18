@@ -4,8 +4,26 @@ namespace Forge.Core;
 
 public static class ImplementationPlanValidator
 {
-    private static readonly Regex ValidationSuccessClaim = new(
-        @"(?i)\b(?:passed|succeeded|successful|completed successfully|all tests pass(?:ed)?)\b",
+    public const string ValidationAlreadyPerformedMessage =
+        "The implementation plan claimed that validation had already been performed.";
+
+    private const string ValidationSubject =
+        @"(?:all\s+)?(?:tests?|build|lint|validation|commands?|checks?|pdf|result|export|download)";
+
+    private static readonly Regex[] HistoricalValidationClaims =
+    [
+        new($@"(?i)\b(?:the\s+)?{ValidationSubject}\s+(?:have|has|had)\s+(?:already\s+)?(?:been\s+)?(?:manually\s+)?(?:run|passed|succeeded|successful|completed|verified|validated)\b",
+            RegexOptions.CultureInvariant),
+        new($@"(?i)\b(?:the\s+)?{ValidationSubject}\s+(?:was|were)\s+(?:already\s+)?(?:manually\s+)?(?:run|passed|successful|completed|verified|validated)\b",
+            RegexOptions.CultureInvariant),
+        new($@"(?i)\b(?:the\s+)?{ValidationSubject}\s+(?:already\s+)?(?:passed|succeeded|completed|ran)\b(?:\s+successfully)?",
+            RegexOptions.CultureInvariant),
+        new(@"(?i)\bno\s+errors?\s+(?:were|was|have\s+been|had\s+been)\s+found\b",
+            RegexOptions.CultureInvariant)
+    ];
+
+    private static readonly Regex CurrentValidationClaim = new(
+        $@"(?i)\b(?:the\s+)?{ValidationSubject}\s+(?:is|are)\s+(?:currently\s+)?(?:passing|successful|complete|validated|verified)\b",
         RegexOptions.CultureInvariant);
 
     private static readonly Regex AbsoluteLocalPath = new(
@@ -86,9 +104,9 @@ public static class ImplementationPlanValidator
             }
         }
 
+        RejectClaimsThatValidationAlreadyRan(plan);
+
         var text = FlattenText(plan);
-        if (ValidationSuccessClaim.IsMatch(text))
-            throw Invalid("The plan must not claim that validation passed or succeeded.");
         if ((!string.IsNullOrWhiteSpace(snapshot.NormalizedRoot) && text.Contains(snapshot.NormalizedRoot, StringComparison.OrdinalIgnoreCase)) ||
             AbsoluteLocalPath.IsMatch(text))
             throw Invalid("The implementation plan contains an absolute local path.");
@@ -96,6 +114,26 @@ public static class ImplementationPlanValidator
         if (MentionsSnapshotPathWithoutEvidence(plan.RepositoryUnderstanding, snapshotPaths, evidenceIds))
             throw Invalid("Repository understanding claims about existing files must cite evidence IDs.");
     }
+
+    private static void RejectClaimsThatValidationAlreadyRan(ImplementationPlan plan)
+    {
+        var narrativeFields = new[] { plan.Title, plan.Objective, plan.RepositoryUnderstanding, plan.Summary }
+            .Concat(plan.AffectedFiles.Select(file => file.Purpose))
+            .Concat(plan.Steps.Select(step => step.Description))
+            .Concat(plan.Assumptions)
+            .Concat(plan.Risks)
+            .Concat(plan.UnresolvedQuestions);
+        var proposedOutcomeFields = plan.ProposedValidationCommands
+            .Concat(plan.Steps.Select(step => step.ExpectedResult));
+
+        if (narrativeFields.Any(value => ContainsClaimThatValidationAlreadyRan(value, includeCurrentState: true)) ||
+            proposedOutcomeFields.Any(value => ContainsClaimThatValidationAlreadyRan(value, includeCurrentState: false)))
+            throw Invalid(ValidationAlreadyPerformedMessage);
+    }
+
+    private static bool ContainsClaimThatValidationAlreadyRan(string value, bool includeCurrentState) =>
+        HistoricalValidationClaims.Any(pattern => pattern.IsMatch(value)) ||
+        includeCurrentState && CurrentValidationClaim.IsMatch(value);
 
     private static bool MentionsSnapshotPathWithoutEvidence(
         string value,
