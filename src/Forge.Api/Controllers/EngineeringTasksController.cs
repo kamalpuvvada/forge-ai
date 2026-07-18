@@ -1,12 +1,16 @@
 using Forge.Api.Contracts;
 using Forge.Core;
+using Forge.Infrastructure;
 using Microsoft.AspNetCore.Mvc;
 
 namespace Forge.Api.Controllers;
 
 [ApiController]
 [Route("api/tasks")]
-public sealed class EngineeringTasksController(EngineeringTaskService service) : ControllerBase
+public sealed class EngineeringTasksController(
+    EngineeringTaskService service,
+    ModelCostResolver costResolver,
+    IEngineeringTaskPdfExporter pdfExporter) : ControllerBase
 {
     [HttpPost]
     [ProducesResponseType<EngineeringTaskResponse>(StatusCodes.Status201Created)]
@@ -16,7 +20,7 @@ public sealed class EngineeringTasksController(EngineeringTaskService service) :
         CancellationToken cancellationToken)
     {
         var task = await service.CreateAsync(request.Repository, request.Requirement, cancellationToken);
-        var response = EngineeringTaskResponse.FromDomain(task);
+        var response = EngineeringTaskResponse.FromDomain(task, costResolver);
         return CreatedAtAction(nameof(Get), new { id = task.Id }, response);
     }
 
@@ -27,7 +31,19 @@ public sealed class EngineeringTasksController(EngineeringTaskService service) :
     {
         var task = await service.GetAsync(id, cancellationToken)
             ?? throw new KeyNotFoundException($"Engineering task '{id}' was not found.");
-        return Ok(EngineeringTaskResponse.FromDomain(task));
+        return Ok(EngineeringTaskResponse.FromDomain(task, costResolver));
+    }
+
+    [HttpGet("{id:guid}/export/pdf")]
+    [Produces("application/pdf")]
+    [ProducesResponseType<FileContentResult>(StatusCodes.Status200OK)]
+    [ProducesResponseType<ProblemDetails>(StatusCodes.Status404NotFound)]
+    public async Task<IActionResult> ExportPdf(Guid id, CancellationToken cancellationToken)
+    {
+        var task = await service.GetAsync(id, cancellationToken)
+            ?? throw new KeyNotFoundException($"Engineering task '{id}' was not found.");
+        var bytes = pdfExporter.Export(task);
+        return File(bytes, "application/pdf", $"forge-task-{task.Id:D}.pdf");
     }
 
     [HttpPost("{id:guid}/answers")]
@@ -41,7 +57,7 @@ public sealed class EngineeringTasksController(EngineeringTaskService service) :
         CancellationToken cancellationToken)
     {
         var task = await service.AnswerAsync(id, request.Answer, cancellationToken);
-        return Ok(EngineeringTaskResponse.FromDomain(task));
+        return Ok(EngineeringTaskResponse.FromDomain(task, costResolver));
     }
 
     [HttpPost("{id:guid}/requirement-revision")]
@@ -55,7 +71,7 @@ public sealed class EngineeringTasksController(EngineeringTaskService service) :
         CancellationToken cancellationToken)
     {
         var task = await service.RequestRevisionAsync(id, request.Correction, cancellationToken);
-        return Ok(EngineeringTaskResponse.FromDomain(task));
+        return Ok(EngineeringTaskResponse.FromDomain(task, costResolver));
     }
 
     [HttpPost("{id:guid}/requirement-approval")]
@@ -65,7 +81,7 @@ public sealed class EngineeringTasksController(EngineeringTaskService service) :
     public async Task<ActionResult<EngineeringTaskResponse>> ApproveRequirement(Guid id, CancellationToken cancellationToken)
     {
         var task = await service.ApproveRequirementAsync(id, cancellationToken);
-        return Ok(EngineeringTaskResponse.FromDomain(task));
+        return Ok(EngineeringTaskResponse.FromDomain(task, costResolver));
     }
 
     [HttpPost("{id:guid}/repository-analysis")]
@@ -75,7 +91,7 @@ public sealed class EngineeringTasksController(EngineeringTaskService service) :
     public async Task<ActionResult<EngineeringTaskResponse>> AnalyzeRepository(Guid id, CancellationToken cancellationToken)
     {
         var task = await service.AnalyzeRepositoryAsync(id, cancellationToken);
-        return Ok(EngineeringTaskResponse.FromDomain(task));
+        return Ok(EngineeringTaskResponse.FromDomain(task, costResolver));
     }
 
     [HttpPost("{id:guid}/plan")]
@@ -84,7 +100,7 @@ public sealed class EngineeringTasksController(EngineeringTaskService service) :
     public async Task<ActionResult<EngineeringTaskResponse>> CreatePlan(Guid id, CancellationToken cancellationToken)
     {
         var task = await service.CreatePlanAsync(id, cancellationToken);
-        return Ok(EngineeringTaskResponse.FromDomain(task));
+        return Ok(EngineeringTaskResponse.FromDomain(task, costResolver));
     }
 
     [HttpPost("{id:guid}/evidence-refresh")]
@@ -94,7 +110,7 @@ public sealed class EngineeringTasksController(EngineeringTaskService service) :
     public async Task<ActionResult<EngineeringTaskResponse>> RefreshEvidence(Guid id, CancellationToken cancellationToken)
     {
         var task = await service.RefreshEvidenceAsync(id, cancellationToken);
-        return Ok(EngineeringTaskResponse.FromDomain(task));
+        return Ok(EngineeringTaskResponse.FromDomain(task, costResolver));
     }
 
     [HttpPost("{id:guid}/plan-revision")]
@@ -109,7 +125,7 @@ public sealed class EngineeringTasksController(EngineeringTaskService service) :
         CancellationToken cancellationToken)
     {
         var task = await service.RequestPlanRevisionAsync(id, request.Correction, cancellationToken);
-        return Ok(EngineeringTaskResponse.FromDomain(task));
+        return Ok(EngineeringTaskResponse.FromDomain(task, costResolver));
     }
 
     [HttpPost("{id:guid}/plan-approval")]
@@ -118,6 +134,6 @@ public sealed class EngineeringTasksController(EngineeringTaskService service) :
     public async Task<ActionResult<EngineeringTaskResponse>> ApprovePlan(Guid id, CancellationToken cancellationToken)
     {
         var task = await service.ApprovePlanAsync(id, cancellationToken);
-        return Ok(EngineeringTaskResponse.FromDomain(task));
+        return Ok(EngineeringTaskResponse.FromDomain(task, costResolver));
     }
 }

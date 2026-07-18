@@ -11,6 +11,22 @@ public sealed class SqlitePersistenceTests : IDisposable
     private string ConnectionString => $"Data Source={DatabasePath}";
 
     [Fact]
+    public async Task Bundled_sqlite_runtime_is_newer_than_the_advisory_minimum()
+    {
+        await new SqliteDatabaseInitializer(ConnectionString).InitializeAsync();
+        await using var connection = new SqliteConnection(ConnectionString);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = "select sqlite_version();";
+
+        var value = Assert.IsType<string>(await command.ExecuteScalarAsync());
+
+        Assert.True(Version.TryParse(value, out var version), $"SQLite returned an invalid version '{value}'.");
+        Assert.True(version >= new Version(3, 50, 2),
+            $"SQLite {version} is older than the version that fixes GHSA-2m69-gcr7-jv3q.");
+    }
+
+    [Fact]
     public async Task Task_answers_corrections_and_model_calls_round_trip()
     {
         await new SqliteDatabaseInitializer(ConnectionString).InitializeAsync();
@@ -21,7 +37,8 @@ public sealed class SqlitePersistenceTests : IDisposable
         task.AnswerCurrentQuestion("Administrators", now.AddMinutes(1));
         task.ApplyClarificationEvaluation(ClarificationEvaluation.Summarize("All activity"), now.AddMinutes(2));
         task.RequestRequirementRevision("Only administrator changes", now.AddMinutes(3));
-        var call = new ModelCallRecord(Guid.NewGuid(), ModelCallStage.Clarification, "OpenAI", "gpt-5.6-terra", "low", now, now.AddSeconds(1), true, "resp_1", 100, 20, 30, 10, .0005m, null);
+        var pricing = new ModelPricingSnapshot(2.50m, 0.25m, 15.00m);
+        var call = new ModelCallRecord(Guid.NewGuid(), ModelCallStage.Clarification, "OpenAI", "gpt-5.6-terra", "low", now, now.AddSeconds(1), true, "resp_1", 100, 20, 30, 10, .0005m, null, pricing);
         task.ApplyClarificationEvaluation(ClarificationEvaluation.Summarize("Administrator changes only", modelCall: call), now.AddMinutes(4));
         await repository.SaveAsync(task);
 
@@ -33,7 +50,46 @@ public sealed class SqlitePersistenceTests : IDisposable
         Assert.Equal("All activity", loaded.RequirementRevisionNotes[0].PreviousSummary);
         Assert.Single(loaded.ModelCalls);
         Assert.Equal("resp_1", loaded.ModelCalls[0].ProviderResponseId);
+        Assert.Equal(pricing, loaded.ModelCalls[0].PricingSnapshot);
+        Assert.Equal(.0005m, loaded.ModelCalls[0].EstimatedCostUsd);
         Assert.Equal("Administrator changes only", loaded.RequirementSummary);
+    }
+
+    [Fact]
+    public async Task Legacy_model_call_json_distinguishes_stored_zero_missing_estimate_and_missing_snapshot()
+    {
+        await new SqliteDatabaseInitializer(ConnectionString).InitializeAsync();
+        var repository = new SqliteEngineeringTaskRepository(ConnectionString);
+        var now = DateTimeOffset.UtcNow;
+        var task = EngineeringTask.Create("C:/repo", "Audit", now);
+        task.ApplyClarificationEvaluation(ClarificationEvaluation.Summarize("Audit changes"), now);
+        await repository.SaveAsync(task);
+        var zeroId = Guid.NewGuid();
+        var missingId = Guid.NewGuid();
+        var legacyCalls = $$"""
+            [{"id":"{{zeroId}}","stage":0,"provider":"OpenAI","model":"legacy","reasoningEffort":"low","startedAt":"{{now:O}}","completedAt":"{{now:O}}","succeeded":true,"providerResponseId":"zero","inputTokens":0,"cachedInputTokens":0,"outputTokens":0,"reasoningTokens":null,"estimatedCostUsd":0,"failureCategory":null},{"id":"{{missingId}}","stage":0,"provider":"OpenAI","model":"legacy","reasoningEffort":"low","startedAt":"{{now:O}}","completedAt":"{{now:O}}","succeeded":false,"providerResponseId":null,"inputTokens":null,"cachedInputTokens":null,"outputTokens":null,"reasoningTokens":null,"failureCategory":"legacy"}]
+            """;
+        await using (var connection = new SqliteConnection(ConnectionString))
+        {
+            await connection.OpenAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = "UPDATE EngineeringTasks SET ModelCalls = $calls WHERE Id = $id";
+            command.Parameters.AddWithValue("$calls", legacyCalls);
+            command.Parameters.AddWithValue("$id", task.Id.ToString());
+            await command.ExecuteNonQueryAsync();
+        }
+
+        var loaded = await repository.GetAsync(task.Id);
+
+        Assert.Equal(0m, loaded!.ModelCalls.Single(call => call.Id == zeroId).EstimatedCostUsd);
+        Assert.Null(loaded.ModelCalls.Single(call => call.Id == zeroId).PricingSnapshot);
+        Assert.Null(loaded.ModelCalls.Single(call => call.Id == missingId).EstimatedCostUsd);
+        Assert.Null(loaded.ModelCalls.Single(call => call.Id == missingId).PricingSnapshot);
+
+        await repository.SaveAsync(loaded);
+        var reread = await repository.GetAsync(task.Id);
+        Assert.Equal(0m, reread!.ModelCalls.Single(call => call.Id == zeroId).EstimatedCostUsd);
+        Assert.Null(reread.ModelCalls.Single(call => call.Id == missingId).EstimatedCostUsd);
     }
 
     [Fact]

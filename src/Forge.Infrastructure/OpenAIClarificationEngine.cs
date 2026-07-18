@@ -71,6 +71,8 @@ public sealed class OpenAIClarificationEngine(
             throw new ClarificationConfigurationException("OpenAI mode requires the OPENAI_API_KEY environment variable.");
         if (!options.IsClarificationConfigurationComplete(true))
             throw new ClarificationConfigurationException("OpenAI mode requires a model, supported reasoning effort, positive output limit, and configured pricing.");
+        if (!costCalculator.TryGetPricingSnapshot(options.ClarificationModel, out var pricingSnapshot))
+            throw new ClarificationConfigurationException("OpenAI mode requires configured pricing for the clarification model.");
 
         var callId = Guid.NewGuid();
         var startedAt = timeProvider.GetUtcNow();
@@ -89,10 +91,10 @@ public sealed class OpenAIClarificationEngine(
 
             var completedAt = timeProvider.GetUtcNow();
             var estimatedCost = costCalculator.Calculate(
-                options.ClarificationModel,
+                pricingSnapshot,
                 response.InputTokens,
                 response.CachedInputTokens,
-                response.OutputTokens);
+                response.OutputTokens).TotalCostUsd;
             var call = new ModelCallRecord(
                 callId,
                 ModelCallStage.Clarification,
@@ -108,7 +110,8 @@ public sealed class OpenAIClarificationEngine(
                 response.OutputTokens,
                 response.ReasoningTokens,
                 estimatedCost,
-                null);
+                null,
+                pricingSnapshot);
 
             return ParseEvaluation(response.OutputText, call);
         }
@@ -136,16 +139,17 @@ public sealed class OpenAIClarificationEngine(
                 timeProvider.GetUtcNow(),
                 false,
                 response?.ResponseId,
-                response?.InputTokens ?? 0,
-                response?.CachedInputTokens ?? 0,
-                response?.OutputTokens ?? 0,
+                response?.InputTokens,
+                response?.CachedInputTokens,
+                response?.OutputTokens,
                 response?.ReasoningTokens,
-                response is null ? 0m : costCalculator.Calculate(
-                    options.ClarificationModel,
+                response is null ? null : costCalculator.Calculate(
+                    pricingSnapshot,
                     response.InputTokens,
                     response.CachedInputTokens,
-                    response.OutputTokens),
-                category);
+                    response.OutputTokens).TotalCostUsd,
+                category,
+                response is null ? null : pricingSnapshot);
             throw new ClarificationProviderException(safeMessage, category, failed, exception);
         }
     }

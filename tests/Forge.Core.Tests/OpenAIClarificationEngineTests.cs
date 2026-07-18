@@ -24,6 +24,7 @@ public sealed class OpenAIClarificationEngineTests
         Assert.Equal(1000, result.ModelCall.InputTokens);
         Assert.Equal(400, result.ModelCall.CachedInputTokens);
         Assert.Equal(0.0046m, result.ModelCall.EstimatedCostUsd);
+        Assert.Equal(new ModelPricingSnapshot(2.50m, 0.25m, 15.00m), result.ModelCall.PricingSnapshot);
     }
 
     [Fact]
@@ -46,6 +47,8 @@ public sealed class OpenAIClarificationEngineTests
             CreateEngine(new StubGateway(Envelope(output))).EvaluateAsync(NewTask()));
         Assert.Equal("invalid_response", exception.Category);
         Assert.False(exception.FailedCall.Succeeded);
+        Assert.NotNull(exception.FailedCall.EstimatedCostUsd);
+        Assert.NotNull(exception.FailedCall.PricingSnapshot);
     }
 
     [Theory]

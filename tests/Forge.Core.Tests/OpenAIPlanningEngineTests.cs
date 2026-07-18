@@ -17,6 +17,7 @@ public sealed class OpenAIPlanningEngineTests
         Assert.Equal("gpt-5.6-sol", result.Plan.PlanningModel);
         Assert.Equal(ModelCallStage.Planning, result.ModelCall?.Stage);
         Assert.Equal(0.0071m, result.ModelCall?.EstimatedCostUsd);
+        Assert.Equal(new ModelPricingSnapshot(5.00m, 0.50m, 30.00m), result.ModelCall?.PricingSnapshot);
         Assert.Equal("gpt-5.6-sol", gateway.Request?.Model);
         Assert.Equal("medium", gateway.Request?.ReasoningEffort);
         Assert.Equal(6000, gateway.Request?.MaxOutputTokens);
@@ -90,6 +91,7 @@ public sealed class OpenAIPlanningEngineTests
         Assert.Equal(6000, exception.FailedCall.OutputTokens);
         Assert.Equal(2000, exception.FailedCall.ReasoningTokens);
         Assert.Equal(0.21005m, exception.FailedCall.EstimatedCostUsd);
+        Assert.Equal(new ModelPricingSnapshot(5.00m, 0.50m, 30.00m), exception.FailedCall.PricingSnapshot);
         Assert.DoesNotContain(partialOutput, exception.ToString(), StringComparison.Ordinal);
         Assert.DoesNotContain(partialOutput, System.Text.Json.JsonSerializer.Serialize(exception.FailedCall), StringComparison.Ordinal);
         Assert.Equal(1, gateway.CallCount);
@@ -118,6 +120,8 @@ public sealed class OpenAIPlanningEngineTests
 
         Assert.Equal("invalid_plan_response", exception.Category);
         Assert.Equal("resp_malformed", exception.FailedCall.ProviderResponseId);
+        Assert.NotNull(exception.FailedCall.EstimatedCostUsd);
+        Assert.NotNull(exception.FailedCall.PricingSnapshot);
     }
 
     [Theory]

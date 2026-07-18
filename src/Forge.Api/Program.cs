@@ -29,6 +29,8 @@ builder.Services.AddSingleton(aiOptions);
 builder.Services.AddSingleton(analysisLimits);
 builder.Services.AddSingleton(new OpenAIConfigurationState(!string.IsNullOrWhiteSpace(apiKey)));
 builder.Services.AddSingleton(new ModelCostCalculator(aiOptions.Pricing));
+builder.Services.AddSingleton<ModelCostResolver>();
+builder.Services.AddSingleton<IEngineeringTaskPdfExporter, TaskPdfExporter>();
 builder.Services.AddSingleton<IClarificationEngine>(services => aiOptions.Mode switch
 {
     ForgeAiModes.Fake => new FakeClarificationEngine(),

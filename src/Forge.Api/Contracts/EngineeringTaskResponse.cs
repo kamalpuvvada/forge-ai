@@ -1,4 +1,5 @@
 using Forge.Core;
+using Forge.Infrastructure;
 
 namespace Forge.Api.Contracts;
 
@@ -21,12 +22,21 @@ public sealed record ModelCallResponse(
     DateTimeOffset CompletedAt,
     bool Succeeded,
     string? ProviderResponseId,
-    int InputTokens,
-    int CachedInputTokens,
-    int OutputTokens,
+    int? InputTokens,
+    int? CachedInputTokens,
+    int? UncachedInputTokens,
+    int? OutputTokens,
     int? ReasoningTokens,
-    decimal EstimatedCostUsd,
+    decimal? EstimatedCostUsd,
+    string PricingProvenance,
+    bool HasStoredPricingSnapshot,
+    ModelPricingSnapshotResponse? StoredPricingSnapshot,
     string? FailureCategory);
+
+public sealed record ModelPricingSnapshotResponse(
+    decimal InputPerMillionUsd,
+    decimal CachedInputPerMillionUsd,
+    decimal OutputPerMillionUsd);
 
 public sealed record ModelTelemetryResponse(
     int TotalCalls,
@@ -34,6 +44,8 @@ public sealed record ModelTelemetryResponse(
     int TotalCachedInputTokens,
     int TotalOutputTokens,
     decimal TotalEstimatedCostUsd,
+    int CostUnavailableCallCount,
+    bool IsPartialEstimate,
     IReadOnlyList<ModelCallResponse> Calls);
 
 public sealed record RepositoryFileResponse(
@@ -96,19 +108,31 @@ public sealed record EngineeringTaskResponse(
     DateTimeOffset? PlanCreatedAt,
     ModelTelemetryResponse Telemetry)
 {
-    public static EngineeringTaskResponse FromDomain(EngineeringTask task)
+    public static EngineeringTaskResponse FromDomain(EngineeringTask task, ModelCostResolver costResolver)
     {
-        var calls = task.ModelCalls.Select(call => new ModelCallResponse(
-            call.Id, call.Stage, call.Provider, call.Model, call.ReasoningEffort,
-            call.StartedAt, call.CompletedAt, call.Succeeded, call.ProviderResponseId,
-            call.InputTokens, call.CachedInputTokens, call.OutputTokens,
-            call.ReasoningTokens, call.EstimatedCostUsd, call.FailureCategory)).ToList();
+        var calls = task.ModelCalls.Select(call =>
+        {
+            var resolved = costResolver.Resolve(call);
+            var snapshot = call.PricingSnapshot is null ? null : new ModelPricingSnapshotResponse(
+                call.PricingSnapshot.InputPerMillionUsd,
+                call.PricingSnapshot.CachedInputPerMillionUsd,
+                call.PricingSnapshot.OutputPerMillionUsd);
+            return new ModelCallResponse(
+                call.Id, call.Stage, call.Provider, call.Model, call.ReasoningEffort,
+                call.StartedAt, call.CompletedAt, call.Succeeded, call.ProviderResponseId,
+                call.InputTokens, call.CachedInputTokens, resolved.UncachedInputTokens, call.OutputTokens,
+                call.ReasoningTokens, resolved.EstimatedCostUsd, resolved.ProvenanceLabel,
+                resolved.HasStoredPricingSnapshot, snapshot, call.FailureCategory);
+        }).ToList();
+        var totalCost = costResolver.ResolveTotal(task.ModelCalls);
         var telemetry = new ModelTelemetryResponse(
             calls.Count,
-            calls.Sum(call => call.InputTokens),
-            calls.Sum(call => call.CachedInputTokens),
-            calls.Sum(call => call.OutputTokens),
-            calls.Sum(call => call.EstimatedCostUsd),
+            calls.Sum(call => call.InputTokens ?? 0),
+            calls.Sum(call => call.CachedInputTokens ?? 0),
+            calls.Sum(call => call.OutputTokens ?? 0),
+            totalCost.TotalEstimatedCostUsd,
+            totalCost.UnavailableCallCount,
+            totalCost.IsPartial,
             calls);
 
         var snapshot = task.RepositorySnapshot is null ? null : new RepositorySnapshotResponse(

@@ -133,6 +133,8 @@ public sealed class OpenAIPlanningEngine(
             throw new PlanningException("planning_configuration", "OpenAI planning requires the OPENAI_API_KEY environment variable.");
         if (!options.IsPlanningConfigurationComplete(true))
             throw new PlanningException("planning_configuration", "OpenAI planning requires a model, supported reasoning effort, positive output limit, and configured pricing.");
+        if (!costCalculator.TryGetPricingSnapshot(options.PlanningModel, out var pricingSnapshot))
+            throw new PlanningException("planning_configuration", "OpenAI planning requires configured pricing for the planning model.");
 
         var callId = Guid.NewGuid();
         var startedAt = timeProvider.GetUtcNow();
@@ -150,14 +152,16 @@ public sealed class OpenAIPlanningEngine(
                 "An evidence-backed implementation plan."), cancellationToken);
 
             if (response.Status != OpenAIResponseStatus.Completed)
-                throw CreateCompletionFailure(response, callId, startedAt);
+                throw CreateCompletionFailure(response, callId, startedAt, pricingSnapshot);
 
             var completedAt = timeProvider.GetUtcNow();
             var call = new ModelCallRecord(
                 callId, ModelCallStage.Planning, "OpenAI", options.PlanningModel,
                 options.PlanningReasoningEffort, startedAt, completedAt, true, response.ResponseId,
                 response.InputTokens, response.CachedInputTokens, response.OutputTokens, response.ReasoningTokens,
-                costCalculator.Calculate(options.PlanningModel, response.InputTokens, response.CachedInputTokens, response.OutputTokens), null);
+                costCalculator.Calculate(pricingSnapshot, response.InputTokens, response.CachedInputTokens, response.OutputTokens).TotalCostUsd,
+                null,
+                pricingSnapshot);
             var plan = ParsePlan(response.OutputText, context, options.PlanningModel);
             return new PlanningEvaluation(plan, call);
         }
@@ -189,10 +193,11 @@ public sealed class OpenAIPlanningEngine(
             var failed = new ModelCallRecord(
                 callId, ModelCallStage.Planning, "OpenAI", options.PlanningModel,
                 options.PlanningReasoningEffort, startedAt, timeProvider.GetUtcNow(), false, response?.ResponseId,
-                response?.InputTokens ?? 0, response?.CachedInputTokens ?? 0, response?.OutputTokens ?? 0,
+                response?.InputTokens, response?.CachedInputTokens, response?.OutputTokens,
                 response?.ReasoningTokens,
-                response is null ? 0m : costCalculator.Calculate(options.PlanningModel, response.InputTokens, response.CachedInputTokens, response.OutputTokens),
-                category);
+                response is null ? null : costCalculator.Calculate(pricingSnapshot, response.InputTokens, response.CachedInputTokens, response.OutputTokens).TotalCostUsd,
+                category,
+                response is null ? null : pricingSnapshot);
             throw new PlanningProviderException(safeMessage, category, failed, exception);
         }
     }
@@ -200,7 +205,8 @@ public sealed class OpenAIPlanningEngine(
     private PlanningProviderException CreateCompletionFailure(
         OpenAIResponseEnvelope response,
         Guid callId,
-        DateTimeOffset startedAt)
+        DateTimeOffset startedAt,
+        ModelPricingSnapshot pricingSnapshot)
     {
         var (category, safeMessage) = response.Status == OpenAIResponseStatus.Incomplete
             ? response.IncompleteReason switch
@@ -218,8 +224,9 @@ public sealed class OpenAIPlanningEngine(
             callId, ModelCallStage.Planning, "OpenAI", options.PlanningModel,
             options.PlanningReasoningEffort, startedAt, timeProvider.GetUtcNow(), false, response.ResponseId,
             response.InputTokens, response.CachedInputTokens, response.OutputTokens, response.ReasoningTokens,
-            costCalculator.Calculate(options.PlanningModel, response.InputTokens, response.CachedInputTokens, response.OutputTokens),
-            category);
+            costCalculator.Calculate(pricingSnapshot, response.InputTokens, response.CachedInputTokens, response.OutputTokens).TotalCostUsd,
+            category,
+            pricingSnapshot);
         return new PlanningProviderException(safeMessage, category, failed);
     }
 

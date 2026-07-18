@@ -10,6 +10,7 @@ using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using UglyToad.PdfPig;
 
 namespace Forge.Api.Tests;
 
@@ -36,6 +37,42 @@ public sealed class EngineeringTaskApiTests : IClassFixture<FakeModeFactory>
         Assert.Equal("AwaitingRequirementApproval", response.GetProperty("status").GetString());
         Assert.Equal(JsonValueKind.Null, response.GetProperty("currentPendingQuestion").ValueKind);
         Assert.False(string.IsNullOrWhiteSpace(response.GetProperty("requirementSummary").GetString()));
+    }
+
+    [Fact]
+    public void Fake_mode_host_uses_an_isolated_temporary_database()
+    {
+        ApiTestDatabaseGuard.AssertIsolated(_factory, _factory.DatabasePath);
+    }
+
+    [Fact]
+    public void OpenAI_no_key_host_uses_an_isolated_temporary_database()
+    {
+        using var factory = new OpenAiNoKeyFactory();
+        ApiTestDatabaseGuard.AssertIsolated(factory, factory.DatabasePath);
+    }
+
+    [Fact]
+    public void API_test_factories_use_distinct_databases_and_remove_them_on_dispose()
+    {
+        var first = new FakeModeFactory();
+        var second = new FakeModeFactory();
+        var firstDirectory = Path.GetDirectoryName(first.DatabasePath)!;
+        var secondDirectory = Path.GetDirectoryName(second.DatabasePath)!;
+        try
+        {
+            ApiTestDatabaseGuard.AssertIsolated(first, first.DatabasePath);
+            ApiTestDatabaseGuard.AssertIsolated(second, second.DatabasePath);
+            Assert.NotEqual(first.DatabasePath, second.DatabasePath);
+        }
+        finally
+        {
+            first.Dispose();
+            second.Dispose();
+        }
+
+        Assert.False(Directory.Exists(firstDirectory));
+        Assert.False(Directory.Exists(secondDirectory));
     }
 
     [Fact]
@@ -140,6 +177,66 @@ public sealed class EngineeringTaskApiTests : IClassFixture<FakeModeFactory>
         Assert.Equal("PlanApproved", persisted.GetProperty("status").GetString());
         Assert.True(persisted.GetProperty("evidenceItems").GetArrayLength() > 0);
         Assert.Equal("DeterministicFake", persisted.GetProperty("implementationPlan").GetProperty("source").GetString());
+    }
+
+    [Fact]
+    public async Task Approved_task_pdf_has_safe_headers_required_content_and_does_not_mutate_task()
+    {
+        const string requirement = "Add report export. Acceptance criteria: export is available. Validation: run focused tests.";
+        var created = await CreateAsync(requirement, _factory.TargetRepositoryPath);
+        var id = created.GetProperty("id").GetGuid();
+        (await _client.PostAsync($"/api/tasks/{id}/requirement-approval", null)).EnsureSuccessStatusCode();
+        (await _client.PostAsync($"/api/tasks/{id}/repository-analysis", null)).EnsureSuccessStatusCode();
+        (await _client.PostAsync($"/api/tasks/{id}/plan", null)).EnsureSuccessStatusCode();
+        (await _client.PostAsync($"/api/tasks/{id}/plan-approval", null)).EnsureSuccessStatusCode();
+        var before = await _client.GetStringAsync($"/api/tasks/{id}");
+
+        var response = await _client.GetAsync($"/api/tasks/{id}/export/pdf");
+        var bytes = await response.Content.ReadAsByteArrayAsync();
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Equal("application/pdf", response.Content.Headers.ContentType?.MediaType);
+        Assert.Equal($"forge-task-{id:D}.pdf", response.Content.Headers.ContentDisposition?.FileNameStar ??
+            response.Content.Headers.ContentDisposition?.FileName?.Trim('"'));
+        Assert.Equal("%PDF", System.Text.Encoding.ASCII.GetString(bytes, 0, 4));
+        using var pdf = PdfDocument.Open(bytes);
+        var text = string.Join('\n', pdf.GetPages().Select(page => page.Text));
+        Assert.Contains(requirement, text);
+        Assert.Contains("estimates, not invoices", text);
+
+        var after = await _client.GetStringAsync($"/api/tasks/{id}");
+        Assert.Equal(before, after);
+    }
+
+    [Fact]
+    public async Task Pdf_export_missing_task_uses_existing_not_found_contract()
+    {
+        var response = await _client.GetAsync($"/api/tasks/{Guid.NewGuid()}/export/pdf");
+        var problem = await response.Content.ReadFromJsonAsync<JsonElement>();
+
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+        Assert.Equal("task_not_found", problem.GetProperty("code").GetString());
+    }
+
+    [Fact]
+    public async Task Pdf_generation_failure_uses_safe_server_error_contract()
+    {
+        await using var factory = new PdfFailureFactory();
+        using var client = factory.CreateClient();
+        var created = await client.PostAsJsonAsync("/api/tasks", new
+        {
+            repository = "C:/repo",
+            requirement = "Add report export. Acceptance criteria: export works. Validation: run tests."
+        });
+        created.EnsureSuccessStatusCode();
+        var id = (await created.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("id").GetGuid();
+
+        var response = await client.GetAsync($"/api/tasks/{id}/export/pdf");
+        var body = await response.Content.ReadAsStringAsync();
+
+        Assert.Equal(HttpStatusCode.InternalServerError, response.StatusCode);
+        Assert.Contains("server_error", body);
+        Assert.DoesNotContain("sensitive-pdf-generator-detail", body);
     }
 
     [Fact]
@@ -372,6 +469,36 @@ public sealed class EngineeringTaskApiTests : IClassFixture<FakeModeFactory>
         Assert.True(capabilities.PlanningAvailable);
     }
 
+    [Fact]
+    public void Task_api_uses_central_resolved_cost_and_exposes_only_stored_per_call_rates()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var task = EngineeringTask.Create("C:/repo", "Add report export", now);
+        var snapshot = new ModelPricingSnapshot(10m, 2m, 20m);
+        task.RecordModelCall(new ModelCallRecord(
+            Guid.NewGuid(), ModelCallStage.Planning, "OpenAI", "model", "medium",
+            now, now, true, "response", 100, 25, 50, 40, 999m, null, snapshot), now);
+        task.RecordModelCall(new ModelCallRecord(
+            Guid.NewGuid(), ModelCallStage.Clarification, "OpenAI", "legacy-model", "low",
+            now, now, true, "legacy-response", 0, 0, 0, 0, 0m, null), now);
+        var calculator = new ModelCostCalculator(new Dictionary<string, ModelPricing>
+        {
+            ["model"] = new(100m, 100m, 100m)
+        });
+
+        var response = EngineeringTaskResponse.FromDomain(task, new ModelCostResolver(calculator));
+
+        var call = Assert.Single(response.Telemetry.Calls, item => item.ProviderResponseId == "response");
+        var legacyCall = Assert.Single(response.Telemetry.Calls, item => item.ProviderResponseId == "legacy-response");
+        Assert.Equal(75, call.UncachedInputTokens);
+        Assert.Equal("stored pricing snapshot", call.PricingProvenance);
+        Assert.Equal("legacy estimate \u2014 pricing snapshot unavailable", legacyCall.PricingProvenance);
+        Assert.Equal(0.0018m, call.EstimatedCostUsd);
+        Assert.Equal(snapshot.InputPerMillionUsd, call.StoredPricingSnapshot?.InputPerMillionUsd);
+        Assert.False(response.Telemetry.IsPartialEstimate);
+        Assert.Equal(0, response.Telemetry.CostUnavailableCallCount);
+    }
+
     private async Task<JsonElement> CreateAsync(string requirement, string repository = "C:/repo")
     {
         var response = await _client.PostAsJsonAsync("/api/tasks", new { repository, requirement });
@@ -383,6 +510,7 @@ public sealed class EngineeringTaskApiTests : IClassFixture<FakeModeFactory>
 public class FakeModeFactory : WebApplicationFactory<Program>
 {
     private readonly string _directory = Path.Combine(Path.GetTempPath(), $"forge-api-tests-{Guid.NewGuid():N}");
+    public string DatabasePath => Path.Combine(_directory, "forge.db");
     public string TargetRepositoryPath
     {
         get
@@ -400,9 +528,10 @@ public class FakeModeFactory : WebApplicationFactory<Program>
     protected override void ConfigureWebHost(IWebHostBuilder builder)
     {
         builder.UseEnvironment("Development");
+        builder.UseSetting("Forge:DatabasePath", DatabasePath);
         builder.ConfigureAppConfiguration((_, configuration) => configuration.AddInMemoryCollection(new Dictionary<string, string?>
         {
-            ["Forge:DatabasePath"] = Path.Combine(_directory, "forge.db"),
+            ["Forge:DatabasePath"] = DatabasePath,
             ["Forge:AI:Mode"] = "Fake"
         }));
     }
@@ -532,15 +661,17 @@ public sealed class MissingDirectEvidenceFactory : FakeModeFactory
 public sealed class OpenAiNoKeyFactory : WebApplicationFactory<Program>
 {
     private readonly string _directory = Path.Combine(Path.GetTempPath(), $"forge-openai-no-key-{Guid.NewGuid():N}");
+    public string DatabasePath => Path.Combine(_directory, "forge.db");
 
     protected override void ConfigureWebHost(IWebHostBuilder builder)
     {
         builder.UseEnvironment("Development");
+        builder.UseSetting("Forge:DatabasePath", DatabasePath);
         builder.UseSetting("Forge:AI:Mode", "OpenAI");
         builder.ConfigureAppConfiguration((_, configuration) => configuration.AddInMemoryCollection(
             new Dictionary<string, string?>
             {
-                ["Forge:DatabasePath"] = Path.Combine(_directory, "forge.db"),
+                ["Forge:DatabasePath"] = DatabasePath,
                 ["Forge:AI:Mode"] = "OpenAI"
             }));
         builder.ConfigureServices(services =>
@@ -555,5 +686,44 @@ public sealed class OpenAiNoKeyFactory : WebApplicationFactory<Program>
         base.Dispose(disposing);
         Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
         if (Directory.Exists(_directory)) Directory.Delete(_directory, true);
+    }
+}
+
+internal static class ApiTestDatabaseGuard
+{
+    public static void AssertIsolated(WebApplicationFactory<Program> factory, string expectedDatabasePath)
+    {
+        using var client = factory.CreateClient();
+        using var response = client.GetAsync("/api/system/capabilities").GetAwaiter().GetResult();
+        Assert.True(response.IsSuccessStatusCode);
+        var configuration = factory.Services.GetRequiredService<IConfiguration>();
+        var environment = factory.Services.GetRequiredService<IWebHostEnvironment>();
+        var configuredPath = configuration["Forge:DatabasePath"];
+        var developmentDatabasePath = Path.GetFullPath(Path.Combine(environment.ContentRootPath, "data", "forge.db"));
+
+        Assert.True(Path.IsPathFullyQualified(expectedDatabasePath));
+        Assert.Equal(expectedDatabasePath, configuredPath);
+        Assert.NotEqual(developmentDatabasePath, Path.GetFullPath(expectedDatabasePath));
+        Assert.StartsWith(Path.GetTempPath(), expectedDatabasePath, StringComparison.OrdinalIgnoreCase);
+        Assert.True(File.Exists(expectedDatabasePath), "The API initializer did not create the isolated test database.");
+    }
+}
+
+public sealed class PdfFailureFactory : FakeModeFactory
+{
+    protected override void ConfigureWebHost(IWebHostBuilder builder)
+    {
+        base.ConfigureWebHost(builder);
+        builder.ConfigureServices(services =>
+        {
+            services.RemoveAll<IEngineeringTaskPdfExporter>();
+            services.AddSingleton<IEngineeringTaskPdfExporter, FailingPdfExporter>();
+        });
+    }
+
+    private sealed class FailingPdfExporter : IEngineeringTaskPdfExporter
+    {
+        public byte[] Export(EngineeringTask task) =>
+            throw new InvalidOperationException("sensitive-pdf-generator-detail");
     }
 }
