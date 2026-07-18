@@ -1,9 +1,14 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
 import { ForgeApiError, forgeApi } from './api'
-import { createTaskPdfDownloader, exportErrorMessage } from './pdfDownload'
+import { createPlanPdfDownloader, createTaskPdfDownloader, exportErrorMessage } from './pdfDownload'
 import { getPlanningRecovery, getReadyPlanningAction } from './planningRecovery'
-import type { EngineeringTask, SystemCapabilities, WorkflowStatus } from './types'
+import { RequirementCopyButton } from './RequirementCopyButton'
+import { createRequirementCopier } from './requirementCopy'
+import type { RequirementCopyState } from './requirementCopy'
+import { TaskHistory } from './TaskHistory'
+import { TaskSelectionCoordinator, newTaskUrl, parseTaskSelection, taskUrl } from './taskNavigation'
+import type { EngineeringTask, EngineeringTaskSummary, SystemCapabilities, WorkflowStatus } from './types'
 import './App.css'
 
 const stages = ['Understand', 'Clarify', 'Confirm', 'Plan', 'Implement', 'Validate', 'Review', 'Pull Request']
@@ -19,6 +24,11 @@ function App() {
   const [planCorrectionMode, setPlanCorrectionMode] = useState(false)
   const [planRevisionInFlight, setPlanRevisionInFlight] = useState(false)
   const [task, setTask] = useState<EngineeringTask | null>(null)
+  const [historyTasks, setHistoryTasks] = useState<EngineeringTaskSummary[]>([])
+  const [historyLoading, setHistoryLoading] = useState(false)
+  const [historyError, setHistoryError] = useState<string | null>(null)
+  const [taskLoading, setTaskLoading] = useState(false)
+  const [taskLoadState, setTaskLoadState] = useState<{ kind: 'invalid' | 'missing' | 'error'; requested: string; message: string } | null>(null)
   const [capabilities, setCapabilities] = useState<SystemCapabilities | null>(null)
   const [capabilitiesUnavailable, setCapabilitiesUnavailable] = useState(false)
   const [busy, setBusy] = useState(false)
@@ -26,109 +36,346 @@ function App() {
   const [planningFailure, setPlanningFailure] = useState<string | null>(null)
   const [planningSnapshotStale, setPlanningSnapshotStale] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [exportingPdf, setExportingPdf] = useState(false)
+  const [exportingPdf, setExportingPdf] = useState<'task' | 'plan' | null>(null)
   const [pdfExportError, setPdfExportError] = useState<string | null>(null)
+  const [copyState, setCopyState] = useState<RequirementCopyState>('idle')
+  const [copyError, setCopyError] = useState<string | null>(null)
+  const [historyPanelOpen, setHistoryPanelOpen] = useState(false)
   const pdfDownloader = useMemo(() => createTaskPdfDownloader(), [])
+  const planPdfDownloader = useMemo(() => createPlanPdfDownloader(), [])
+  const requirementCopier = useMemo(() => createRequirementCopier(), [])
+  const selectionCoordinator = useRef(new TaskSelectionCoordinator())
+  const copyResetTimer = useRef<number | null>(null)
+  const historyToggleButton = useRef<HTMLButtonElement | null>(null)
+  const historyPanelHeading = useRef<HTMLHeadingElement | null>(null)
+  const selectedTaskId = task?.id ?? null
   const activeStage = task ? stageByStatus[task.status] : 0
   const answeredCount = task?.clarificationAnswers.length ?? 0
   const taskLabel = useMemo(() => task ? `FORGE-${task.id.slice(0, 6).toUpperCase()}` : 'NEW TASK', [task])
 
   useEffect(() => {
+    let active = true
     forgeApi.getCapabilities()
-      .then(setCapabilities)
-      .catch(() => setCapabilitiesUnavailable(true))
+      .then(value => {
+        if (!active) return
+        setCapabilities(value)
+        setCapabilitiesUnavailable(false)
+      })
+      .catch(() => {
+        if (!active) return
+        setCapabilitiesUnavailable(true)
+      })
+    return () => { active = false }
   }, [])
 
-  async function run(action: () => Promise<EngineeringTask>) {
-    setBusy(true); setError(null)
-    try { setTask(await action()) }
-    catch (caught) { setError(caught instanceof Error ? caught.message : 'An unexpected error occurred.') }
-    finally { setBusy(false) }
+  async function loadHistory() {
+    setHistoryLoading(true); setHistoryError(null)
+    try { setHistoryTasks(await forgeApi.listTasks()) }
+    catch { setHistoryError('Task history is temporarily unavailable.') }
+    finally { setHistoryLoading(false) }
   }
 
-  function createTask(event: FormEvent) { event.preventDefault(); void run(() => forgeApi.createTask(repository, requirement)) }
+  function clearCopyResetTimer() {
+    if (copyResetTimer.current === null) return
+    window.clearTimeout(copyResetTimer.current)
+    copyResetTimer.current = null
+  }
+
+  function resetTaskScopedUi() {
+    clearCopyResetTimer()
+    setBusy(false)
+    setPlanningProgress(null)
+    setPlanningFailure(null)
+    setPlanningSnapshotStale(false)
+    setError(null)
+    setExportingPdf(null)
+    setPdfExportError(null)
+    setCopyState('idle')
+    setCopyError(null)
+    setPlanRevisionInFlight(false)
+  }
+
+  function captureTaskSelection(taskId: string) {
+    const token = selectionCoordinator.current.capture()
+    return token.taskId === taskId ? token : null
+  }
+
+  async function loadSelection(search: string) {
+    const selection = parseTaskSelection(search)
+    const token = selectionCoordinator.current.begin(selection.kind === 'task' ? selection.id : null)
+    resetTaskScopedUi()
+    if (selection.kind === 'new') {
+      setTask(null); setTaskLoadState(null); setTaskLoading(false)
+      await loadHistory(); return
+    }
+    if (selection.kind === 'invalid') {
+      setTask(null); setTaskLoading(false)
+      setTaskLoadState({ kind: 'invalid', requested: selection.requested, message: 'The task link contains an invalid task identifier.' }); return
+    }
+    setTask(null); setTaskLoading(true); setTaskLoadState(null)
+    try {
+      const loaded = await forgeApi.getTask(selection.id)
+      if (!selectionCoordinator.current.matches(token)) return
+      setTaskLoading(false)
+      setTask(loaded)
+    } catch (caught) {
+      if (!selectionCoordinator.current.matches(token)) return
+      setTaskLoading(false)
+      const missing = caught instanceof ForgeApiError && caught.code === 'task_not_found'
+      setTaskLoadState({
+        kind: missing ? 'missing' : 'error',
+        requested: selection.id,
+        message: missing ? 'The requested task was not found.' : 'The requested task could not be loaded.',
+      })
+    }
+  }
+
+  useEffect(() => {
+    const coordinator = selectionCoordinator.current
+    const handleLocation = () => { void loadSelection(window.location.search) }
+    handleLocation()
+    window.addEventListener('popstate', handleLocation)
+    return () => {
+      window.removeEventListener('popstate', handleLocation)
+      coordinator.invalidate()
+    }
+  }, [])
+
+  useEffect(() => {
+    return clearCopyResetTimer
+  }, [])
+
+  useEffect(() => {
+    setHistoryPanelOpen(false)
+  }, [selectedTaskId])
+
+  useEffect(() => {
+    if (selectedTaskId === null || !historyPanelOpen) return
+    void loadHistory()
+  }, [historyPanelOpen, selectedTaskId])
+
+  useEffect(() => {
+    if (!historyPanelOpen) return
+    historyPanelHeading.current?.focus()
+    const button = historyToggleButton.current
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return
+      event.preventDefault()
+      setHistoryPanelOpen(false)
+      button?.focus()
+    }
+
+    window.addEventListener('keydown', handleEscape)
+    return () => window.removeEventListener('keydown', handleEscape)
+  }, [historyPanelOpen])
+
+  async function runTaskAction(taskId: string, action: () => Promise<EngineeringTask>, onSuccess?: () => void) {
+    const token = captureTaskSelection(taskId)
+    if (!token) return
+    setBusy(true); setError(null)
+    try {
+      const updated = await action()
+      if (!selectionCoordinator.current.matches(token)) return
+      setTask(updated)
+      onSuccess?.()
+    }
+    catch (caught) {
+      if (!selectionCoordinator.current.matches(token)) return
+      setError(caught instanceof Error ? caught.message : 'An unexpected error occurred.')
+    }
+    finally {
+      if (selectionCoordinator.current.matches(token)) setBusy(false)
+    }
+  }
+
+  function createTask(event: FormEvent) {
+    event.preventDefault()
+    const token = selectionCoordinator.current.capture()
+    if (token.taskId !== null) return
+    setBusy(true); setError(null)
+    void (async () => {
+      const created = await forgeApi.createTask(repository, requirement)
+      if (!selectionCoordinator.current.matches(token)) return
+      setBusy(false)
+      window.history.pushState(null, '', taskUrl(created.id))
+      selectionCoordinator.current.begin(created.id)
+      setTask(created)
+      setTaskLoadState(null)
+      setTaskLoading(false)
+    })().catch(caught => {
+      if (!selectionCoordinator.current.matches(token)) return
+      setError(caught instanceof Error ? caught.message : 'An unexpected error occurred.')
+      setBusy(false)
+    })
+  }
   function submitAnswer(event: FormEvent) {
     event.preventDefault(); if (!task) return
     const submitted = answer
-    void run(async () => { const updated = await forgeApi.answerQuestion(task.id, submitted); setAnswer(''); return updated })
+    void runTaskAction(task.id, () => forgeApi.answerQuestion(task.id, submitted), () => setAnswer(''))
   }
   function submitCorrection(event: FormEvent) {
     event.preventDefault(); if (!task) return
     const submitted = correction
-    void run(async () => {
-      const updated = await forgeApi.requestRevision(task.id, submitted)
-      setCorrection(''); setCorrectionMode(false)
-      return updated
+    void runTaskAction(task.id, () => forgeApi.requestRevision(task.id, submitted), () => {
+      setCorrection('')
+      setCorrectionMode(false)
     })
   }
-  function approveSummary() { if (task) void run(() => forgeApi.approveRequirement(task.id)) }
+  function approveSummary() { if (task) void runTaskAction(task.id, () => forgeApi.approveRequirement(task.id)) }
   async function analyzeAndPlan() {
     if (!task) return
+    const token = captureTaskSelection(task.id)
+    if (!token) return
     let repositoryAnalyzed = false
     setBusy(true); setError(null); setPlanningFailure(null); setPlanningSnapshotStale(false); setPlanningProgress(0)
     try {
       const analyzed = await forgeApi.analyzeRepository(task.id)
+      if (!selectionCoordinator.current.matches(token)) return
       repositoryAnalyzed = true; setTask(analyzed); setPlanningProgress(2)
       const planned = await forgeApi.createPlan(task.id)
+      if (!selectionCoordinator.current.matches(token)) return
       setTask(planned); setPlanningProgress(3)
     } catch (caught) {
+      if (!selectionCoordinator.current.matches(token)) return
       const message = caught instanceof Error ? caught.message : 'Planning could not be completed.'
       if (repositoryAnalyzed) {
-        try { setTask(await forgeApi.getTask(task.id)) } catch { /* Keep the analyzed task if refresh fails. */ }
+        try {
+          const refreshed = await forgeApi.getTask(task.id)
+          if (!selectionCoordinator.current.matches(token)) return
+          setTask(refreshed)
+        } catch {
+          if (!selectionCoordinator.current.matches(token)) return
+        }
         setPlanningSnapshotStale(caught instanceof ForgeApiError && caught.code === 'stale_snapshot')
         setPlanningFailure(message)
       }
       else setError(message)
     }
-    finally { setBusy(false) }
+    finally {
+      if (selectionCoordinator.current.matches(token)) setBusy(false)
+    }
   }
   async function retryPlanGeneration() {
     if (!task || (task.status !== 'Planning' && task.status !== 'ReadyForPlanning')) return
+    const token = captureTaskSelection(task.id)
+    if (!token) return
     setBusy(true); setError(null); setPlanningFailure(null); setPlanningSnapshotStale(false); setPlanningProgress(2)
     try {
       const planned = await forgeApi.createPlan(task.id)
+      if (!selectionCoordinator.current.matches(token)) return
       setTask(planned); setPlanningProgress(3)
     } catch (caught) {
-      try { setTask(await forgeApi.getTask(task.id)) } catch { /* Keep the current task if refresh fails. */ }
+      if (!selectionCoordinator.current.matches(token)) return
+      try {
+        const refreshed = await forgeApi.getTask(task.id)
+        if (!selectionCoordinator.current.matches(token)) return
+        setTask(refreshed)
+      } catch {
+        if (!selectionCoordinator.current.matches(token)) return
+      }
       setPlanningSnapshotStale(caught instanceof ForgeApiError && caught.code === 'stale_snapshot')
       setPlanningFailure(caught instanceof Error ? caught.message : 'Planning could not be completed.')
-    } finally { setBusy(false) }
+    } finally {
+      if (selectionCoordinator.current.matches(token)) setBusy(false)
+    }
   }
   async function refreshEvidence() {
     if (!task || task.status !== 'Planning') return
+    const token = captureTaskSelection(task.id)
+    if (!token) return
     setBusy(true); setError(null); setPlanningFailure(null); setPlanningSnapshotStale(false)
     try {
       const refreshed = await forgeApi.refreshEvidence(task.id)
+      if (!selectionCoordinator.current.matches(token)) return
       setTask(refreshed)
     } catch (caught) {
-      try { setTask(await forgeApi.getTask(task.id)) } catch { /* Keep the failed planning task if refresh fails. */ }
+      if (!selectionCoordinator.current.matches(token)) return
+      try {
+        const refreshed = await forgeApi.getTask(task.id)
+        if (!selectionCoordinator.current.matches(token)) return
+        setTask(refreshed)
+      } catch {
+        if (!selectionCoordinator.current.matches(token)) return
+      }
       setPlanningSnapshotStale(caught instanceof ForgeApiError && caught.code === 'stale_snapshot')
       setPlanningFailure(caught instanceof Error ? caught.message : 'Repository evidence could not be refreshed.')
-    } finally { setBusy(false) }
+    } finally {
+      if (selectionCoordinator.current.matches(token)) setBusy(false)
+    }
   }
   async function submitPlanCorrection(event: FormEvent) {
     event.preventDefault()
     if (!task || task.status !== 'AwaitingPlanApproval' || !planCorrection.trim()) return
+    const token = captureTaskSelection(task.id)
+    if (!token) return
     const submitted = planCorrection
     setBusy(true); setPlanRevisionInFlight(true); setError(null); setPlanningFailure(null); setPlanningSnapshotStale(false)
     try {
       const revised = await forgeApi.requestPlanRevision(task.id, submitted)
+      if (!selectionCoordinator.current.matches(token)) return
       setTask(revised); setPlanCorrection(''); setPlanCorrectionMode(false)
     } catch (caught) {
-      try { setTask(await forgeApi.getTask(task.id)) } catch { /* Keep the reviewed plan visible if refresh fails. */ }
+      if (!selectionCoordinator.current.matches(token)) return
+      try {
+        const refreshed = await forgeApi.getTask(task.id)
+        if (!selectionCoordinator.current.matches(token)) return
+        setTask(refreshed)
+      } catch {
+        if (!selectionCoordinator.current.matches(token)) return
+      }
       setPlanningSnapshotStale(caught instanceof ForgeApiError && caught.code === 'stale_snapshot')
       setPlanningFailure(caught instanceof Error ? caught.message : 'The plan correction could not be completed.')
-    } finally { setPlanRevisionInFlight(false); setBusy(false) }
+    } finally {
+      if (selectionCoordinator.current.matches(token)) {
+        setPlanRevisionInFlight(false)
+        setBusy(false)
+      }
+    }
   }
-  function approvePlan() { if (task) void run(() => forgeApi.approvePlan(task.id)) }
-  async function exportPdf() {
-    if (!task || task.status !== 'PlanApproved' || pdfDownloader.isActive) return
-    setExportingPdf(true); setPdfExportError(null)
-    try { await pdfDownloader.run(task.id) }
-    catch (caught) { setPdfExportError(exportErrorMessage(caught)) }
-    finally { setExportingPdf(false) }
+  function approvePlan() { if (task) void runTaskAction(task.id, () => forgeApi.approvePlan(task.id)) }
+  async function exportPdf(documentType: 'task' | 'plan') {
+    if (!task || exportingPdf || (documentType === 'task' && task.status !== 'PlanApproved')) return
+    const token = captureTaskSelection(task.id)
+    if (!token) return
+    const downloader = documentType === 'task' ? pdfDownloader : planPdfDownloader
+    if (downloader.isActive) return
+    setExportingPdf(documentType); setPdfExportError(null)
+    try { await downloader.run(task.id) }
+    catch (caught) {
+      if (!selectionCoordinator.current.matches(token)) return
+      setPdfExportError(exportErrorMessage(caught))
+    }
+    finally {
+      if (selectionCoordinator.current.matches(token)) setExportingPdf(null)
+    }
   }
-  function startAnother() { setTask(null); setRepository(''); setRequirement(''); setAnswer(''); setCorrection(''); setCorrectionMode(false); setPlanCorrection(''); setPlanCorrectionMode(false); setPlanningFailure(null); setPlanningSnapshotStale(false); setPdfExportError(null); setError(null) }
+  async function copyRequirement() {
+    if (!task?.requirementSummary || requirementCopier.isPending) return
+    const token = captureTaskSelection(task.id)
+    if (!token) return
+    setCopyState('pending'); setCopyError(null)
+    try {
+      await requirementCopier.run(task.requirementSummary)
+      if (!selectionCoordinator.current.matches(token)) return
+      setCopyState('copied')
+      clearCopyResetTimer()
+      copyResetTimer.current = window.setTimeout(() => setCopyState('idle'), 2500)
+    } catch {
+      if (!selectionCoordinator.current.matches(token)) return
+      setCopyState('error')
+      setCopyError('The requirement could not be copied. Check clipboard permission and try again.')
+    }
+  }
+  function navigateTo(url: string) {
+    setHistoryPanelOpen(false)
+    window.history.pushState(null, '', url)
+    void loadSelection(window.location.search)
+  }
+  function selectHistoryTask(id: string) { navigateTo(taskUrl(id)) }
+  function startAnother() {
+    setRepository(''); setRequirement(''); setAnswer(''); setCorrection(''); setCorrectionMode(false); setPlanCorrection(''); setPlanCorrectionMode(false)
+    navigateTo(newTaskUrl())
+  }
 
   const telemetry = task?.telemetry ?? { totalCalls: 0, totalInputTokens: 0, totalCachedInputTokens: 0, totalOutputTokens: 0, totalEstimatedCostUsd: 0, costUnavailableCallCount: 0, isPartialEstimate: false, calls: [] }
   const clarificationCalls = telemetry.calls.filter(call => call.stage === 'Clarification')
@@ -165,13 +412,42 @@ function App() {
       <div className="workspace">
         <section className="action-card" aria-busy={busy}>
           <div className="card-heading"><div><span className="section-number">{task ? String(activeStage + 1).padStart(2, '0') : '01'}</span><p>{task ? stages[activeStage].toUpperCase() : 'UNDERSTAND'}</p></div>{task && <span className="status-pill"><i />{formatStatus(task.status)}</span>}</div>
-          {!task && <form className="task-form" onSubmit={createTask}>
+          {task && <div className="task-navigation-strip">
+            <div className="task-navigation-actions">
+              <button
+                ref={historyToggleButton}
+                type="button"
+                className="secondary-button"
+                aria-expanded={historyPanelOpen}
+                aria-controls="selected-task-history"
+                onClick={() => setHistoryPanelOpen(open => !open)}>
+                Task history
+              </button>
+              <button type="button" className="secondary-button" onClick={startAnother}>New task</button>
+            </div>
+            <p>Switch tasks or return to the blank task form without changing persisted task data.</p>
+          </div>}
+          {task && historyPanelOpen && <section className="selected-task-history-panel" id="selected-task-history" aria-labelledby="selected-task-history-heading">
+            <div className="selected-task-history-header">
+              <div>
+                <p className="eyebrow">TASK NAVIGATION</p>
+                <h2 id="selected-task-history-heading" tabIndex={-1} ref={historyPanelHeading}>Recent tasks</h2>
+              </div>
+              <button type="button" className="text-button" onClick={() => { setHistoryPanelOpen(false); historyToggleButton.current?.focus() }}>
+                Close history
+              </button>
+            </div>
+            <TaskHistory tasks={historyTasks} loading={historyLoading} error={historyError} selectedId={task.id} onSelect={selectHistoryTask} onRetry={() => void loadHistory()} />
+          </section>}
+          {!task && taskLoading && <div className="task-load-state" role="status"><span className="spinner dark" /><h2>Loading persisted task…</h2><p>The task is being reopened without changing its workflow state.</p></div>}
+          {!task && taskLoadState && <div className="task-load-state" role="alert"><div className="failure-seal">!</div><h2>{taskLoadState.kind === 'invalid' ? 'Invalid task link' : taskLoadState.kind === 'missing' ? 'Task not found' : 'Task unavailable'}</h2><p>{taskLoadState.message}</p><code>{taskLoadState.requested || '(empty task identifier)'}</code><div className="load-state-actions">{taskLoadState.kind !== 'invalid' && <button type="button" className="secondary-button" onClick={() => void loadSelection(window.location.search)}>Retry task</button>}<button type="button" className="primary-button compact" onClick={startAnother}>Return to new task</button></div></div>}
+          {!task && !taskLoading && !taskLoadState && <><form className="task-form" onSubmit={createTask}>
             <div className="action-title"><span className="title-icon">⌁</span><div><h2>What are we building?</h2><p>Point Forge at a local repository and describe the outcome you need.</p></div></div>
             <label><span>LOCAL REPOSITORY PATH</span><div className="input-frame"><span aria-hidden="true">⌘</span><input value={repository} onChange={event => setRepository(event.target.value)} placeholder="C:\Projects\your-repository" required /></div></label>
             <label><span>REQUIREMENT OR WORK ITEM</span><textarea value={requirement} onChange={event => setRequirement(event.target.value)} placeholder="Describe the change, why it matters, and any known constraints…" rows={7} maxLength={10000} required /><small>{requirement.length.toLocaleString()} / 10,000</small></label>
             <button className="primary-button" disabled={busy || !repository.trim() || !requirement.trim()}>{busy ? <><span className="spinner" />Evaluating…</> : <>Analyze requirement <span>→</span></>}</button>
             <p className="form-note"><span>i</span> Repository inspection occurs read-only only after requirement approval.</p>
-          </form>}
+          </form><TaskHistory tasks={historyTasks} loading={historyLoading} error={historyError} selectedId={null} onSelect={selectHistoryTask} onRetry={() => void loadHistory()} /></>}
           {task?.status === 'Clarifying' && task.currentPendingQuestion && <form className="question-form" onSubmit={submitAnswer}>
             <div className="question-count"><span>QUESTION {answeredCount + 1}</span><span className="single-question-note">ONE AT A TIME</span></div>
             <div className="action-title"><span className="title-icon">?</span><div><h2>One detail before we continue</h2><p>Only the highest-value unresolved question is shown.</p></div></div>
@@ -182,11 +458,11 @@ function App() {
           </form>}
           {task?.status === 'AwaitingRequirementApproval' && task.requirementSummary && <div className="summary-view">
             <div className="action-title"><span className="title-icon">✓</span><div><h2>Confirm the requirement</h2><p>Approve the current summary or request one focused correction.</p></div></div>
-            <div className="summary-paper"><span className="paper-label">CURRENT REQUIREMENT SUMMARY</span><pre>{task.requirementSummary}</pre></div>
+            <div className="summary-paper"><div className="paper-toolbar"><span className="paper-label">CURRENT REQUIREMENT SUMMARY</span><RequirementCopyButton state={copyState} onCopy={() => void copyRequirement()} /></div><pre>{task.requirementSummary}</pre>{copyState === 'copied' && <p className="copy-success" role="status">Copied to clipboard.</p>}{copyError && <p className="copy-error" role="alert">{copyError}</p>}</div>
             {!correctionMode ? <div className="approval-row"><p><strong>Explicit approval required</strong><br />Approval locks this summary as planning context.</p><div className="approval-actions"><button className="secondary-button" onClick={() => setCorrectionMode(true)}>Request correction</button><button className="primary-button compact" onClick={approveSummary} disabled={busy}>Approve requirement <span>→</span></button></div></div>
               : <form className="correction-form" onSubmit={submitCorrection}><div><strong>Request a correction</strong><p>The current summary will be preserved in revision history and regenerated.</p></div><label><span>CORRECTION NOTE</span><textarea autoFocus value={correction} onChange={event => setCorrection(event.target.value)} placeholder="State only what should change…" rows={4} maxLength={5000} required /></label><div className="approval-actions"><button type="button" className="secondary-button" onClick={() => { setCorrectionMode(false); setCorrection('') }}>Cancel</button><button className="primary-button compact" disabled={busy || !correction.trim()}>{busy ? 'Regenerating…' : 'Submit correction'}</button></div></form>}
           </div>}
-          {task?.status === 'ReadyForPlanning' && <div className="ready-view"><div className="success-seal">✓</div><p className="eyebrow">{readyPlanningAction.eyebrow}</p><h2>Ready for evidence-backed planning</h2><p>{readyPlanningAction.usesSavedEvidence ? 'The refreshed evidence is saved. Generate the plan only when you are ready to make one explicit provider call.' : 'Forge will inspect the repository read-only, select bounded evidence, and use the configured planning provider.'}</p><div className="coming-next"><span>04</span><div><strong>Read-only planning</strong><p>No files, Git state, packages, builds, or tests will be changed.</p></div><button className="primary-button compact" onClick={() => void (readyPlanningAction.usesSavedEvidence ? retryPlanGeneration() : analyzeAndPlan())} disabled={busy}>{readyPlanningAction.button}</button></div><button className="text-button" onClick={startAnother}>Start another task</button></div>}
+          {task?.status === 'ReadyForPlanning' && <div className="ready-view"><div className="success-seal">✓</div><p className="eyebrow">{readyPlanningAction.eyebrow}</p><h2>Ready for evidence-backed planning</h2><p>{readyPlanningAction.usesSavedEvidence ? 'The refreshed evidence is saved. Generate the plan only when you are ready to make one explicit provider call.' : 'Forge will inspect the repository read-only, select bounded evidence, and use the configured planning provider.'}</p><div className="coming-next"><span>04</span><div><strong>Read-only planning</strong><p>No files, Git state, packages, builds, or tests will be changed.</p></div><button className="primary-button compact" onClick={() => void (readyPlanningAction.usesSavedEvidence ? retryPlanGeneration() : analyzeAndPlan())} disabled={busy}>{readyPlanningAction.button}</button></div></div>}
           {task?.status === 'Planning' && planningFailureMessage && !busy && <div className="planning-failure"><div className="failure-seal">!</div><p className="eyebrow">PLAN GENERATION FAILED</p><h2>{planningRecovery.heading}</h2><p>{planningFailureMessage}</p>{latestFailedPlanningCall && <div className="failed-call-summary"><strong>{latestFailedPlanningCall.model} · {latestFailedPlanningCall.failureCategory}</strong><span>{(latestFailedPlanningCall.outputTokens ?? 0).toLocaleString()} output tokens · {latestFailedPlanningCall.estimatedCostUsd === null ? 'cost unavailable' : `estimated $${latestFailedPlanningCall.estimatedCostUsd.toFixed(6)}`}</span></div>}{planningRecovery.action === 'reanalyze' ? <button className="primary-button compact" onClick={() => void analyzeAndPlan()} disabled={busy}>Re-analyze repository and create plan <span>→</span></button> : planningRecovery.action === 'refresh' ? <button className="primary-button compact" onClick={() => void refreshEvidence()} disabled={busy}>Refresh evidence <span>→</span></button> : <button className="primary-button compact" onClick={() => void retryPlanGeneration()} disabled={busy}>Retry plan generation <span>→</span></button>}<small>{planningRecovery.note}</small></div>}
           {task?.status === 'Planning' && task.planRevisionNotes.length > 0 && !busy && <section className="plan-revision-history"><small>PREVIOUS PLAN PRESERVED</small>{task.planRevisionNotes.map((revision, index) => <article key={revision.submittedAt}><strong>Revision {index + 1}: {revision.previousPlanTitle}</strong><p>{revision.correction}</p><code>{revision.previousAffectedPaths.join(', ') || 'No affected paths'}</code></article>)}</section>}
           {((task?.status === 'Planning' && !planningFailureMessage) || planningProgress !== null && busy) && <div className="planning-progress"><div className="action-title"><span className="title-icon">04</span><div><h2>Creating an evidence-backed plan</h2><p>The target remains read-only throughout analysis.</p></div></div>{['Inspecting repository', 'Selecting evidence', 'Creating evidence-backed plan', 'Awaiting approval'].map((label, index) => <div className={`planning-progress-step ${index < (planningProgress ?? 0) ? 'complete' : index === (planningProgress ?? 0) ? 'active' : ''}`} key={label}><span>{index < (planningProgress ?? 0) ? '✓' : index + 1}</span><p>{label}</p></div>)}</div>}
@@ -202,10 +478,12 @@ function App() {
             <section className="plan-section"><small>PROPOSED VALIDATION · NOT RUN</small>{task.implementationPlan.proposedValidationCommands.map(command => <code className="validation-command" key={command}>{command}</code>)}</section>
             <div className="plan-columns"><section className="plan-section"><small>RISKS</small><ul>{task.implementationPlan.risks.map(risk => <li key={risk}>{risk}</li>)}</ul></section><section className="plan-section"><small>ASSUMPTIONS</small><ul>{task.implementationPlan.assumptions.map(assumption => <li key={assumption}>{assumption}</li>)}</ul></section></div>
             {task.implementationPlan.unresolvedQuestions.length > 0 && <section className="plan-section"><small>UNRESOLVED QUESTIONS</small><ul>{task.implementationPlan.unresolvedQuestions.map(question => <li key={question}>{question}</li>)}</ul></section>}
+            <div className="plan-download-row"><div><strong>Proposed plan document</strong><p>Exports this persisted plan marked as not approved.</p></div><button type="button" className="secondary-button" onClick={() => void exportPdf('plan')} disabled={exportingPdf !== null}>{exportingPdf === 'plan' ? 'Generating proposed plan…' : 'Download proposed plan'}</button></div>
+            {pdfExportError && <p className="export-error" role="alert">{pdfExportError}</p>}
             {!planCorrectionMode ? <div className="approval-row"><p><strong>Explicit plan approval required</strong><br />Approve this plan or request one focused correction.</p><div className="approval-actions"><button className="secondary-button" onClick={() => void analyzeAndPlan()} disabled={busy}>Re-analyze repository</button><button className="secondary-button" onClick={() => setPlanCorrectionMode(true)} disabled={busy}>Request plan correction</button><button className="primary-button compact" onClick={approvePlan} disabled={busy}>Approve plan <span>→</span></button></div></div>
               : <form className="correction-form plan-correction-form" onSubmit={submitPlanCorrection}><div><strong>Request one focused plan correction</strong><p>Forge will reuse the fresh snapshot, refresh only relevant evidence, preserve this plan in history, and make exactly one planning request.</p></div><label><span>PLAN CORRECTION</span><textarea autoFocus value={planCorrection} onChange={event => setPlanCorrection(event.target.value)} placeholder="State the specific gap to correct without restating the full requirement…" rows={5} maxLength={5000} required /><small>{planCorrection.length.toLocaleString()} / 5,000</small></label>{planRevisionInFlight && <div className="revision-progress" aria-live="polite"><span>Checking saved snapshot</span><span>Refreshing targeted evidence</span><span>Generating revised plan</span></div>}<div className="approval-actions"><button type="button" className="secondary-button" onClick={() => { setPlanCorrectionMode(false); setPlanCorrection('') }} disabled={busy}>Cancel</button><button className="primary-button compact" disabled={busy || !planCorrection.trim()}>{planRevisionInFlight ? <><span className="spinner" />Revising plan…</> : 'Submit correction'}</button></div></form>}
           </div>}
-          {task?.status === 'PlanApproved' && <div className="ready-view"><div className="success-seal">✓</div><p className="eyebrow">PLAN APPROVED</p><h2>Your engineering task report is ready.</h2><p>Download a server-generated PDF containing the approved requirement, clarification history, and model-call cost provenance.</p><div className="export-actions"><button className="primary-button compact" onClick={() => void exportPdf()} disabled={exportingPdf}>{exportingPdf ? <><span className="spinner" />Generating PDF…</> : 'Download task PDF'}</button><button className="text-button" onClick={startAnother} disabled={exportingPdf}>Start another task</button></div>{pdfExportError && <p className="export-error" role="alert">{pdfExportError}</p>}</div>}
+          {task?.status === 'PlanApproved' && <div className="ready-view"><div className="success-seal">✓</div><p className="eyebrow">PLAN APPROVED</p><h2>Your plan and task report are ready.</h2><p>The approved plan PDF contains the implementation plan. The separate task report contains the requirement, clarification history, and complete model-call cost provenance.</p><div className="export-actions"><button className="primary-button compact" onClick={() => void exportPdf('plan')} disabled={exportingPdf !== null}>{exportingPdf === 'plan' ? <><span className="spinner" />Generating plan…</> : 'Download approved plan'}</button><button className="secondary-button" onClick={() => void exportPdf('task')} disabled={exportingPdf !== null}>{exportingPdf === 'task' ? 'Generating task report…' : 'Download task report PDF'}</button></div>{pdfExportError && <p className="export-error" role="alert">{pdfExportError}</p>}</div>}
           {task && task.evidenceItems.length > 0 && <section className="evidence-view"><div className="evidence-heading"><div><p className="eyebrow">SELECTED REPOSITORY EVIDENCE</p><h3>{task.evidenceFilesSelected} files · {task.totalEvidenceCharacters.toLocaleString()} characters</h3></div><span>{task.evidenceFilesInspected} eligible files inspected</span></div>{task.evidenceItems.map(item => <details className="evidence-item" key={item.id}><summary><b>{item.id}</b><code>{item.relativePath}:{item.startLine}-{item.endLine}</code><span>score {item.score}</span></summary><p>{item.reasonSelected}</p><pre>{item.excerpt}</pre></details>)}</section>}
         </section>
         <aside className="context-column">

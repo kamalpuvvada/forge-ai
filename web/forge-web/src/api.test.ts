@@ -35,4 +35,17 @@ describe('task PDF API helper', () => {
       message: 'The server could not generate this PDF.', code: 'server_error',
     } satisfies Partial<ForgeApiError>)
   })
+
+  it('lists task summaries and downloads plan PDFs from distinct routes', async () => {
+    const fetch = vi.fn()
+      .mockResolvedValueOnce(new Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } }))
+      .mockResolvedValueOnce(new Response(new Blob(['%PDF']), { status: 200,
+        headers: { 'Content-Disposition': 'attachment; filename="forge-plan-abc.pdf"' } }))
+    vi.stubGlobal('fetch', fetch)
+
+    await expect(forgeApi.listTasks()).resolves.toEqual([])
+    await expect(forgeApi.exportPlanPdf('abc')).resolves.toMatchObject({ filename: 'forge-plan-abc.pdf' })
+    expect(fetch).toHaveBeenNthCalledWith(2, '/api/tasks/abc/export/plan-pdf', { headers: { Accept: 'application/pdf' } })
+    expect(parseSafePdfFilename('attachment; filename="../bad.pdf"', 'abc', 'plan')).toBe('forge-plan-abc.pdf')
+  })
 })

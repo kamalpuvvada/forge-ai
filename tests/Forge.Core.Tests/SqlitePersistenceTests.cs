@@ -1,6 +1,7 @@
 using Forge.Core;
 using Forge.Infrastructure;
 using Microsoft.Data.Sqlite;
+using System.Text;
 
 namespace Forge.Core.Tests;
 
@@ -9,6 +10,88 @@ public sealed class SqlitePersistenceTests : IDisposable
     private readonly string _directory = Path.Combine(Path.GetTempPath(), $"forge-tests-{Guid.NewGuid():N}");
     private string DatabasePath => Path.Combine(_directory, "forge.db");
     private string ConnectionString => $"Data Source={DatabasePath}";
+
+    [Fact]
+    public async Task Recent_history_is_empty_for_a_new_database()
+    {
+        await new SqliteDatabaseInitializer(ConnectionString).InitializeAsync();
+        var repository = new SqliteEngineeringTaskRepository(ConnectionString);
+
+        var summaries = await repository.ListRecentAsync(50);
+
+        Assert.Empty(summaries);
+    }
+
+    [Fact]
+    public async Task Recent_history_is_lightweight_descending_bounded_and_does_not_mutate_details()
+    {
+        await new SqliteDatabaseInitializer(ConnectionString).InitializeAsync();
+        var repository = new SqliteEngineeringTaskRepository(ConnectionString);
+        var start = new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
+        EngineeringTask? newest = null;
+        for (var index = 0; index < 55; index++)
+        {
+            var requirement = index == 54
+                ? string.Join("  \n", Enumerable.Repeat("complete requirement preview", 12))
+                : $"Requirement {index}";
+            var task = EngineeringTask.Create($"repo-{index}", requirement, start.AddMinutes(index));
+            task.ApplyClarificationEvaluation(ClarificationEvaluation.Summarize($"Summary {index}"), start.AddMinutes(index));
+            await repository.SaveAsync(task);
+            newest = task;
+        }
+        var before = System.Text.Json.JsonSerializer.Serialize(await repository.GetAsync(newest!.Id));
+
+        var summaries = await repository.ListRecentAsync(50);
+        var after = System.Text.Json.JsonSerializer.Serialize(await repository.GetAsync(newest.Id));
+
+        Assert.Equal(50, summaries.Count);
+        Assert.Equal(newest.Id, summaries[0].Id);
+        Assert.True(summaries.Zip(summaries.Skip(1)).All(pair => pair.First.UpdatedAt >= pair.Second.UpdatedAt));
+        Assert.All(summaries, summary => Assert.InRange(summary.OriginalRequirementPreview.Length, 1, 160));
+        Assert.NotEqual(newest.OriginalRequirement, summaries[0].OriginalRequirementPreview);
+        Assert.DoesNotContain('\n', summaries[0].OriginalRequirementPreview);
+        Assert.Equal(before, after);
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => repository.ListRecentAsync(51));
+    }
+
+    [Fact]
+    public async Task Recent_history_preview_truncates_on_rune_boundaries_with_a_160_character_maximum()
+    {
+        await new SqliteDatabaseInitializer(ConnectionString).InitializeAsync();
+        var repository = new SqliteEngineeringTaskRepository(ConnectionString);
+        var crossingBoundary = new string('a', 159) + "\U0001F680 trailing text";
+        var exactBoundary = new string('b', 158) + "\U0001F680";
+        await repository.SaveAsync(EngineeringTask.Create("repo-crossing", crossingBoundary, DateTimeOffset.UtcNow));
+        await repository.SaveAsync(EngineeringTask.Create("repo-exact", exactBoundary, DateTimeOffset.UtcNow.AddMinutes(1)));
+
+        var summaries = await repository.ListRecentAsync(50);
+        var exactPreview = summaries.Single(item => item.Repository == "repo-exact").OriginalRequirementPreview;
+        var crossingPreview = summaries.Single(item => item.Repository == "repo-crossing").OriginalRequirementPreview;
+
+        Assert.Equal(160, exactPreview.Length);
+        Assert.EndsWith("\U0001F680", exactPreview, StringComparison.Ordinal);
+        Assert.Equal(160, crossingPreview.Length);
+        Assert.EndsWith("\u2026", crossingPreview, StringComparison.Ordinal);
+        Assert.False(crossingPreview.EndsWith("\ud83d", StringComparison.Ordinal));
+        Assert.All(summaries.Select(item => item.OriginalRequirementPreview), AssertNoUnpairedSurrogates);
+    }
+
+    [Fact]
+    public async Task Recent_history_preview_normalizes_whitespace_without_unnecessary_ellipsis()
+    {
+        await new SqliteDatabaseInitializer(ConnectionString).InitializeAsync();
+        var repository = new SqliteEngineeringTaskRepository(ConnectionString);
+        const string requirement = "  ship\tportable  export \n with   evidence  ";
+        await repository.SaveAsync(EngineeringTask.Create("repo-preview", requirement, DateTimeOffset.UtcNow));
+
+        var preview = Assert.Single(await repository.ListRecentAsync(50)).OriginalRequirementPreview;
+
+        Assert.Equal("ship portable export with evidence", preview);
+        Assert.DoesNotContain('\n', preview);
+        Assert.DoesNotContain('\t', preview);
+        Assert.DoesNotContain("\u2026", preview, StringComparison.Ordinal);
+        Assert.InRange(preview.Length, 1, 160);
+    }
 
     [Fact]
     public async Task Bundled_sqlite_runtime_is_newer_than_the_advisory_minimum()
@@ -132,6 +215,43 @@ public sealed class SqlitePersistenceTests : IDisposable
     }
 
     [Fact]
+    public async Task Initializer_adds_recent_history_index_and_recent_query_uses_it()
+    {
+        await new SqliteDatabaseInitializer(ConnectionString).InitializeAsync();
+        await new SqliteDatabaseInitializer(ConnectionString).InitializeAsync();
+        var repository = new SqliteEngineeringTaskRepository(ConnectionString);
+        var now = DateTimeOffset.UtcNow;
+        for (var index = 0; index < 3; index++)
+            await repository.SaveAsync(EngineeringTask.Create($"repo-{index}", $"Requirement {index}", now.AddMinutes(index)));
+
+        await using var connection = new SqliteConnection(ConnectionString);
+        await connection.OpenAsync();
+        await using var indexCommand = connection.CreateCommand();
+        indexCommand.CommandText = "PRAGMA index_list('EngineeringTasks');";
+        await using var indexReader = await indexCommand.ExecuteReaderAsync();
+        var indexes = new List<string>();
+        while (await indexReader.ReadAsync())
+            indexes.Add(indexReader.GetString(indexReader.GetOrdinal("name")));
+
+        Assert.Contains("IX_EngineeringTasks_UpdatedAt_Id", indexes);
+
+        await using var planCommand = connection.CreateCommand();
+        planCommand.CommandText = """
+            EXPLAIN QUERY PLAN
+            SELECT Id, Status, CreatedAt, UpdatedAt, Repository, substr(OriginalRequirement, 1, 161)
+            FROM EngineeringTasks
+            ORDER BY UpdatedAt DESC, Id ASC
+            LIMIT 50;
+            """;
+        await using var planReader = await planCommand.ExecuteReaderAsync();
+        var planDetails = new List<string>();
+        while (await planReader.ReadAsync())
+            planDetails.Add(planReader.GetString(planReader.GetOrdinal("detail")));
+
+        Assert.Contains(planDetails, detail => detail.Contains("IX_EngineeringTasks_UpdatedAt_Id", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public async Task Snapshot_evidence_plan_and_approval_round_trip()
     {
         await new SqliteDatabaseInitializer(ConnectionString).InitializeAsync();
@@ -242,5 +362,15 @@ public sealed class SqlitePersistenceTests : IDisposable
     {
         SqliteConnection.ClearAllPools();
         if (Directory.Exists(_directory)) Directory.Delete(_directory, true);
+    }
+
+    private static void AssertNoUnpairedSurrogates(string value)
+    {
+        for (var index = 0; index < value.Length; index++)
+        {
+            if (!char.IsSurrogate(value[index])) continue;
+            Assert.True(Rune.TryGetRuneAt(value, index, out _), $"Preview contained an unpaired surrogate at index {index}: {value}");
+            if (char.IsHighSurrogate(value[index])) index++;
+        }
     }
 }

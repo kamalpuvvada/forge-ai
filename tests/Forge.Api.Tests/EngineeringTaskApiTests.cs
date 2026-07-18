@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Http.Json;
+using System.Text;
 using System.Text.Json;
 using Forge.Api.Contracts;
 using Forge.Api.Controllers;
@@ -23,6 +24,76 @@ public sealed class EngineeringTaskApiTests : IClassFixture<FakeModeFactory>
     {
         _factory = factory;
         _client = factory.CreateClient();
+    }
+
+    [Fact]
+    public async Task Task_history_is_empty_then_returns_only_lightweight_summaries_without_mutation()
+    {
+        await using var factory = new FakeModeFactory();
+        using var client = factory.CreateClient();
+        Assert.Empty((await client.GetFromJsonAsync<JsonElement[]>("/api/tasks"))!);
+        var created = await client.PostAsJsonAsync("/api/tasks", new
+        {
+            repository = "C:/history-repository",
+            requirement = "History requirement with private planning context. Acceptance criteria: list it. Validation: run tests."
+        });
+        created.EnsureSuccessStatusCode();
+        var detail = await created.Content.ReadFromJsonAsync<JsonElement>();
+        var id = detail.GetProperty("id").GetGuid();
+        var before = await client.GetStringAsync($"/api/tasks/{id}");
+
+        var response = await client.GetAsync("/api/tasks");
+        var json = await response.Content.ReadFromJsonAsync<JsonElement>();
+        var summary = Assert.Single(json.EnumerateArray());
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Equal(["createdAt", "id", "originalRequirementPreview", "repository", "status", "updatedAt"],
+            summary.EnumerateObject().Select(property => property.Name).Order().ToArray());
+        Assert.Equal(id, summary.GetProperty("id").GetGuid());
+        Assert.Equal("C:/history-repository", summary.GetProperty("repository").GetString());
+        Assert.DoesNotContain("implementationPlan", summary.ToString());
+        Assert.DoesNotContain("telemetry", summary.ToString());
+        Assert.Equal(before, await client.GetStringAsync($"/api/tasks/{id}"));
+        Assert.Equal(before, await client.GetStringAsync($"/api/tasks/{id}"));
+    }
+
+    [Fact]
+    public async Task Task_history_preview_json_is_unicode_safe_and_bounded()
+    {
+        await using var factory = new FakeModeFactory();
+        using var client = factory.CreateClient();
+        var requirement = new string('a', 159) + "\U0001F680 trailing text";
+        var created = await client.PostAsJsonAsync("/api/tasks", new
+        {
+            repository = "C:/unicode-repository",
+            requirement
+        });
+        created.EnsureSuccessStatusCode();
+
+        var summary = Assert.Single((await client.GetFromJsonAsync<JsonElement[]>("/api/tasks"))!);
+        var preview = summary.GetProperty("originalRequirementPreview").GetString();
+
+        Assert.NotNull(preview);
+        Assert.Equal(160, preview.Length);
+        Assert.EndsWith("\u2026", preview, StringComparison.Ordinal);
+        for (var index = 0; index < preview.Length; index++)
+        {
+            if (!char.IsSurrogate(preview[index])) continue;
+            Assert.True(Rune.TryGetRuneAt(preview, index, out _), $"Preview contained an unpaired surrogate at index {index}: {preview}");
+            if (char.IsHighSurrogate(preview[index])) index++;
+        }
+    }
+
+    [Fact]
+    public async Task Detail_routes_handle_invalid_and_missing_task_ids_without_mutation()
+    {
+        var invalid = await _client.GetAsync("/api/tasks/not-a-guid");
+        var missing = await _client.GetAsync($"/api/tasks/{Guid.NewGuid()}");
+        var problem = await missing.Content.ReadFromJsonAsync<JsonElement>();
+
+        Assert.Equal(HttpStatusCode.NotFound, invalid.StatusCode);
+        Assert.Equal(HttpStatusCode.NotFound, missing.StatusCode);
+        Assert.Equal("task_not_found", problem.GetProperty("code").GetString());
     }
 
     [Fact]
@@ -206,6 +277,56 @@ public sealed class EngineeringTaskApiTests : IClassFixture<FakeModeFactory>
 
         var after = await _client.GetStringAsync($"/api/tasks/{id}");
         Assert.Equal(before, after);
+    }
+
+    [Fact]
+    public async Task Proposed_and_approved_plan_pdf_routes_use_persisted_status_safe_headers_and_do_not_mutate_task()
+    {
+        const string requirement = "Add plan PDF export. Acceptance criteria: export all plan sections. Validation: run focused tests.";
+        var created = await CreateAsync(requirement, _factory.TargetRepositoryPath);
+        var id = created.GetProperty("id").GetGuid();
+        (await _client.PostAsync($"/api/tasks/{id}/requirement-approval", null)).EnsureSuccessStatusCode();
+        (await _client.PostAsync($"/api/tasks/{id}/repository-analysis", null)).EnsureSuccessStatusCode();
+        (await _client.PostAsync($"/api/tasks/{id}/plan", null)).EnsureSuccessStatusCode();
+        var proposedBefore = await _client.GetStringAsync($"/api/tasks/{id}");
+
+        var proposed = await _client.GetAsync($"/api/tasks/{id}/export/plan-pdf");
+        var proposedBytes = await proposed.Content.ReadAsByteArrayAsync();
+        var proposedText = ExtractPdf(proposedBytes);
+
+        Assert.Equal(HttpStatusCode.OK, proposed.StatusCode);
+        Assert.Equal("application/pdf", proposed.Content.Headers.ContentType?.MediaType);
+        Assert.Equal($"forge-plan-{id:D}.pdf", proposed.Content.Headers.ContentDisposition?.FileNameStar ??
+            proposed.Content.Headers.ContentDisposition?.FileName?.Trim('"'));
+        Assert.Equal("%PDF", System.Text.Encoding.ASCII.GetString(proposedBytes, 0, 4));
+        Assert.Contains("PROPOSED PLAN \u2014 NOT APPROVED", proposedText);
+        Assert.Contains("NOT EXECUTED", proposedText);
+        Assert.DoesNotContain(_factory.TargetRepositoryPath, proposedText, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(proposedBefore, await _client.GetStringAsync($"/api/tasks/{id}"));
+
+        (await _client.PostAsync($"/api/tasks/{id}/plan-approval", null)).EnsureSuccessStatusCode();
+        var approvedBefore = await _client.GetStringAsync($"/api/tasks/{id}");
+        var approved = await _client.GetAsync($"/api/tasks/{id}/export/plan-pdf");
+        var approvedText = ExtractPdf(await approved.Content.ReadAsByteArrayAsync());
+
+        Assert.Contains("APPROVED PLAN", approvedText);
+        Assert.DoesNotContain("PROPOSED PLAN \u2014 NOT APPROVED", approvedText);
+        Assert.Equal(approvedBefore, await _client.GetStringAsync($"/api/tasks/{id}"));
+    }
+
+    [Fact]
+    public async Task Plan_pdf_route_rejects_no_plan_and_missing_task_safely()
+    {
+        var created = await CreateAsync("Add plan PDF export.");
+        var id = created.GetProperty("id").GetGuid();
+
+        var noPlan = await _client.GetAsync($"/api/tasks/{id}/export/plan-pdf");
+        var missing = await _client.GetAsync($"/api/tasks/{Guid.NewGuid()}/export/plan-pdf");
+
+        Assert.Equal(HttpStatusCode.Conflict, noPlan.StatusCode);
+        Assert.Equal("workflow_conflict", (await noPlan.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("code").GetString());
+        Assert.Equal(HttpStatusCode.NotFound, missing.StatusCode);
+        Assert.Equal("task_not_found", (await missing.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("code").GetString());
     }
 
     [Fact]
@@ -504,6 +625,12 @@ public sealed class EngineeringTaskApiTests : IClassFixture<FakeModeFactory>
         var response = await _client.PostAsJsonAsync("/api/tasks", new { repository, requirement });
         response.EnsureSuccessStatusCode();
         return await response.Content.ReadFromJsonAsync<JsonElement>();
+    }
+
+    private static string ExtractPdf(byte[] bytes)
+    {
+        using var pdf = PdfDocument.Open(bytes);
+        return string.Join('\n', pdf.GetPages().Select(page => page.Text));
     }
 }
 

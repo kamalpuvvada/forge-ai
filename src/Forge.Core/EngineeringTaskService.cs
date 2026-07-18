@@ -9,6 +9,8 @@ public sealed class EngineeringTaskService(
     IPlanningEngine? planningEngine = null,
     RepositoryAnalysisLimits? analysisLimits = null)
 {
+    public const int MaximumRecentTasks = 50;
+
     public async Task<EngineeringTask> CreateAsync(
         string repositoryIdentifier,
         string requirement,
@@ -21,6 +23,9 @@ public sealed class EngineeringTaskService(
 
     public Task<EngineeringTask?> GetAsync(Guid id, CancellationToken cancellationToken = default) =>
         repository.GetAsync(id, cancellationToken);
+
+    public Task<IReadOnlyList<EngineeringTaskSummary>> ListRecentAsync(CancellationToken cancellationToken = default) =>
+        repository.ListRecentAsync(MaximumRecentTasks, cancellationToken);
 
     public async Task<EngineeringTask> AnswerAsync(Guid id, string answer, CancellationToken cancellationToken = default)
     {

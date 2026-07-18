@@ -82,6 +82,14 @@ export interface EngineeringTask {
   planCreatedAt: string | null
   telemetry: ModelTelemetry
 }
+export interface EngineeringTaskSummary {
+  id: string
+  status: WorkflowStatus
+  createdAt: string
+  updatedAt: string
+  repository: string
+  originalRequirementPreview: string
+}
 export interface SystemCapabilities {
   aiMode: 'Fake' | 'OpenAI' | string
   clarificationProvider: string
