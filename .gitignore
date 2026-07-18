@@ -1,0 +1,27 @@
+# .NET
+**/bin/
+**/obj/
+*.user
+.vs/
+
+# Local persistence
+src/Forge.Api/data/
+*.db-shm
+*.db-wal
+
+# Frontend
+web/forge-web/node_modules/
+web/forge-web/dist/
+web/forge-web/.vite/
+
+# Editors and OS
+.idea/
+.vscode/
+.run/
+.DS_Store
+Thumbs.db
+
+# Local secrets
+.env
+.env.*
+!.env.example
