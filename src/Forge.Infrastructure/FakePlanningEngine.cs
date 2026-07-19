@@ -44,8 +44,12 @@ public sealed class FakePlanningEngine : IPlanningEngine
         var validations = constraints.RepositoryValidationCommandsProhibited
             ? []
             : ProposedValidations(context.Snapshot)
+                .Where(command => !(constraints.TestExecutionProhibited || constraints.TargetBuildExecutionProhibited) ||
+                                  !string.Equals(command, FallbackValidationCommand, StringComparison.Ordinal))
                 .Where(command => !constraints.TestExecutionProhibited ||
                                   !command.Contains("test", StringComparison.OrdinalIgnoreCase))
+                .Where(command => !constraints.TargetBuildExecutionProhibited ||
+                                  !command.Contains("build", StringComparison.OrdinalIgnoreCase))
                 .ToArray();
         var limited = affected.Length == 0 || affected.All(file => file.Confidence < 0.5m);
         var risks = new List<string>
@@ -89,20 +93,21 @@ public sealed class FakePlanningEngine : IPlanningEngine
                 "The remaining approved affected paths receive the proposed deterministic Fake operations.");
         }
 
-        var testsProhibited = constraints.TestChangesProhibited || constraints.TestExecutionProhibited;
-        if (!testsProhibited)
+        if (!constraints.TestChangesProhibited)
         {
             var testPaths = affected.Where(file => context.Snapshot.Files.Any(metadata =>
-                    metadata.IsTest && RepositoryPathRules.Comparer.Equals(metadata.RelativePath, file.Path)))
+                    metadata.IsTest && RepositoryPathRules.Comparer.Equals(metadata.RelativePath, file.Path)) &&
+                    file.Action is PlannedFileAction.Create or PlannedFileAction.Modify or PlannedFileAction.Delete)
                 .Select(file => file.Path).Take(6).ToArray();
-            if (testPaths.Length == 0) testPaths = primaryPaths;
-            AddStep(
-                "Add or update focused tests for the approved acceptance criteria.",
-                testPaths,
-                "Focused automated coverage describes the expected behavior.");
+            if (testPaths.Length > 0)
+                AddStep(
+                    "Add or update focused tests for the approved acceptance criteria.",
+                    testPaths,
+                    "Focused automated coverage describes the expected behavior.");
         }
 
-        if (constraints.RepositoryValidationCommandsProhibited)
+        if (constraints.RepositoryValidationCommandsProhibited ||
+            validations.Length == 0 && (constraints.TestExecutionProhibited || constraints.TargetBuildExecutionProhibited))
         {
             AddStep(
                 "Review the generated file list, hashes, byte and line counts, and bounded diff previews; verify that the original active checkout remains unchanged.",
@@ -187,7 +192,7 @@ public sealed class FakePlanningEngine : IPlanningEngine
         string path,
         RepositorySnapshot snapshot,
         PlanConstraints constraints) =>
-        (constraints.TestChangesProhibited || constraints.TestExecutionProhibited) &&
+        constraints.TestChangesProhibited &&
         snapshot.Files.Any(file => file.IsTest && RepositoryPathRules.Comparer.Equals(file.RelativePath, path));
 
     private static IEnumerable<string> OrderedEvidencePaths(
@@ -225,11 +230,14 @@ public sealed class FakePlanningEngine : IPlanningEngine
             validations.Add($"{prefix}npm run lint");
             validations.Add($"{prefix}npm run build");
         }
-        if (validations.Count == 0) validations.Add("Run the repository's documented validation commands after implementation.");
+        if (validations.Count == 0) validations.Add(FallbackValidationCommand);
         return validations;
     }
 
     private static string Quote(string value) => value.Contains(' ') ? $"\"{value}\"" : value;
+
+    private const string FallbackValidationCommand =
+        "Run the repository's documented validation commands after implementation.";
 
     private sealed record CandidatePath(
         string Path,

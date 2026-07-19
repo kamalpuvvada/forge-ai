@@ -188,6 +188,99 @@ public sealed class EngineeringTaskServiceTests
     }
 
     [Fact]
+    public async Task No_op_plan_correction_restores_reviewable_plan_and_allows_another_correction()
+    {
+        var repository = new InMemoryRepository();
+        var now = DateTimeOffset.UtcNow;
+        var task = ReviewTask(now);
+        var previousPlan = task.ImplementationPlan;
+        var previousEvidence = task.EvidenceItems.ToArray();
+        await repository.SaveAsync(task);
+        var snapshot = task.RepositorySnapshot!;
+        var textFile = new RepositoryTextFile(snapshot.Files[0], "public class App { void PersistPricingSnapshot() {} }");
+        var planner = new CapturingPlanningEngine();
+        var service = new EngineeringTaskService(repository,
+            new ScriptedEngine(ClarificationEvaluation.Summarize("unused")), TimeProvider.System,
+            new FixedDiscovery(snapshot, [textFile]),
+            new DeterministicEvidenceSelectionService(new RepositoryAnalysisLimits()), planner,
+            new RepositoryAnalysisLimits());
+
+        var exception = await Assert.ThrowsAsync<PlanningException>(() =>
+            service.RequestPlanRevisionAsync(task.Id, "Exactly one Modify action."));
+        var restored = await repository.GetAsync(task.Id);
+
+        Assert.Equal("plan_revision_no_change", exception.Category);
+        Assert.Equal(WorkflowStatus.AwaitingPlanApproval, restored!.Status);
+        Assert.Equal(previousPlan, restored.ImplementationPlan);
+        Assert.Null(restored.PlanApprovedAt);
+        Assert.Single(restored.PlanRevisionNotes);
+        Assert.Equal(previousEvidence.Select(item => item.Id), restored.EvidenceItems.Select(item => item.Id));
+
+        var revised = await service.RequestPlanRevisionAsync(task.Id, "Clarify the App pricing snapshot purpose.");
+
+        Assert.Equal(WorkflowStatus.AwaitingPlanApproval, revised.Status);
+        Assert.Equal(2, revised.PlanRevisionNotes.Count);
+        Assert.NotNull(revised.ImplementationPlan);
+    }
+
+    [Fact]
+    public async Task Rejected_openai_style_revision_restores_plan_and_evidence_while_preserving_telemetry()
+    {
+        var repository = new InMemoryRepository();
+        var now = DateTimeOffset.UtcNow;
+        var task = ReviewTask(now);
+        var previousPlan = task.ImplementationPlan;
+        var previousEvidence = task.EvidenceItems.ToArray();
+        await repository.SaveAsync(task);
+        var snapshot = task.RepositorySnapshot!;
+        var textFile = new RepositoryTextFile(snapshot.Files[0], "public class App { void PersistPricingSnapshot() {} }");
+        var planner = new ConstraintViolatingPlanningEngine();
+        var service = new EngineeringTaskService(repository,
+            new ScriptedEngine(ClarificationEvaluation.Summarize("unused")), TimeProvider.System,
+            new FixedDiscovery(snapshot, [textFile]),
+            new DeterministicEvidenceSelectionService(new RepositoryAnalysisLimits()), planner,
+            new RepositoryAnalysisLimits());
+
+        var exception = await Assert.ThrowsAsync<PlanningException>(() =>
+            service.RequestPlanRevisionAsync(task.Id, "Exclude src/App.cs."));
+        var restored = await repository.GetAsync(task.Id);
+
+        Assert.Equal("plan_constraint_violation", exception.Category);
+        Assert.Equal(WorkflowStatus.AwaitingPlanApproval, restored!.Status);
+        Assert.Equal(previousPlan, restored.ImplementationPlan);
+        Assert.Equal(previousEvidence.Select(item => item.Id), restored.EvidenceItems.Select(item => item.Id));
+        Assert.Null(restored.PlanApprovedAt);
+        Assert.Single(restored.PlanRevisionNotes);
+        Assert.Single(restored.ModelCalls, call => call.ProviderResponseId == "test-response" && call.Succeeded);
+    }
+
+    [Fact]
+    public async Task Rejected_revision_restore_persistence_failure_returns_only_safe_storage_error()
+    {
+        var inner = new InMemoryRepository();
+        var now = DateTimeOffset.UtcNow;
+        var task = ReviewTask(now);
+        await inner.SaveAsync(task);
+        var repository = new FailOnSaveRepository(inner, 2,
+            new TaskPersistenceException("Data Source=C:\\sensitive\\forge.db; provider failure"));
+        var snapshot = task.RepositorySnapshot!;
+        var textFile = new RepositoryTextFile(snapshot.Files[0], "public class App { void PersistPricingSnapshot() {} }");
+        var service = new EngineeringTaskService(repository,
+            new ScriptedEngine(ClarificationEvaluation.Summarize("unused")), TimeProvider.System,
+            new FixedDiscovery(snapshot, [textFile]),
+            new DeterministicEvidenceSelectionService(new RepositoryAnalysisLimits()), new CapturingPlanningEngine(),
+            new RepositoryAnalysisLimits());
+
+        var exception = await Assert.ThrowsAsync<TaskPersistenceException>(() =>
+            service.RequestPlanRevisionAsync(task.Id, "Exactly one Modify action."));
+
+        Assert.Equal("Task persistence is temporarily unavailable.", exception.Message);
+        Assert.Null(exception.InnerException);
+        Assert.DoesNotContain("sensitive", exception.ToString(), StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("Data Source", exception.ToString(), StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public async Task Post_engine_constraint_gate_rejects_contradictory_candidate_and_persists_telemetry_without_retry()
     {
         var repository = new InMemoryRepository();
@@ -458,6 +551,27 @@ public sealed class EngineeringTaskServiceTests
         {
             _tasks[task.Id] = task;
             return Task.CompletedTask;
+        }
+    }
+
+    private sealed class FailOnSaveRepository(
+        IEngineeringTaskRepository inner,
+        int failOnSave,
+        Exception failure) : IEngineeringTaskRepository
+    {
+        private int saveCount;
+
+        public Task<EngineeringTask?> GetAsync(Guid id, CancellationToken cancellationToken = default) =>
+            inner.GetAsync(id, cancellationToken);
+
+        public Task<IReadOnlyList<EngineeringTaskSummary>> ListRecentAsync(
+            int maximumCount,
+            CancellationToken cancellationToken = default) => inner.ListRecentAsync(maximumCount, cancellationToken);
+
+        public Task SaveAsync(EngineeringTask task, CancellationToken cancellationToken = default)
+        {
+            saveCount++;
+            return saveCount == failOnSave ? Task.FromException(failure) : inner.SaveAsync(task, cancellationToken);
         }
     }
 }

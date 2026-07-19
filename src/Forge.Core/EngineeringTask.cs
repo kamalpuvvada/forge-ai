@@ -400,6 +400,44 @@ public sealed class EngineeringTask
         UpdatedAt = now;
     }
 
+    public void RestoreRejectedPlanRevision(EvidenceSelection previousEvidence, DateTimeOffset now)
+    {
+        EnsureStatus(WorkflowStatus.Planning);
+        ArgumentNullException.ThrowIfNull(previousEvidence);
+        var revision = _planRevisionNotes.LastOrDefault()
+            ?? throw new WorkflowException("A submitted plan correction is required before restoring its previous plan.");
+        if (RepositorySnapshot is null || string.IsNullOrWhiteSpace(RepositoryFingerprint) ||
+            !string.Equals(revision.PreviousRepositoryFingerprint, RepositoryFingerprint, StringComparison.Ordinal) ||
+            !string.Equals(revision.PreviousPlan.RepositoryFingerprint, RepositoryFingerprint, StringComparison.Ordinal))
+            throw new PlanningException("plan_revision_restore_failure",
+                "The previous proposed plan could not be restored safely.");
+        if (previousEvidence.FilesSelected != previousEvidence.Items.Select(item => item.RelativePath)
+                .Distinct(RepositoryPathRules.Comparer).Count() ||
+            previousEvidence.FilesInspected < previousEvidence.FilesSelected || previousEvidence.TotalCharacters < 0)
+            throw new PlanningException("plan_revision_restore_failure",
+                "The previous proposed plan could not be restored safely.");
+
+        try
+        {
+            ImplementationPlanValidator.Validate(revision.PreviousPlan, RepositorySnapshot, previousEvidence.Items);
+        }
+        catch (PlanningException)
+        {
+            throw new PlanningException("plan_revision_restore_failure",
+                "The previous proposed plan could not be restored safely.");
+        }
+
+        EvidenceItems = previousEvidence.Items.ToArray();
+        EvidenceFilesInspected = previousEvidence.FilesInspected;
+        EvidenceFilesSelected = previousEvidence.FilesSelected;
+        TotalEvidenceCharacters = previousEvidence.TotalCharacters;
+        ImplementationPlan = revision.PreviousPlan;
+        PlanCreatedAt = revision.PreviousPlan.CreatedAt;
+        PlanApprovedAt = null;
+        Status = WorkflowStatus.AwaitingPlanApproval;
+        UpdatedAt = now;
+    }
+
     public void EnsurePlanRevisionCanBeRequested(string correction)
     {
         EnsureStatus(WorkflowStatus.AwaitingPlanApproval);

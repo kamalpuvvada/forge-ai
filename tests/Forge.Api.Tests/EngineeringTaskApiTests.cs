@@ -586,19 +586,7 @@ public sealed class EngineeringTaskApiTests : IClassFixture<FakeModeFactory>
     {
         await using var factory = new FakeModeFactory();
         using var client = factory.CreateClient();
-        var repository = Path.Combine(Path.GetDirectoryName(factory.DatabasePath)!, "plan-constraint-target");
-        Directory.CreateDirectory(Path.Combine(repository, "src"));
-        Directory.CreateDirectory(Path.Combine(repository, "config"));
-        await File.WriteAllTextAsync(Path.Combine(repository, "src", "GreetingService.cs"),
-            "public sealed class GreetingService { public string Greet() => \"Hello\"; }\n");
-        await File.WriteAllTextAsync(Path.Combine(repository, "config", "settings.json"), "{\"greeting\":\"Hello\"}\n");
-        await File.WriteAllTextAsync(Path.Combine(repository, "README.md"), "# Greeting service\n");
-        await File.WriteAllTextAsync(Path.Combine(repository, "ManualTarget.csproj"),
-            "<Project Sdk=\"Microsoft.NET.Sdk\"><!-- GreetingService config settings README --></Project>\n");
-        FakeModeFactory.RunGit(repository, "init", "--initial-branch=main");
-        FakeModeFactory.RunGit(repository, "add", "--", ".");
-        FakeModeFactory.RunGit(repository, "-c", "user.name=Forge API Tests",
-            "-c", "user.email=forge-tests@example.invalid", "commit", "-m", "constraint fixture");
+        var repository = await CreatePlanConstraintTargetAsync(factory);
         var requirement = """
             Modify the greeting behavior in these named files:
             - src/GreetingService.cs
@@ -650,6 +638,89 @@ public sealed class EngineeringTaskApiTests : IClassFixture<FakeModeFactory>
         Assert.Contains("README.md", pdfText, StringComparison.Ordinal);
         Assert.Equal("AwaitingPlanApproval",
             (await client.GetFromJsonAsync<JsonElement>($"/api/tasks/{id}")).GetProperty("status").GetString());
+    }
+
+    [Fact]
+    public async Task Exact_manual_requirement_initial_fake_plan_enforces_three_existing_files_and_pdf_scope()
+    {
+        await using var factory = new FakeModeFactory();
+        using var client = factory.CreateClient();
+        var repository = await CreatePlanConstraintTargetAsync(factory);
+        var requirement = """
+            Prepare a safe manual-validation change in this repository.
+
+            Modify these existing files only:
+            - src/GreetingService.cs
+            - config/settings.json
+            - README.md
+
+            The purpose is to demonstrate Forge AI's isolated implementation and diff-review workflow in Fake mode. Do not run the target project's build or tests. Do not stage, commit, push, or create a pull request.
+
+            Acceptance criteria:
+            - The approved plan identifies only the three existing files listed above.
+            - Implementation changes are created only in an isolated Forge worktree.
+            - The original target checkout remains completely unchanged.
+            - A bounded and clearly labelled Fake implementation diff is available for review.
+
+            Validation:
+            - Review the Forge-generated file list, hashes, byte and line counts, and diff previews.
+            - Compare the target repository branch, HEAD, status, index, and file hashes before and after implementation.
+            """;
+        var created = await client.PostAsJsonAsync("/api/tasks", new { repository, requirement });
+        created.EnsureSuccessStatusCode();
+        var id = (await created.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("id").GetGuid();
+        (await client.PostAsync($"/api/tasks/{id}/requirement-approval", null)).EnsureSuccessStatusCode();
+        var analysis = await client.PostAsync($"/api/tasks/{id}/repository-analysis", null);
+        analysis.EnsureSuccessStatusCode();
+        Assert.Equal(4, (await analysis.Content.ReadFromJsonAsync<JsonElement>())
+            .GetProperty("evidenceItems").GetArrayLength());
+
+        var response = await client.PostAsync($"/api/tasks/{id}/plan", null);
+        Assert.True(response.IsSuccessStatusCode, await response.Content.ReadAsStringAsync());
+        var planned = await response.Content.ReadFromJsonAsync<JsonElement>();
+        var plan = planned.GetProperty("implementationPlan");
+        var files = plan.GetProperty("affectedFiles").EnumerateArray().ToArray();
+
+        Assert.Equal("AwaitingPlanApproval", planned.GetProperty("status").GetString());
+        Assert.Equal(new[] { "src/GreetingService.cs", "config/settings.json", "README.md" },
+            files.Select(file => file.GetProperty("path").GetString()));
+        Assert.All(files, file => Assert.Equal("Modify", file.GetProperty("action").GetString()));
+        Assert.Empty(plan.GetProperty("proposedValidationCommands").EnumerateArray());
+        Assert.DoesNotContain("ManualTarget.csproj", plan.GetRawText(), StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(plan.GetProperty("orderedSteps").EnumerateArray(), step =>
+            step.GetProperty("description").GetString()!.Contains("add or update focused tests", StringComparison.OrdinalIgnoreCase));
+
+        var pdfText = ExtractPdf(await client.GetByteArrayAsync($"/api/tasks/{id}/export/plan-pdf"));
+        Assert.DoesNotContain("ManualTarget.csproj", pdfText, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("src/GreetingService.cs", pdfText, StringComparison.Ordinal);
+        Assert.Contains("config/settings.json", pdfText, StringComparison.Ordinal);
+        Assert.Contains("README.md", pdfText, StringComparison.Ordinal);
+
+        var noOp = await client.PostAsJsonAsync($"/api/tasks/{id}/plan-revision", new
+        {
+            correction = "Exactly three Modify actions."
+        });
+        Assert.Equal(HttpStatusCode.UnprocessableEntity, noOp.StatusCode);
+        Assert.Equal("plan_revision_no_change",
+            (await noOp.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("code").GetString());
+        var restored = await client.GetFromJsonAsync<JsonElement>($"/api/tasks/{id}");
+        Assert.Equal("AwaitingPlanApproval", restored.GetProperty("status").GetString());
+        Assert.Equal(JsonValueKind.Null, restored.GetProperty("planApprovedAt").ValueKind);
+        Assert.NotEqual(JsonValueKind.Null, restored.GetProperty("implementationPlan").ValueKind);
+        Assert.Single(restored.GetProperty("planRevisionNotes").EnumerateArray());
+
+        var secondCorrection = await client.PostAsJsonAsync($"/api/tasks/{id}/plan-revision", new
+        {
+            correction = """
+                Modify these existing files only:
+                - src/GreetingService.cs
+                - config/settings.json
+                """
+        });
+        Assert.True(secondCorrection.IsSuccessStatusCode, await secondCorrection.Content.ReadAsStringAsync());
+        var corrected = await secondCorrection.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Equal("AwaitingPlanApproval", corrected.GetProperty("status").GetString());
+        Assert.Equal(2, corrected.GetProperty("planRevisionNotes").GetArrayLength());
     }
 
     [Fact]
@@ -881,6 +952,24 @@ public sealed class EngineeringTaskApiTests : IClassFixture<FakeModeFactory>
         Assert.Equal(snapshot.InputPerMillionUsd, call.StoredPricingSnapshot?.InputPerMillionUsd);
         Assert.False(response.Telemetry.IsPartialEstimate);
         Assert.Equal(0, response.Telemetry.CostUnavailableCallCount);
+    }
+
+    private static async Task<string> CreatePlanConstraintTargetAsync(FakeModeFactory factory)
+    {
+        var repository = Path.Combine(Path.GetDirectoryName(factory.DatabasePath)!, "plan-constraint-target");
+        Directory.CreateDirectory(Path.Combine(repository, "src"));
+        Directory.CreateDirectory(Path.Combine(repository, "config"));
+        await File.WriteAllTextAsync(Path.Combine(repository, "src", "GreetingService.cs"),
+            "public sealed class GreetingService { public string Greet() => \"Hello\"; }\n");
+        await File.WriteAllTextAsync(Path.Combine(repository, "config", "settings.json"), "{\"greeting\":\"Hello\"}\n");
+        await File.WriteAllTextAsync(Path.Combine(repository, "README.md"), "# Greeting service\n");
+        await File.WriteAllTextAsync(Path.Combine(repository, "ManualTarget.csproj"),
+            "<Project Sdk=\"Microsoft.NET.Sdk\"><!-- GreetingService config settings README --></Project>\n");
+        FakeModeFactory.RunGit(repository, "init", "--initial-branch=main");
+        FakeModeFactory.RunGit(repository, "add", "--", ".");
+        FakeModeFactory.RunGit(repository, "-c", "user.name=Forge API Tests",
+            "-c", "user.email=forge-tests@example.invalid", "commit", "-m", "constraint fixture");
+        return repository;
     }
 
     private async Task<JsonElement> CreateAsync(string requirement, string repository = "C:/repo")

@@ -12,13 +12,14 @@ public sealed record PlanConstraints(
     IReadOnlySet<PlannedFileAction> ProhibitedActions,
     bool TestChangesProhibited,
     bool TestExecutionProhibited,
+    bool TargetBuildExecutionProhibited,
     bool RepositoryValidationCommandsProhibited,
     bool DiffMetadataReviewOnly,
     bool StructuralRevisionRequested)
 {
     public static PlanConstraints None { get; } = new(
         null, [], new Dictionary<PlannedFileAction, int>(), new HashSet<PlannedFileAction>(),
-        false, false, false, false, false);
+        false, false, false, false, false, false);
 }
 
 public static partial class PlanConstraintPolicy
@@ -73,6 +74,7 @@ public static partial class PlanConstraintPolicy
             prohibitedActions,
             approved.TestChangesProhibited || correction.TestChangesProhibited,
             approved.TestExecutionProhibited || correction.TestExecutionProhibited,
+            approved.TargetBuildExecutionProhibited || correction.TargetBuildExecutionProhibited,
             approved.RepositoryValidationCommandsProhibited || correction.RepositoryValidationCommandsProhibited,
             approved.DiffMetadataReviewOnly || correction.DiffMetadataReviewOnly,
             correction.StructuralDirectiveRecognized);
@@ -119,7 +121,7 @@ public static partial class PlanConstraintPolicy
 
         var metadata = context.Snapshot.Files.ToDictionary(
             file => RepositoryPathRules.Normalize(file.RelativePath), file => file, RepositoryPathRules.Comparer);
-        if (constraints.TestChangesProhibited || constraints.TestExecutionProhibited)
+        if (constraints.TestChangesProhibited)
         {
             foreach (var file in plan.AffectedFiles)
             {
@@ -138,7 +140,16 @@ public static partial class PlanConstraintPolicy
 
         if (constraints.TestExecutionProhibited &&
             (plan.ProposedValidationCommands.Any(TestCommandRegex().IsMatch) ||
-             plan.Steps.Any(step => CommandExecutionRegex().IsMatch(step.Description) && TestCommandRegex().IsMatch(step.Description))))
+             plan.Steps.Any(step =>
+                 CommandExecutionRegex().IsMatch(step.Description) && TestCommandRegex().IsMatch(step.Description) ||
+                 CommandExecutionRegex().IsMatch(step.ExpectedResult) && TestCommandRegex().IsMatch(step.ExpectedResult))))
+            Violation();
+
+        if (constraints.TargetBuildExecutionProhibited &&
+            (plan.ProposedValidationCommands.Any(BuildCommandRegex().IsMatch) ||
+             plan.Steps.Any(step =>
+                 CommandExecutionRegex().IsMatch(step.Description) && BuildCommandRegex().IsMatch(step.Description) ||
+                 CommandExecutionRegex().IsMatch(step.ExpectedResult) && BuildCommandRegex().IsMatch(step.ExpectedResult))))
             Violation();
 
         if (constraints.RepositoryValidationCommandsProhibited)
@@ -262,10 +273,11 @@ public static partial class PlanConstraintPolicy
 
         var testChangesProhibited = TestChangeProhibitionRegex().IsMatch(text);
         var testExecutionProhibited = TestExecutionProhibitionRegex().IsMatch(text);
+        var targetBuildExecutionProhibited = TargetBuildExecutionProhibitionRegex().IsMatch(text);
         var validationCommandsProhibited = ValidationCommandProhibitionRegex().IsMatch(text) ||
                                            ValidationLimitedRegex().IsMatch(text);
         var reviewOnly = validationCommandsProhibited || ValidationLimitedRegex().IsMatch(text);
-        structural |= isCorrection && (testChangesProhibited || testExecutionProhibited ||
+        structural |= isCorrection && (testChangesProhibited || testExecutionProhibited || targetBuildExecutionProhibited ||
                                         validationCommandsProhibited || ReferentialOnlyScopeRegex().IsMatch(text));
         return new ParsedConstraints(
             NormalizePaths(authoritative),
@@ -274,6 +286,7 @@ public static partial class PlanConstraintPolicy
             prohibitedActions,
             testChangesProhibited,
             testExecutionProhibited,
+            targetBuildExecutionProhibited,
             validationCommandsProhibited,
             reviewOnly,
             structural);
@@ -384,7 +397,9 @@ public static partial class PlanConstraintPolicy
     }
 
     private static IEnumerable<string> PlanConstraintText(ImplementationPlan plan) =>
-        plan.Steps.SelectMany(step => new[] { step.Description, step.ExpectedResult }.Concat(step.AffectedPaths))
+        new[] { plan.Title, plan.Objective, plan.RepositoryUnderstanding, plan.Summary }
+            .Concat(plan.AffectedFiles.SelectMany(file => new[] { file.Path, file.Purpose }))
+            .Concat(plan.Steps.SelectMany(step => new[] { step.Description, step.ExpectedResult }.Concat(step.AffectedPaths)))
             .Concat(plan.RequirementCoverage.SelectMany(item => new[] { item.Requirement }.Concat(item.AffectedPaths)))
             .Concat(plan.Risks)
             .Concat(plan.Assumptions)
@@ -416,16 +431,17 @@ public static partial class PlanConstraintPolicy
         IReadOnlySet<PlannedFileAction> ProhibitedActions,
         bool TestChangesProhibited,
         bool TestExecutionProhibited,
+        bool TargetBuildExecutionProhibited,
         bool RepositoryValidationCommandsProhibited,
         bool DiffMetadataReviewOnly,
         bool StructuralDirectiveRecognized)
     {
         public static ParsedConstraints Empty { get; } = new(
             [], [], new Dictionary<PlannedFileAction, int>(), new HashSet<PlannedFileAction>(),
-            false, false, false, false, false);
+            false, false, false, false, false, false);
     }
 
-    [GeneratedRegex(@"(?ix)^\s*(?:[-*]\s*)?(?:(?<action>modify|create|delete|inspect)\s+(?:these\s+(?:files|paths)\s+only|only)|only\s+(?:these|the\s+following)\s+(?:files|paths)(?:\s+may\s+be\s+affected)?|exactly\s+these\s+(?:files|paths))\s*:?\s*(?<inline>.*)$", RegexOptions.CultureInvariant)]
+    [GeneratedRegex(@"(?ix)^\s*(?:[-*]\s*)?(?:(?<action>modify|create|delete|inspect)\s+(?:only(?:\s+(?:(?:these|the|following|existing|named|\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+)*(?:files|paths))?|(?:(?:these|the|following|existing|named|\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+)*(?:files|paths)\s+only)|only\s+(?:(?:these|the|following|existing|named|\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+)*(?:files|paths)(?:\s+may\s+be\s+affected)?|exactly\s+(?:(?:these|the|following|existing|named|\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+)*(?:files|paths))\s*:?\s*(?<inline>.*)$", RegexOptions.CultureInvariant)]
     private static partial Regex ScopeHeaderRegex();
 
     [GeneratedRegex(@"^\s*(?:[-*]|\d+[.)])\s+(?<content>.+)$", RegexOptions.CultureInvariant)]
@@ -455,10 +471,13 @@ public static partial class PlanConstraintPolicy
     [GeneratedRegex(@"(?ix)\b(?:do\s+not\s+(?:add|update|modify|create)\s+(?:(?:or|/)\s*(?:add|update|modify|create)\s+)?tests?|no\s+test\s+files?)\b", RegexOptions.CultureInvariant)]
     private static partial Regex TestChangeProhibitionRegex();
 
-    [GeneratedRegex(@"(?ix)\b(?:do\s+not\s+run\s+(?:the\s+)?tests?|no\s+tests?\s+(?:may|must|should|will)\s+be\s+run)\b", RegexOptions.CultureInvariant)]
+    [GeneratedRegex(@"(?ix)\b(?:do\s+not\s+run\s+(?:(?:the\s+)?tests?|the\s+target(?:\s+project(?:'s)?)?\s+build\s+or\s+tests?)|no\s+tests?\s+(?:may|must|should|will)\s+be\s+run)\b", RegexOptions.CultureInvariant)]
     private static partial Regex TestExecutionProhibitionRegex();
 
-    [GeneratedRegex(@"(?ix)\b(?:do\s+not\s+run\s+(?:the\s+)?target\s+build\s+or\s+tests?|do\s+not\s+(?:propose|propose\s+or\s+run)\b[^.\n]{0,160}\b(?:commands?|builds?|tests?|lint|restore)|do\s+not\s+run\s+(?:target[- ]repository|repository)\s+validation\s+commands?)\b", RegexOptions.CultureInvariant)]
+    [GeneratedRegex(@"(?ix)\bdo\s+not\s+run\s+the\s+target(?:\s+project(?:'s)?)?\s+build\s+or\s+tests?\b", RegexOptions.CultureInvariant)]
+    private static partial Regex TargetBuildExecutionProhibitionRegex();
+
+    [GeneratedRegex(@"(?ix)\b(?:do\s+not\s+(?:propose|propose\s+or\s+run)\b[^.\n]{0,160}\b(?:commands?|builds?|tests?|lint|restore)|do\s+not\s+run\s+(?:target[- ]repository|repository)\s+validation\s+commands?)\b", RegexOptions.CultureInvariant)]
     private static partial Regex ValidationCommandProhibitionRegex();
 
     [GeneratedRegex(@"(?ix)\bvalidation\s+is\s+limited\s+to\s+(?:reviewing\s+Forge\s+diff\s+metadata|proving\s+the\s+active\s+checkout\s+is\s+unchanged)\b", RegexOptions.CultureInvariant)]
@@ -472,6 +491,9 @@ public static partial class PlanConstraintPolicy
 
     [GeneratedRegex(@"(?ix)\b(?:dotnet\s+test|npm\s+(?:test|run\s+test)|tests?)\b", RegexOptions.CultureInvariant)]
     private static partial Regex TestCommandRegex();
+
+    [GeneratedRegex(@"(?ix)\b(?:dotnet\s+build|npm\s+run\s+build|build)\b", RegexOptions.CultureInvariant)]
+    private static partial Regex BuildCommandRegex();
 
     [GeneratedRegex(@"(?ix)\b(?:run|execute|invoke)\b[^.\n]{0,100}\b(?:commands?|tests?|build|lint|restore|validation)\b", RegexOptions.CultureInvariant)]
     private static partial Regex CommandExecutionRegex();

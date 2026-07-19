@@ -21,6 +21,35 @@ public sealed class PlanConstraintPolicyTests
         Assert.Equal(ExpectedPaths, Assert.Single(plan.RequirementCoverage).AffectedPaths);
     }
 
+    [Theory]
+    [InlineData("Modify these existing files only:")]
+    [InlineData("Modify only these three files:")]
+    [InlineData("Only these three existing files may be affected:")]
+    [InlineData("Only the following three paths may be affected:")]
+    [InlineData("Only the 3 existing paths may be affected:")]
+    [InlineData("Exactly these existing paths:")]
+    public async Task Bounded_scope_header_variants_create_authoritative_allowlist(string heading)
+    {
+        var context = Context($"{heading}\n- {ExpectedPaths[0]}\n- {ExpectedPaths[1]}\n- {ExpectedPaths[2]}");
+
+        var plan = (await new FakePlanningEngine().CreatePlanAsync(context)).Plan;
+
+        Assert.Equal(ExpectedPaths, plan.AffectedFiles.Select(file => file.Path));
+        Assert.DoesNotContain(plan.AffectedFiles, file => file.Path == "ManualTarget.csproj");
+    }
+
+    [Theory]
+    [InlineData("Consider these three files:")]
+    [InlineData("Files may include:")]
+    [InlineData("Likely affected files:")]
+    public void Ambiguous_scope_headers_are_not_authoritative(string heading)
+    {
+        var constraints = PlanConstraintPolicy.Derive(Context(
+            $"{heading}\n- {ExpectedPaths[0]}\n- {ExpectedPaths[1]}\n- {ExpectedPaths[2]}"));
+
+        Assert.Null(constraints.AuthoritativePaths);
+    }
+
     [Fact]
     public async Task Fake_revision_replaces_previous_scope_and_removes_tests_and_repository_commands()
     {
@@ -74,21 +103,78 @@ public sealed class PlanConstraintPolicyTests
     }
 
     [Fact]
-    public async Task Test_execution_prohibition_omits_test_changes_and_test_commands()
+    public async Task Test_execution_prohibition_preserves_explicit_test_change_but_omits_test_commands()
     {
-        var context = Context($"""
+        var context = TestContext("""
             Modify only:
-            - {ExpectedPaths[0]}
-            - {ExpectedPaths[1]}
-            - {ExpectedPaths[2]}
+            - tests/FooTests.cs
             Do not run tests.
             """);
 
         var plan = (await new FakePlanningEngine().CreatePlanAsync(context)).Plan;
 
-        Assert.DoesNotContain(plan.Steps, step => step.Description.Contains("tests", StringComparison.OrdinalIgnoreCase));
+        var file = Assert.Single(plan.AffectedFiles);
+        Assert.Equal("tests/FooTests.cs", file.Path);
+        Assert.Equal(PlannedFileAction.Modify, file.Action);
+        Assert.Contains(plan.Steps, step => step.Description.Contains("tests", StringComparison.OrdinalIgnoreCase));
         Assert.DoesNotContain(plan.ProposedValidationCommands, command => command.Contains("test", StringComparison.OrdinalIgnoreCase));
         Assert.Contains(plan.ProposedValidationCommands, command => command.Contains("build", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public async Task Test_change_prohibition_rejects_explicit_test_file_mutation()
+    {
+        var context = TestContext("""
+            Modify only:
+            - tests/FooTests.cs
+            Do not add or update tests.
+            """);
+
+        var exception = await Assert.ThrowsAsync<PlanningException>(() =>
+            new FakePlanningEngine().CreatePlanAsync(context));
+
+        Assert.Equal("plan_constraint_violation", exception.Category);
+    }
+
+    [Fact]
+    public async Task Explicit_test_file_inspect_remains_allowed_without_test_mutation_step()
+    {
+        var context = TestContext("""
+            Inspect only:
+            - tests/FooTests.cs
+            Do not add or update tests.
+            """);
+
+        var plan = (await new FakePlanningEngine().CreatePlanAsync(context)).Plan;
+
+        Assert.Equal(PlannedFileAction.Inspect, Assert.Single(plan.AffectedFiles).Action);
+        Assert.DoesNotContain(plan.Steps, step =>
+            step.Description.Contains("add or update focused tests", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public async Task Production_only_plan_does_not_invent_test_change_step()
+    {
+        var context = Context($"Modify only:\n- {ExpectedPaths[0]}\n- {ExpectedPaths[1]}\n- {ExpectedPaths[2]}");
+
+        var plan = (await new FakePlanningEngine().CreatePlanAsync(context)).Plan;
+
+        Assert.DoesNotContain(plan.Steps, step =>
+            step.Description.Contains("add or update focused tests", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public async Task Target_project_build_and_test_prohibition_removes_both_commands()
+    {
+        var context = Context($"Modify only:\n- {ExpectedPaths[0]}\nDo not run the target project's build or tests.");
+
+        var plan = (await new FakePlanningEngine().CreatePlanAsync(context)).Plan;
+
+        Assert.DoesNotContain(plan.ProposedValidationCommands, command =>
+            command.Contains("build", StringComparison.OrdinalIgnoreCase) ||
+            command.Contains("test", StringComparison.OrdinalIgnoreCase));
+        Assert.DoesNotContain(plan.Steps, step =>
+            step.Description.Contains("run", StringComparison.OrdinalIgnoreCase));
     }
 
     [Fact]
@@ -231,6 +317,40 @@ public sealed class PlanConstraintPolicyTests
         Assert.Equal(PlanConstraintPolicy.ConstraintViolationMessage, exception.Message);
     }
 
+    [Theory]
+    [InlineData("title")]
+    [InlineData("objective")]
+    [InlineData("repository-understanding")]
+    [InlineData("summary")]
+    [InlineData("affected-purpose")]
+    [InlineData("affected-path")]
+    [InlineData("step-description")]
+    [InlineData("step-result")]
+    [InlineData("step-path")]
+    [InlineData("coverage")]
+    [InlineData("risk")]
+    [InlineData("assumption")]
+    [InlineData("question")]
+    [InlineData("validation")]
+    public async Task Excluded_path_is_rejected_from_every_current_plan_text_surface(string field)
+    {
+        const string excluded = "ManualTarget.csproj";
+        var previous = (await new FakePlanningEngine().CreatePlanAsync(
+            Context("Update the selected repository files."))).Plan;
+        var revision = new PlanRevisionNote($"Exclude {excluded}.", Now, previous.Title,
+            previous.RepositoryFingerprint, previous);
+        var context = Context("Update the selected repository files.", revision,
+            previous.AffectedFiles.Select(file => file.Path).ToArray());
+        var valid = (await new FakePlanningEngine().CreatePlanAsync(context)).Plan;
+        var candidate = InjectExcludedPath(valid, field, excluded);
+
+        var exception = Assert.Throws<PlanningException>(() =>
+            PlanConstraintPolicy.ValidateCandidate(candidate, context));
+
+        Assert.Equal("plan_constraint_violation", exception.Category);
+        Assert.Equal(PlanConstraintPolicy.ConstraintViolationMessage, exception.Message);
+    }
+
     private static PlanningContext Context(
         string approvedRequirement,
         PlanRevisionNote? revision = null,
@@ -245,6 +365,59 @@ public sealed class PlanConstraintPolicyTests
             Now,
             revision,
             previousPaths);
+
+    private static PlanningContext TestContext(string approvedRequirement)
+    {
+        var metadata = new RepositoryFileMetadata(
+            "tests/FooTests.cs", ".cs", 50, 1, "test", true, "src/Foo.cs", ["FooTests"]);
+        var snapshot = Snapshot() with
+        {
+            Files = [metadata],
+            TotalDiscoveredFiles = 1,
+            EligibleTextFileCount = 1
+        };
+        var evidence = new EvidenceItem("ET", metadata.RelativePath, 1, 1, "class FooTests",
+            "selected test evidence", 50, "test-hash");
+        return new PlanningContext(
+            approvedRequirement, approvedRequirement, [], [], snapshot, [evidence], Now);
+    }
+
+    private static ImplementationPlan InjectExcludedPath(ImplementationPlan plan, string field, string path) => field switch
+    {
+        "title" => plan with { Title = $"Review {path}" },
+        "objective" => plan with { Objective = $"Review {path}" },
+        "repository-understanding" => plan with { RepositoryUnderstanding = $"Review {path}" },
+        "summary" => plan with { Summary = $"Review {path}" },
+        "affected-purpose" => plan with
+        {
+            AffectedFiles = [plan.AffectedFiles[0] with { Purpose = $"Review {path}" }, .. plan.AffectedFiles.Skip(1)]
+        },
+        "affected-path" => plan with
+        {
+            AffectedFiles = [plan.AffectedFiles[0] with { Path = path }, .. plan.AffectedFiles.Skip(1)]
+        },
+        "step-description" => plan with
+        {
+            Steps = [plan.Steps[0] with { Description = $"Review {path}" }, .. plan.Steps.Skip(1)]
+        },
+        "step-result" => plan with
+        {
+            Steps = [plan.Steps[0] with { ExpectedResult = $"Review {path}" }, .. plan.Steps.Skip(1)]
+        },
+        "step-path" => plan with
+        {
+            Steps = [plan.Steps[0] with { AffectedPaths = [path] }, .. plan.Steps.Skip(1)]
+        },
+        "coverage" => plan with
+        {
+            RequirementCoverage = [plan.RequirementCoverage[0] with { Requirement = $"Review {path}" }]
+        },
+        "risk" => plan with { Risks = [$"Review {path}"] },
+        "assumption" => plan with { Assumptions = [$"Review {path}"] },
+        "question" => plan with { UnresolvedQuestions = [$"Review {path}"] },
+        "validation" => plan with { ProposedValidationCommands = [$"review {path}"] },
+        _ => throw new ArgumentOutOfRangeException(nameof(field), field, null)
+    };
 
     private static string ApprovedRequirement() => """
         Modify only:

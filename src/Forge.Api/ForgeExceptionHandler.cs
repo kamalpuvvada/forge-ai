@@ -49,6 +49,8 @@ public sealed class ForgeExceptionHandler(
                     planning.Message, "plan_constraint_violation"),
                 "plan_revision_no_change" => (422, "Plan correction made no structural change",
                     planning.Message, "plan_revision_no_change"),
+                "plan_revision_restore_failure" => (409, "Previous proposed plan could not be restored",
+                    planning.Message, "plan_revision_restore_failure"),
                 _ => (422, "Invalid implementation plan", planning.Message, "invalid_plan")
             },
             ClarificationConfigurationException => (503, "AI configuration error", exception.Message, "ai_configuration"),

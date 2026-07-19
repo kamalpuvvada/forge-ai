@@ -192,6 +192,11 @@ public sealed class EngineeringTaskService(
             snapshotRead.TextFiles,
             task.RequirementSummary!,
             correction);
+        var previousEvidence = new EvidenceSelection(
+            task.EvidenceItems.ToArray(),
+            task.EvidenceFilesInspected,
+            task.EvidenceFilesSelected,
+            task.TotalEvidenceCharacters);
 
         task.RequestPlanRevision(correction, timeProvider.GetUtcNow());
         task.StoreEvidence(selection, timeProvider.GetUtcNow());
@@ -199,12 +204,13 @@ public sealed class EngineeringTaskService(
         if (selection.Items.Count == 0)
             throw new PlanningException("insufficient_evidence", "The plan correction did not match sufficient repository evidence.");
 
-        return await GenerateAndStorePlanAsync(task, cancellationToken);
+        return await GenerateAndStorePlanAsync(task, cancellationToken, previousEvidence);
     }
 
     private async Task<EngineeringTask> GenerateAndStorePlanAsync(
         EngineeringTask task,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        EvidenceSelection? revisionEvidenceToRestore = null)
     {
         var now = timeProvider.GetUtcNow();
         var engine = planningEngine ?? throw new PlanningException("planning_configuration", "Implementation planning is not configured.");
@@ -227,16 +233,7 @@ public sealed class EngineeringTaskService(
             var constraints = PlanConstraintPolicy.Derive(context);
             var evaluation = await engine.CreatePlanAsync(context, cancellationToken);
             if (evaluation.ModelCall is not null) task.RecordModelCall(evaluation.ModelCall, timeProvider.GetUtcNow());
-            try
-            {
-                PlanConstraintPolicy.ValidateCandidate(evaluation.Plan, context, constraints);
-            }
-            catch (PlanningException exception) when (exception.Category is "plan_constraint_violation" or "plan_revision_no_change")
-            {
-                if (evaluation.ModelCall is not null)
-                    await repository.SaveAsync(task, CancellationToken.None);
-                throw;
-            }
+            PlanConstraintPolicy.ValidateCandidate(evaluation.Plan, context, constraints);
             var maximumAge = TimeSpan.FromMinutes((analysisLimits ?? new RepositoryAnalysisLimits()).SnapshotMaximumAgeMinutes);
             task.StoreImplementationPlan(evaluation.Plan, timeProvider.GetUtcNow(), maximumAge);
             await repository.SaveAsync(task, cancellationToken);
@@ -247,6 +244,21 @@ public sealed class EngineeringTaskService(
             task.RecordModelCall(exception.FailedCall, timeProvider.GetUtcNow());
             // Preserve the failed provider audit even when the request token has been cancelled after failure.
             await repository.SaveAsync(task, CancellationToken.None);
+            throw;
+        }
+        catch (PlanningException exception) when (
+            exception.Category is "plan_constraint_violation" or "plan_revision_no_change" &&
+            revisionEvidenceToRestore is not null && task.PlanRevisionNotes.Count > 0)
+        {
+            task.RestoreRejectedPlanRevision(revisionEvidenceToRestore, timeProvider.GetUtcNow());
+            try
+            {
+                await repository.SaveAsync(task, CancellationToken.None);
+            }
+            catch (TaskPersistenceException)
+            {
+                throw new TaskPersistenceException();
+            }
             throw;
         }
     }

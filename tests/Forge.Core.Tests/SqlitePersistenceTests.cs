@@ -319,6 +319,43 @@ public sealed class SqlitePersistenceTests : IDisposable
     }
 
     [Fact]
+    public async Task Rejected_plan_revision_restoration_round_trips_with_previous_evidence_and_reviewable_plan()
+    {
+        await new SqliteDatabaseInitializer(ConnectionString).InitializeAsync();
+        var repository = new SqliteEngineeringTaskRepository(ConnectionString);
+        var now = DateTimeOffset.UtcNow;
+        var task = EngineeringTask.Create("C:/repo", "Add report export", now);
+        task.ApplyClarificationEvaluation(ClarificationEvaluation.Summarize("Add report export"), now);
+        task.ApproveRequirementSummary(now);
+        task.BeginRepositoryAnalysis(now);
+        var snapshot = PlanningWorkflowTests.Snapshot(now);
+        var evidence = PlanningWorkflowTests.Evidence();
+        var previousEvidence = new EvidenceSelection([evidence], 1, 1, evidence.Excerpt.Length);
+        task.StoreRepositorySnapshot(snapshot, now);
+        task.StoreEvidence(previousEvidence, now);
+        var previousPlan = PlanningWorkflowTests.Plan(snapshot, [evidence]);
+        task.StoreImplementationPlan(previousPlan, now, TimeSpan.FromMinutes(30));
+        task.RequestPlanRevision("Exactly one Modify action.", now.AddMinutes(1));
+        var refreshed = evidence with { Id = "ER", Excerpt = "refreshed correction evidence" };
+        task.StoreEvidence(new EvidenceSelection([refreshed], 1, 1, refreshed.Excerpt.Length), now.AddMinutes(1));
+
+        task.RestoreRejectedPlanRevision(previousEvidence, now.AddMinutes(2));
+        await repository.SaveAsync(task);
+        var loaded = await repository.GetAsync(task.Id);
+
+        Assert.NotNull(loaded);
+        Assert.Equal(WorkflowStatus.AwaitingPlanApproval, loaded.Status);
+        Assert.Equal(previousPlan.Title, loaded.ImplementationPlan?.Title);
+        Assert.Equal(previousPlan.Summary, loaded.ImplementationPlan?.Summary);
+        Assert.Equal(previousPlan.AffectedFiles.Select(file => (file.Path, file.Action)),
+            loaded.ImplementationPlan!.AffectedFiles.Select(file => (file.Path, file.Action)));
+        Assert.Null(loaded.PlanApprovedAt);
+        Assert.Equal(evidence.Id, Assert.Single(loaded.EvidenceItems).Id);
+        ImplementationPlanValidator.Validate(loaded.ImplementationPlan!, loaded.RepositorySnapshot!, loaded.EvidenceItems);
+        Assert.Single(loaded.PlanRevisionNotes);
+    }
+
+    [Fact]
     public async Task Legacy_implementing_plan_is_migrated_to_structured_plan_approved_state()
     {
         await new SqliteDatabaseInitializer(ConnectionString).InitializeAsync();
