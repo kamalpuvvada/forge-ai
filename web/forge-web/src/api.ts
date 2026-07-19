@@ -45,6 +45,7 @@ export const forgeApi = {
   createPlan: (id: string) => request<EngineeringTask>(`/api/tasks/${id}/plan`, { method: 'POST' }),
   requestPlanRevision: (id: string, correction: string) => request<EngineeringTask>(`/api/tasks/${id}/plan-revision`, { method: 'POST', body: JSON.stringify({ correction }) }),
   approvePlan: (id: string) => request<EngineeringTask>(`/api/tasks/${id}/plan-approval`, { method: 'POST' }),
+  generateImplementation: (id: string) => request<EngineeringTask>(`/api/tasks/${id}/implementation`, { method: 'POST' }),
   exportTaskPdf: async (id: string): Promise<TaskPdfDownload> => {
     const response = await fetch(`/api/tasks/${id}/export/pdf`, { headers: { Accept: 'application/pdf' } })
     if (!response.ok) await throwResponseError(response)

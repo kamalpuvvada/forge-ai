@@ -300,7 +300,8 @@ public sealed class EvidenceSelectionTests(ITestOutputHelper output)
             "src/Forge.Infrastructure/ModelCostResolver.cs");
         Assert.Contains(result.Items, item => item.RelativePath is "src/Forge.Infrastructure/SqliteEngineeringTaskRepository.cs" or
             "tests/Forge.Core.Tests/SqlitePersistenceTests.cs");
-        Assert.Contains(result.Items, item => item.RelativePath == "src/Forge.Api/Contracts/EngineeringTaskResponse.cs");
+        Assert.Contains(result.Items, item => item.RelativePath is "src/Forge.Api/Contracts/EngineeringTaskResponse.cs" or
+            "src/Forge.Api/Controllers/EngineeringTasksController.cs");
         Assert.True(result.Items.Count(item => item.RelativePath.Contains("Clarification", StringComparison.OrdinalIgnoreCase) ||
             item.RelativePath.Contains("PlanningEngine", StringComparison.OrdinalIgnoreCase)) <= 1);
     }

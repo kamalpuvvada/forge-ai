@@ -36,7 +36,12 @@ public sealed class OpenAIPlanningEngine(
         affected-file purposes and step descriptions brief. Refer to evidence only by ID.
         When a plan correction is supplied, directly address it, preserve valid portions of the previous plan,
         and add missing domain or persistence work when supported by refreshed evidence. State when evidence
-        remains insufficient, and do not merely reword the previous plan.
+        remains insufficient, and do not merely reword the previous plan. Obey the supplied deterministic explicit
+        plan constraints exactly: an authoritative affected-path allowlist is mutation scope, not a suggestion;
+        exclusions and action counts are binding; and explicit test or validation-command prohibitions must not be
+        contradicted. A prohibition on running tests restricts test execution, not an explicitly approved test-file
+        change; only a separate test-change prohibition forbids that mutation. Selected evidence outside an allowlist
+        remains read-only context only.
         When the approved requirement explicitly requires backend tests, identify an existing or proposed backend
         test file in affectedFiles and a concrete implementation step that changes it. Apply the same rule for
         explicitly required frontend tests. Validation commands such as dotnet test, lint, or build describe test
@@ -279,6 +284,7 @@ public sealed class OpenAIPlanningEngine(
     internal static string BuildCanonicalContext(PlanningContext context)
     {
         var snapshot = context.Snapshot;
+        var constraints = PlanConstraintPolicy.Derive(context);
         var payload = new
         {
             allowedExistingAffectedPaths = context.Evidence.Select(item => Safe(item.RelativePath, snapshot.NormalizedRoot))
@@ -297,6 +303,23 @@ public sealed class OpenAIPlanningEngine(
             previousPlanAffectedPaths = (context.PreviousPlanAffectedPaths ?? [])
                 .Select(path => Safe(path, snapshot.NormalizedRoot))
                 .Distinct(StringComparer.OrdinalIgnoreCase),
+            explicitPlanConstraints = new
+            {
+                authoritativeAffectedPaths = constraints.AuthoritativePaths?.Select(item => new
+                {
+                    path = Safe(item.Path, snapshot.NormalizedRoot),
+                    action = item.Action?.ToString()
+                }),
+                excludedPaths = constraints.ExcludedPaths.Select(path => Safe(path, snapshot.NormalizedRoot)),
+                exactActionCounts = constraints.ExactActionCounts.ToDictionary(
+                    item => item.Key.ToString(), item => item.Value, StringComparer.Ordinal),
+                prohibitedActions = constraints.ProhibitedActions.Select(action => action.ToString()),
+                constraints.TestChangesProhibited,
+                constraints.TestExecutionProhibited,
+                constraints.TargetBuildExecutionProhibited,
+                constraints.RepositoryValidationCommandsProhibited,
+                constraints.DiffMetadataReviewOnly
+            },
             repositorySnapshot = new
             {
                 snapshot.TotalDiscoveredFiles,

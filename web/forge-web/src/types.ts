@@ -1,4 +1,4 @@
-export type WorkflowStatus = 'Draft' | 'Clarifying' | 'RequirementSummaryReady' | 'AwaitingRequirementApproval' | 'ReadyForPlanning' | 'Planning' | 'AwaitingPlanApproval' | 'PlanApproved' | 'Implementing' | 'Validating' | 'Reviewing' | 'Completed' | 'Failed'
+export type WorkflowStatus = 'Draft' | 'Clarifying' | 'RequirementSummaryReady' | 'AwaitingRequirementApproval' | 'ReadyForPlanning' | 'Planning' | 'AwaitingPlanApproval' | 'PlanApproved' | 'Implementing' | 'AwaitingImplementationReview' | 'Validating' | 'Reviewing' | 'Completed' | 'Failed'
 export interface ClarificationAnswer { question: string; answer: string; answeredAt: string }
 export interface RequirementRevision { correction: string; previousSummary: string; submittedAt: string }
 export interface PlanRevision {
@@ -41,7 +41,7 @@ export interface ModelTelemetry {
 }
 export interface RepositoryFile { relativePath: string; extension: string; sizeBytes: number; lineCount: number; probableRole: string; isTest: boolean; association: string | null; declaredSymbols: string[] }
 export interface RepositorySnapshot {
-  normalizedRoot: string; isGitRepository: boolean; branch: string | null; shortHeadSha: string | null; fullHeadSha: string | null
+  isGitRepository: boolean; branch: string | null; shortHeadSha: string | null; fullHeadSha: string | null
   workingTreeStatus: string; totalDiscoveredFiles: number; eligibleTextFileCount: number; excludedFileCount: number
   detectedLanguages: string[]; detectedExtensions: string[]; projectFiles: string[]; testLocations: string[]; warnings: string[]
   analyzedAt: string; fingerprint: string; files: RepositoryFile[]
@@ -55,6 +55,24 @@ export interface ImplementationPlan {
   title: string; objective: string; repositoryUnderstanding: string; affectedFiles: PlannedFile[]; orderedSteps: ImplementationStep[]
   proposedValidationCommands: string[]; risks: string[]; assumptions: string[]; unresolvedQuestions: string[]; requirementCoverage: RequirementCoverage[]; summary: string
   source: 'DeterministicFake' | 'OpenAI'; planningModel: string | null; isDeterministicFake: boolean; createdAt: string; repositoryFingerprint: string
+}
+export type ImplementationOperationAction = 'Create' | 'Modify' | 'Delete'
+export interface ImplementationWorkspace {
+  token: string; branch: string; baseCommitSha: string; phase: 'Reserved' | 'Ready' | 'RecoveryRequired' | 'Completed' | 'WorkspacePreparing' | 'WorkspacePrepared' | 'MutationStarted' | 'ApplyCompleted' | 'ResultPersisted' | 'Interrupted'
+  createdAt: string; updatedAt: string; isAvailable: boolean
+}
+export type ImplementationAttemptDisposition = 'None' | 'Active' | 'SafeResume' | 'RecoveryRequired' | 'Interrupted' | 'TerminalIncompatible' | 'Completed'
+export interface ImplementationRuntime { workspaceAvailable: boolean; activeCheckoutVerified: boolean; disposition: ImplementationAttemptDisposition; safeMessage: string | null }
+export interface ImplementationFailure { category: string; message: string; recoveryRequired: boolean; occurredAt: string; safeToResume: boolean; activeCheckoutVerified: boolean }
+export interface ChangedFileReview {
+  path: string; action: ImplementationOperationAction; originalContentSha256: string | null; newContentSha256: string | null
+  originalBytes: number; newBytes: number; originalLines: number; newLines: number; additions: number; deletions: number
+  diffPreview: string; fullDiffCharacters: number; displayedDiffCharacters: number; diffTruncated: boolean; fullDiffUtf8Bytes: number; displayedDiffUtf8Bytes: number
+}
+export interface ImplementationResult {
+  source: 'DeterministicFake' | 'OpenAI'; model: string | null; baseCommitSha: string; branch: string; summary: string
+  warnings: string[]; changedFiles: ChangedFileReview[]; fullDiffCharacters: number; displayedDiffCharacters: number
+  diffTruncated: boolean; completedAt: string; isDeterministicFake: boolean; fullDiffUtf8Bytes: number; displayedDiffUtf8Bytes: number; activeCheckoutVerified: boolean
 }
 export interface EngineeringTask {
   id: string
@@ -80,6 +98,12 @@ export interface EngineeringTask {
   repositoryAnalyzedAt: string | null
   repositoryFingerprint: string | null
   planCreatedAt: string | null
+  implementationWorkspace: ImplementationWorkspace | null
+  implementationResult: ImplementationResult | null
+  lastImplementationFailure: ImplementationFailure | null
+  implementationStartedAt: string | null
+  implementationCompletedAt: string | null
+  implementationRuntime: ImplementationRuntime | null
   telemetry: ModelTelemetry
 }
 export interface EngineeringTaskSummary {
@@ -100,6 +124,10 @@ export interface SystemCapabilities {
   planningModel: string
   planningReasoningEffort: string
   planningConfigured: boolean
+  implementationProvider: string
+  implementationModel: string | null
+  implementationReasoningEffort: string | null
+  implementationConfigured: boolean
   aiConfigured: boolean
   repositoryInspectionAvailable: boolean
   planningAvailable: boolean

@@ -6,7 +6,8 @@ using Forge.Infrastructure;
 
 var builder = WebApplication.CreateBuilder(args);
 
-builder.Services.AddControllers()
+builder.Services.AddScoped<EngineeringTaskNotFoundExceptionFilter>();
+builder.Services.AddControllers(options => options.Filters.AddService<EngineeringTaskNotFoundExceptionFilter>())
     .AddJsonOptions(options => options.JsonSerializerOptions.Converters.Add(new JsonStringEnumConverter()));
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
@@ -22,11 +23,25 @@ var databasePath = Path.GetFullPath(configuredDataSource, builder.Environment.Co
 var connectionString = $"Data Source={databasePath}";
 var aiOptions = builder.Configuration.GetSection("Forge:AI").Get<ForgeAiOptions>() ?? new ForgeAiOptions();
 var analysisLimits = builder.Configuration.GetSection("Forge:RepositoryAnalysis").Get<RepositoryAnalysisLimits>() ?? new RepositoryAnalysisLimits();
+var implementationLimits = builder.Configuration.GetSection("Forge:Implementation:Limits").Get<ImplementationLimits>() ?? new ImplementationLimits();
+var workspaceOptions = builder.Configuration.GetSection("Forge:Implementation").Get<ImplementationWorkspaceOptions>() ?? new ImplementationWorkspaceOptions();
+if (!Path.IsPathFullyQualified(workspaceOptions.WorktreeRoot))
+    workspaceOptions.WorktreeRoot = Path.GetFullPath(workspaceOptions.WorktreeRoot, builder.Environment.ContentRootPath);
+var gitProcessOptions = builder.Configuration.GetSection("Forge:Implementation:Git").Get<GitProcessOptions>() ?? new GitProcessOptions();
+gitProcessOptions.ExecutablePath = GitExecutableResolver.Resolve(gitProcessOptions.ExecutablePath);
+gitProcessOptions.OwnedRoot = workspaceOptions.WorktreeRoot;
+gitProcessOptions.HooksDirectory = Path.Combine(workspaceOptions.WorktreeRoot, ".empty-hooks");
+gitProcessOptions.SafeHomeDirectory = Path.Combine(workspaceOptions.WorktreeRoot, ".git-home");
 var apiKey = Environment.GetEnvironmentVariable("OPENAI_API_KEY");
 
 builder.Services.AddSingleton(TimeProvider.System);
 builder.Services.AddSingleton(aiOptions);
 builder.Services.AddSingleton(analysisLimits);
+builder.Services.AddSingleton(implementationLimits);
+builder.Services.AddSingleton(workspaceOptions);
+builder.Services.AddSingleton(gitProcessOptions);
+builder.Services.AddSingleton<ImplementationOperationCoordinator>();
+builder.Services.AddSingleton(new ImplementationProcessIdentity(Guid.NewGuid()));
 builder.Services.AddSingleton(new OpenAIConfigurationState(!string.IsNullOrWhiteSpace(apiKey)));
 builder.Services.AddSingleton(new ModelCostCalculator(aiOptions.Pricing));
 builder.Services.AddSingleton<ModelCostResolver>();
@@ -52,9 +67,15 @@ builder.Services.AddSingleton<IPlanningEngine>(services => aiOptions.Mode switch
         services.GetRequiredService<TimeProvider>()),
     _ => throw new InvalidOperationException($"Unsupported Forge AI mode '{aiOptions.Mode}'. Use 'Fake' or 'OpenAI'.")
 });
-builder.Services.AddSingleton<IEngineeringTaskRepository>(_ => new SqliteEngineeringTaskRepository(connectionString));
+if (string.Equals(aiOptions.Mode, ForgeAiModes.Fake, StringComparison.OrdinalIgnoreCase))
+    builder.Services.AddSingleton<IImplementationEngine, FakeImplementationEngine>();
+builder.Services.AddSingleton<IEngineeringTaskRepository>(services => new SqliteEngineeringTaskRepository(
+    connectionString, implementationLimits, services.GetRequiredService<TimeProvider>()));
 builder.Services.AddSingleton<IRepositoryDiscoveryService, RepositoryDiscoveryService>();
 builder.Services.AddSingleton<IEvidenceSelectionService, DeterministicEvidenceSelectionService>();
+builder.Services.AddSingleton<RepositoryFileSafetyPolicy>();
+builder.Services.AddSingleton<IGitProcessRunner, GitProcessRunner>();
+builder.Services.AddSingleton<IImplementationWorkspaceManager, GitWorktreeManager>();
 builder.Services.AddSingleton(new SqliteDatabaseInitializer(connectionString));
 builder.Services.AddScoped<EngineeringTaskService>();
 

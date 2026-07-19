@@ -41,7 +41,14 @@ public sealed class SqliteDatabaseInitializer(string connectionString)
                 ImplementationPlan TEXT NULL,
                 RepositoryAnalyzedAt TEXT NULL,
                 RepositoryFingerprint TEXT NULL,
-                PlanCreatedAt TEXT NULL
+                PlanCreatedAt TEXT NULL,
+                ImplementationWorkspace TEXT NULL,
+                ImplementationResult TEXT NULL,
+                LastImplementationFailure TEXT NULL,
+                ImplementationStartedAt TEXT NULL,
+                ImplementationCompletedAt TEXT NULL,
+                ImplementationLease TEXT NULL,
+                RowVersion INTEGER NOT NULL DEFAULT 0
             );
             """;
         await command.ExecuteNonQueryAsync(cancellationToken);
@@ -57,6 +64,13 @@ public sealed class SqliteDatabaseInitializer(string connectionString)
         await EnsureColumnAsync(connection, "RepositoryAnalyzedAt", "TEXT NULL", cancellationToken);
         await EnsureColumnAsync(connection, "RepositoryFingerprint", "TEXT NULL", cancellationToken);
         await EnsureColumnAsync(connection, "PlanCreatedAt", "TEXT NULL", cancellationToken);
+        await EnsureColumnAsync(connection, "ImplementationWorkspace", "TEXT NULL", cancellationToken);
+        await EnsureColumnAsync(connection, "ImplementationResult", "TEXT NULL", cancellationToken);
+        await EnsureColumnAsync(connection, "LastImplementationFailure", "TEXT NULL", cancellationToken);
+        await EnsureColumnAsync(connection, "ImplementationStartedAt", "TEXT NULL", cancellationToken);
+        await EnsureColumnAsync(connection, "ImplementationCompletedAt", "TEXT NULL", cancellationToken);
+        await EnsureColumnAsync(connection, "ImplementationLease", "TEXT NULL", cancellationToken);
+        await EnsureColumnAsync(connection, "RowVersion", "INTEGER NOT NULL DEFAULT 0", cancellationToken);
         await EnsureIndexAsync(connection, cancellationToken);
     }
 

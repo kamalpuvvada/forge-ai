@@ -66,6 +66,32 @@ public sealed class ImplementationPlanPdfExporterTests
         Assert.DoesNotContain("PROPOSED PLAN \u2014 NOT APPROVED", text);
     }
 
+    [Theory]
+    [InlineData(WorkflowStatus.Implementing)]
+    [InlineData(WorkflowStatus.AwaitingImplementationReview)]
+    [InlineData(WorkflowStatus.Validating)]
+    [InlineData(WorkflowStatus.Reviewing)]
+    [InlineData(WorkflowStatus.Completed)]
+    public void Persisted_approval_timestamp_is_semantic_for_every_later_state(WorkflowStatus status)
+    {
+        var approved = PlannedTask();
+        approved.ApproveImplementationPlan(Now.AddMinutes(1));
+        var task = EngineeringTask.Rehydrate(
+            approved.Id, approved.Repository, approved.OriginalRequirement, approved.CurrentClarifiedRequirement,
+            approved.ClarificationAnswers, approved.RequirementRevisionNotes, approved.ModelCalls,
+            approved.CurrentPendingQuestion, approved.RequirementSummary, status, approved.CreatedAt,
+            approved.UpdatedAt, approved.RequirementApprovedAt, approved.PlanApprovedAt,
+            approved.RepositorySnapshot, approved.EvidenceItems, approved.EvidenceFilesInspected,
+            approved.EvidenceFilesSelected, approved.TotalEvidenceCharacters, approved.ImplementationPlan,
+            approved.RepositoryAnalyzedAt, approved.RepositoryFingerprint, approved.PlanCreatedAt,
+            approved.PlanRevisionNotes);
+
+        var text = Extract(Exporter().Export(task));
+
+        Assert.Contains("APPROVED PLAN", text);
+        Assert.DoesNotContain("PROPOSED PLAN \u2014 NOT APPROVED", text);
+    }
+
     [Fact]
     public void Export_rejects_tasks_without_an_available_complete_plan()
     {

@@ -15,8 +15,14 @@ public sealed class ForgeExceptionHandler(
     {
         var (status, title, detail, code) = exception switch
         {
-            KeyNotFoundException => (404, "Engineering task not found", exception.Message, "task_not_found"),
+            EngineeringTaskNotFoundException => (404, "Engineering task not found",
+                "The requested engineering task was not found.", "task_not_found"),
             WorkflowException => (409, "Invalid workflow action", exception.Message, "workflow_conflict"),
+            TaskConcurrencyException => (409, "Task changed concurrently", exception.Message, "task_concurrency_conflict"),
+            TaskDataCorruptException => (409, "Stored task data is invalid", exception.Message, "task_data_corrupt"),
+            TaskPersistenceException => (503, "Task persistence unavailable",
+                "Task persistence is temporarily unavailable. Retry the request after storage access is restored.",
+                "task_persistence_unavailable"),
             RepositoryDiscoveryException discovery => discovery.Category switch
             {
                 "inaccessible_path" => (403, "Repository path inaccessible", discovery.Message, "repository_inaccessible"),
@@ -24,6 +30,7 @@ public sealed class ForgeExceptionHandler(
                 "analysis_limits" => (422, "Repository analysis limit", discovery.Message, "repository_analysis_limit"),
                 _ => (400, "Repository path invalid", discovery.Message, "repository_missing_path")
             },
+            ImplementationException implementation => MapImplementationFailure(implementation),
             PlanningProviderException { Category: "missing_direct_evidence" } provider => (
                 422,
                 "Repository evidence does not support the plan",
@@ -39,6 +46,12 @@ public sealed class ForgeExceptionHandler(
                 "stale_snapshot" => (409, "Repository snapshot is stale", planning.Message, "stale_snapshot"),
                 "insufficient_evidence" => (422, "Insufficient repository evidence", planning.Message, "insufficient_evidence"),
                 "planning_configuration" => (503, "Planning unavailable", planning.Message, "planning_configuration"),
+                "plan_constraint_violation" => (422, "Implementation plan conflicts with approved scope",
+                    planning.Message, "plan_constraint_violation"),
+                "plan_revision_no_change" => (422, "Plan correction made no structural change",
+                    planning.Message, "plan_revision_no_change"),
+                "plan_revision_restore_failure" => (409, "Previous proposed plan could not be restored",
+                    planning.Message, "plan_revision_restore_failure"),
                 _ => (422, "Invalid implementation plan", planning.Message, "invalid_plan")
             },
             ClarificationConfigurationException => (503, "AI configuration error", exception.Message, "ai_configuration"),
@@ -69,5 +82,28 @@ public sealed class ForgeExceptionHandler(
             },
             Exception = exception
         });
+    }
+
+    private static (int Status, string Title, string Detail, string Code) MapImplementationFailure(
+        ImplementationException exception)
+    {
+        var safe = SensitiveContentDetector.ContainsSensitiveValue(exception.Category) ||
+                   SensitiveContentDetector.ContainsSensitiveValue(exception.Message)
+            ? new ImplementationException("implementation_failure",
+                "Implementation generation failed safely.", exception.RecoveryRequired)
+            : exception;
+        return safe.Category switch
+        {
+            "implementation_configuration" or "implementation_workspace_configuration" =>
+                (503, "Implementation unavailable", safe.Message, safe.Category),
+            "implementation_repository_not_git" or "implementation_repository_dirty" or
+                "implementation_base_changed" or "implementation_repository_state" or
+                "implementation_workspace_conflict" or "implementation_active_checkout_changed" or
+                "implementation_recovery_required" =>
+                (409, "Implementation workspace conflict", safe.Message, safe.Category),
+            "implementation_unsafe_path" =>
+                (400, "Unsafe implementation path", safe.Message, safe.Category),
+            _ => (422, "Implementation generation rejected", safe.Message, safe.Category)
+        };
     }
 }

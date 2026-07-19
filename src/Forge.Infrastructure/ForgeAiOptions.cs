@@ -20,6 +20,9 @@ public sealed class ForgeAiOptions
     public string PlanningModel { get; set; } = "gpt-5.6-sol";
     public string PlanningReasoningEffort { get; set; } = "medium";
     public int PlanningMaxOutputTokens { get; set; } = 6000;
+    public string ImplementationModel { get; set; } = "gpt-5.6-sol";
+    public string ImplementationReasoningEffort { get; set; } = "medium";
+    public int ImplementationMaxOutputTokens { get; set; } = 20_000;
     public Dictionary<string, ModelPricing> Pricing { get; set; } = DefaultPricing();
 
     public bool IsClarificationConfigurationComplete(bool hasApiKey) =>

@@ -3,7 +3,8 @@ namespace Forge.Core;
 public enum ModelCallStage
 {
     Clarification,
-    Planning
+    Planning,
+    Implementation
 }
 
 public sealed record ModelPricingSnapshot(

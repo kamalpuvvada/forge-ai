@@ -8,6 +8,8 @@
 - [x] Evidence-backed deterministic Fake planning and explicit plan approval
 - [x] Strict-schema OpenAI evidence-backed planning with non-billable adapter tests
 - [x] Explicit `PlanApproved` gate with legacy approved-plan compatibility
+- [x] Safe deterministic Fake implementation in an isolated task worktree
+- [x] Persisted bounded changed-file metadata and human diff-review state
 - [x] Stage-specific clarification/planning telemetry and truthful capabilities
 - [x] README setup and validation commands
 - [ ] Curated demo repository and demo data

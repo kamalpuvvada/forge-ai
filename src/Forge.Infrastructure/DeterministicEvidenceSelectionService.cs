@@ -157,7 +157,8 @@ public sealed class DeterministicEvidenceSelectionService(RepositoryAnalysisLimi
         bool CanAdd(RankedFile candidate)
         {
             if (paths.Contains(candidate.File.Metadata.RelativePath)) return false;
-            if (candidate.Module != "Docs" && chosen.Count(item => item.Module == candidate.Module) >= 3) return false;
+            var moduleLimit = candidate.PriorityNameMatch ? 4 : 3;
+            if (candidate.Module != "Docs" && chosen.Count(item => item.Module == candidate.Module) >= moduleLimit) return false;
             return candidate.Module != "Docs" || !chosen.Any(item => item.Module != "Docs") ||
                 chosen.Count(item => item.Module == "Docs") < 1;
         }
