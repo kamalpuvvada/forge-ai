@@ -39,8 +39,7 @@ public sealed class EngineeringTasksController(
     [ProducesResponseType<ProblemDetails>(StatusCodes.Status404NotFound)]
     public async Task<ActionResult<EngineeringTaskResponse>> Get(Guid id, CancellationToken cancellationToken)
     {
-        var task = await service.GetAsync(id, cancellationToken)
-            ?? throw new KeyNotFoundException($"Engineering task '{id}' was not found.");
+        var task = await service.GetRequiredAsync(id, cancellationToken);
         var runtime = await service.GetImplementationRuntimeStatusAsync(task, cancellationToken);
         return Ok(EngineeringTaskResponse.FromDomain(task, costResolver, runtime));
     }
@@ -51,9 +50,9 @@ public sealed class EngineeringTasksController(
     [ProducesResponseType<ProblemDetails>(StatusCodes.Status404NotFound)]
     public async Task<IActionResult> ExportPdf(Guid id, CancellationToken cancellationToken)
     {
-        var task = await service.GetAsync(id, cancellationToken)
-            ?? throw new KeyNotFoundException($"Engineering task '{id}' was not found.");
-        var bytes = pdfExporter.Export(task);
+        var task = await service.GetRequiredAsync(id, cancellationToken);
+        var runtime = await service.GetImplementationReportRuntimeStatusAsync(task, cancellationToken);
+        var bytes = pdfExporter.Export(task, runtime);
         return File(bytes, "application/pdf", $"forge-task-{task.Id:D}.pdf");
     }
 
@@ -64,8 +63,7 @@ public sealed class EngineeringTasksController(
     [ProducesResponseType<ProblemDetails>(StatusCodes.Status409Conflict)]
     public async Task<IActionResult> ExportPlanPdf(Guid id, CancellationToken cancellationToken)
     {
-        var task = await service.GetAsync(id, cancellationToken)
-            ?? throw new KeyNotFoundException($"Engineering task '{id}' was not found.");
+        var task = await service.GetRequiredAsync(id, cancellationToken);
         var bytes = planPdfExporter.Export(task);
         return File(bytes, "application/pdf", $"forge-plan-{task.Id:D}.pdf");
     }

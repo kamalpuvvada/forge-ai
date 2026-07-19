@@ -118,18 +118,20 @@ public sealed class GitProcessRunner : IGitProcessRunner
     private readonly string ownedRoot;
     private readonly string hooksDirectory;
     private readonly string safeHomeDirectory;
+    private readonly ISafeDirectoryAncestry ancestry;
 
-    public GitProcessRunner(GitProcessOptions options)
+    public GitProcessRunner(GitProcessOptions options) : this(options, new SafeDirectoryAncestry()) { }
+
+    internal GitProcessRunner(GitProcessOptions options, ISafeDirectoryAncestry ancestry)
     {
         this.options = options ?? throw new ArgumentNullException(nameof(options));
+        this.ancestry = ancestry ?? throw new ArgumentNullException(nameof(ancestry));
         executablePath = GitExecutableResolver.Resolve(options.ExecutablePath);
-        ownedRoot = ResolveOwnedRoot(options.OwnedRoot);
-        hooksDirectory = ResolveOwnedDirectory(
+        ownedRoot = NormalizeOwnedRoot(options.OwnedRoot);
+        hooksDirectory = NormalizeOwnedDirectory(
             string.IsNullOrWhiteSpace(options.HooksDirectory) ? Path.Combine(ownedRoot, ".empty-hooks") : options.HooksDirectory);
-        safeHomeDirectory = ResolveOwnedDirectory(
+        safeHomeDirectory = NormalizeOwnedDirectory(
             string.IsNullOrWhiteSpace(options.SafeHomeDirectory) ? Path.Combine(ownedRoot, ".git-home") : options.SafeHomeDirectory);
-        VerifyOwnedEmptyDirectory(hooksDirectory, requireEmpty: true);
-        VerifyOwnedEmptyDirectory(safeHomeDirectory, requireEmpty: true);
     }
 
     public async Task<GitProcessResult> RunAsync(
@@ -143,8 +145,7 @@ public sealed class GitProcessRunner : IGitProcessRunner
         ArgumentException.ThrowIfNullOrWhiteSpace(workingDirectory);
         ArgumentNullException.ThrowIfNull(arguments);
         cancellationToken.ThrowIfCancellationRequested();
-        VerifyOwnedEmptyDirectory(hooksDirectory, requireEmpty: true);
-        VerifyOwnedEmptyDirectory(safeHomeDirectory, requireEmpty: true);
+        InitializeOperationalDirectories();
 
         var startInfo = new ProcessStartInfo(executablePath)
         {
@@ -168,6 +169,7 @@ public sealed class GitProcessRunner : IGitProcessRunner
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeout.Token);
         try
         {
+            ValidateOperationalDirectories();
             process = Process.Start(startInfo)
                 ?? throw new ImplementationException("git_unavailable", "Git could not be started safely.");
             outputTask = ReadBoundedAsync(process.StandardOutput,
@@ -251,30 +253,51 @@ public sealed class GitProcessRunner : IGitProcessRunner
         if (!string.IsNullOrWhiteSpace(value)) startInfo.Environment[name] = value;
     }
 
-    private string ResolveOwnedDirectory(string path)
+    private string NormalizeOwnedDirectory(string path)
     {
         var fullPath = Path.GetFullPath(path);
         var prefix = ownedRoot.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
         if (!fullPath.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
             throw new ImplementationException("implementation_workspace_configuration", "A Git safety directory escaped the Forge-owned root.");
-        Directory.CreateDirectory(fullPath);
         return fullPath;
     }
 
-    private static string ResolveOwnedRoot(string configured)
+    private static string NormalizeOwnedRoot(string configured)
     {
         var path = string.IsNullOrWhiteSpace(configured)
             ? Path.Combine(Path.GetTempPath(), "ForgeAI", $"process-{Environment.ProcessId}")
             : configured;
-        var fullPath = Path.GetFullPath(path).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-        Directory.CreateDirectory(fullPath);
-        if ((File.GetAttributes(fullPath) & FileAttributes.ReparsePoint) != 0)
-            throw new ImplementationException("implementation_workspace_configuration", "The Forge-owned Git root cannot be a reparse point.");
-        return fullPath;
+        return Path.GetFullPath(path).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+    }
+
+    private void InitializeOperationalDirectories()
+    {
+        ancestry.EnsureCreated(ownedRoot);
+        ancestry.EnsureExisting(ownedRoot);
+        ancestry.EnsureCreated(hooksDirectory);
+        ancestry.EnsureExisting(ownedRoot);
+        ancestry.EnsureCreated(safeHomeDirectory);
+        ValidateOperationalDirectories();
+    }
+
+    private void ValidateOperationalDirectories()
+    {
+        ancestry.EnsureExisting(ownedRoot);
+        ancestry.EnsureExisting(hooksDirectory);
+        ancestry.EnsureExisting(safeHomeDirectory);
+        VerifyOwnedEmptyDirectory(hooksDirectory, requireEmpty: true);
+        VerifyOwnedEmptyDirectory(safeHomeDirectory, requireEmpty: true);
+    }
+
+    private void EnsureOwnedRootIsSafe()
+    {
+        ancestry.EnsureExisting(ownedRoot);
     }
 
     private void VerifyOwnedEmptyDirectory(string path, bool requireEmpty)
     {
+        EnsureOwnedRootIsSafe();
+        ancestry.EnsureExisting(path);
         var relative = Path.GetRelativePath(ownedRoot, path);
         if (relative.StartsWith("..", StringComparison.Ordinal) || Path.IsPathRooted(relative))
             throw new ImplementationException("implementation_workspace_configuration", "A Git safety directory escaped the Forge-owned root.");

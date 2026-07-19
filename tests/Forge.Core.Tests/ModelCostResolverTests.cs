@@ -105,6 +105,20 @@ public sealed class ModelCostResolverTests
         Assert.True(total.IsPartial);
     }
 
+    [Fact]
+    public void Total_treats_decimal_overflow_and_negative_legacy_values_as_unavailable()
+    {
+        var total = Resolver().ResolveTotal([
+            Call(1, 0, 1, decimal.MaxValue),
+            Call(1, 0, 1, decimal.MaxValue),
+            Call(1, 0, 1, -1m)
+        ]);
+
+        Assert.Equal(decimal.MaxValue, total.TotalEstimatedCostUsd);
+        Assert.Equal(2, total.UnavailableCallCount);
+        Assert.True(total.IsPartial);
+    }
+
     private static ModelCostCalculator Calculator() => new(new Dictionary<string, ModelPricing>(StringComparer.OrdinalIgnoreCase)
     {
         ["model"] = new(Snapshot.InputPerMillionUsd, Snapshot.CachedInputPerMillionUsd, Snapshot.OutputPerMillionUsd)

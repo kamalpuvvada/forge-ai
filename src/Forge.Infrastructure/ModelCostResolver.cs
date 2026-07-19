@@ -75,8 +75,13 @@ public sealed class ModelCostResolver(ModelCostCalculator calculator)
         foreach (var call in calls)
         {
             var resolved = Resolve(call);
-            if (resolved.EstimatedCostUsd is { } cost) total += cost;
-            else unavailable++;
+            if (resolved.EstimatedCostUsd is not { } cost || cost < 0)
+            {
+                unavailable++;
+                continue;
+            }
+            try { total = checked(total + cost); }
+            catch (OverflowException) { unavailable++; }
         }
         return new ModelTaskCostResolution(total, unavailable);
     }
@@ -103,7 +108,7 @@ public sealed class ModelCostResolver(ModelCostCalculator calculator)
             breakdown = calculator.Calculate(pricing, input, cached, output);
             return true;
         }
-        catch (ArgumentOutOfRangeException)
+        catch (Exception exception) when (exception is ArgumentOutOfRangeException or OverflowException)
         {
             return false;
         }

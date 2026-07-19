@@ -51,6 +51,9 @@ public sealed class RepositoryDisplayIdentifierTests
         var exposed = string.Join('\n', task.RequirementSummary, taskText, planText);
 
         Assert.Contains(RepositoryDisplayIdentifier.Create(repository), task.RequirementSummary);
+        Assert.Contains(
+            "Development note: requirement summary assembled by deterministic fake logic. At this summary-generation stage, no repository inspection or AI model call had occurred.",
+            task.RequirementSummary);
         Assert.DoesNotContain(repository, exposed, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain(recognizableUser, exposed, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain(recognizableDirectory, exposed, StringComparison.OrdinalIgnoreCase);

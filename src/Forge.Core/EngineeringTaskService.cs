@@ -75,6 +75,56 @@ public sealed class EngineeringTaskService(
             message);
     }
 
+    public async Task<ImplementationReportRuntimeStatus?> GetImplementationReportRuntimeStatusAsync(
+        EngineeringTask task,
+        CancellationToken cancellationToken = default)
+    {
+        if (task.ImplementationWorkspace is null) return null;
+        var available = implementationWorkspaceManager is not null &&
+                        await implementationWorkspaceManager.IsObservedAvailableReadOnlyAsync(
+                            task.Repository,
+                            task.ImplementationWorkspace,
+                            task.ImplementationPlan ?? throw new TaskDataCorruptException(
+                                "Stored implementation data is missing its approved plan."),
+                            task.ImplementationResult,
+                            cancellationToken);
+        var now = timeProvider.GetUtcNow();
+        var failure = task.LastImplementationFailure;
+        var activeLease = task.ImplementationLease?.IsActive(now) == true;
+        var disposition = failure?.RecoveryRequired == true
+            ? ImplementationAttemptDisposition.RecoveryRequired
+            : failure is { SafeToResume: false }
+                ? ImplementationAttemptDisposition.TerminalIncompatible
+                : task.Status == WorkflowStatus.AwaitingImplementationReview && task.ImplementationResult is not null
+                    ? available ? ImplementationAttemptDisposition.Completed : ImplementationAttemptDisposition.RecoveryRequired
+                    : activeLease
+                        ? ImplementationAttemptDisposition.Active
+                        : task.ImplementationWorkspace.Phase is ImplementationWorkspacePhase.Reserved or
+                            ImplementationWorkspacePhase.WorkspacePrepared or ImplementationWorkspacePhase.Ready
+                            ? ImplementationAttemptDisposition.SafeResume
+                            : task.ImplementationWorkspace.Phase is ImplementationWorkspacePhase.WorkspacePreparing or
+                                ImplementationWorkspacePhase.MutationStarted or ImplementationWorkspacePhase.ApplyCompleted or
+                                ImplementationWorkspacePhase.RecoveryRequired
+                                ? ImplementationAttemptDisposition.RecoveryRequired
+                                : ImplementationAttemptDisposition.Interrupted;
+        var message = disposition switch
+        {
+            ImplementationAttemptDisposition.Active => null,
+            ImplementationAttemptDisposition.SafeResume =>
+                "The persisted implementation attempt can be considered for resume after explicit workspace verification.",
+            ImplementationAttemptDisposition.Completed =>
+                "The expected isolated workspace path was observed with valid non-reparse worktree metadata at export time; no Git or checkout verification was performed.",
+            ImplementationAttemptDisposition.RecoveryRequired when task.Status == WorkflowStatus.AwaitingImplementationReview && !available =>
+                failure?.Message ?? "The persisted review remains readable, but the isolated workspace was not observed at export time.",
+            ImplementationAttemptDisposition.RecoveryRequired =>
+                failure?.Message ?? "The persisted implementation attempt requires explicit recovery.",
+            ImplementationAttemptDisposition.TerminalIncompatible =>
+                failure?.Message ?? "The approved plan is not compatible with deterministic Fake implementation.",
+            _ => failure?.Message ?? "The persisted implementation attempt is not active."
+        };
+        return new ImplementationReportRuntimeStatus(available, disposition, message);
+    }
+
     public Task<IReadOnlyList<EngineeringTaskSummary>> ListRecentAsync(CancellationToken cancellationToken = default) =>
         repository.ListRecentAsync(MaximumRecentTasks, cancellationToken);
 
@@ -236,6 +286,8 @@ public sealed class EngineeringTaskService(
             PlanConstraintPolicy.ValidateCandidate(evaluation.Plan, context, constraints);
             var maximumAge = TimeSpan.FromMinutes((analysisLimits ?? new RepositoryAnalysisLimits()).SnapshotMaximumAgeMinutes);
             task.StoreImplementationPlan(evaluation.Plan, timeProvider.GetUtcNow(), maximumAge);
+            if (revisionEvidenceToRestore is not null)
+                task.ResolvePlanRevisionAccepted(timeProvider.GetUtcNow());
             await repository.SaveAsync(task, cancellationToken);
             return task;
         }
@@ -584,7 +636,7 @@ public sealed class EngineeringTaskService(
         }
     }
 
-    private async Task<EngineeringTask> GetRequiredAsync(Guid id, CancellationToken cancellationToken) =>
+    public async Task<EngineeringTask> GetRequiredAsync(Guid id, CancellationToken cancellationToken = default) =>
         await repository.GetAsync(id, cancellationToken)
-        ?? throw new KeyNotFoundException($"Engineering task '{id}' was not found.");
+        ?? throw new EngineeringTaskNotFoundException();
 }

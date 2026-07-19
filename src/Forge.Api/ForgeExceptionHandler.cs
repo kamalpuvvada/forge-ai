@@ -15,7 +15,8 @@ public sealed class ForgeExceptionHandler(
     {
         var (status, title, detail, code) = exception switch
         {
-            KeyNotFoundException => (404, "Engineering task not found", exception.Message, "task_not_found"),
+            EngineeringTaskNotFoundException => (404, "Engineering task not found",
+                "The requested engineering task was not found.", "task_not_found"),
             WorkflowException => (409, "Invalid workflow action", exception.Message, "workflow_conflict"),
             TaskConcurrencyException => (409, "Task changed concurrently", exception.Message, "task_concurrency_conflict"),
             TaskDataCorruptException => (409, "Stored task data is invalid", exception.Message, "task_data_corrupt"),

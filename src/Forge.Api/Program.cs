@@ -6,7 +6,8 @@ using Forge.Infrastructure;
 
 var builder = WebApplication.CreateBuilder(args);
 
-builder.Services.AddControllers()
+builder.Services.AddScoped<EngineeringTaskNotFoundExceptionFilter>();
+builder.Services.AddControllers(options => options.Filters.AddService<EngineeringTaskNotFoundExceptionFilter>())
     .AddJsonOptions(options => options.JsonSerializerOptions.Converters.Add(new JsonStringEnumConverter()));
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();

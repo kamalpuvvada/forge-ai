@@ -97,6 +97,11 @@ public sealed record ImplementationRuntimeStatus(
     ImplementationAttemptDisposition Disposition,
     string? SafeMessage);
 
+public sealed record ImplementationReportRuntimeStatus(
+    bool WorkspaceObservedAvailable,
+    ImplementationAttemptDisposition Disposition,
+    string? SafeMessage);
+
 public sealed record ImplementationFailure(
     string Category,
     string Message,
@@ -254,6 +259,13 @@ public interface IImplementationWorkspaceManager
         ImplementationPlan plan,
         ImplementationResult? result,
         CancellationToken cancellationToken = default);
+
+    Task<bool> IsObservedAvailableReadOnlyAsync(
+        string repositoryPath,
+        ImplementationWorkspace workspace,
+        ImplementationPlan plan,
+        ImplementationResult? result,
+        CancellationToken cancellationToken = default) => Task.FromResult(false);
 
     Task VerifyResultAsync(
         string repositoryPath,

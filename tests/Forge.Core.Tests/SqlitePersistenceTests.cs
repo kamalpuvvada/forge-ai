@@ -131,6 +131,9 @@ public sealed class SqlitePersistenceTests : IDisposable
         Assert.Single(loaded.ClarificationAnswers);
         Assert.Single(loaded.RequirementRevisionNotes);
         Assert.Equal("All activity", loaded.RequirementRevisionNotes[0].PreviousSummary);
+        Assert.Equal(RequirementRevisionOutcome.ReplacementSummaryGenerated,
+            loaded.RequirementRevisionNotes[0].Outcome);
+        Assert.NotNull(loaded.RequirementRevisionNotes[0].ResolvedAt);
         Assert.Single(loaded.ModelCalls);
         Assert.Equal("resp_1", loaded.ModelCalls[0].ProviderResponseId);
         Assert.Equal(pricing, loaded.ModelCalls[0].PricingSnapshot);
@@ -304,6 +307,7 @@ public sealed class SqlitePersistenceTests : IDisposable
         task.StoreEvidence(new EvidenceSelection([evidence], 1, 1, evidence.Excerpt.Length), now.AddMinutes(1));
         var revisedPlan = PlanningWorkflowTests.Plan(snapshot, [evidence]) with { Title = "Revised pricing snapshot plan" };
         task.StoreImplementationPlan(revisedPlan, now.AddMinutes(2), TimeSpan.FromMinutes(30));
+        task.ResolvePlanRevisionAccepted(now.AddMinutes(2).AddSeconds(1));
         await repository.SaveAsync(task);
 
         var loaded = await repository.GetAsync(task.Id);
@@ -314,6 +318,8 @@ public sealed class SqlitePersistenceTests : IDisposable
         Assert.Equal(previousPlan.Title, revision.PreviousPlanTitle);
         Assert.Equal(previousPlan.Summary, revision.PreviousPlan.Summary);
         Assert.Equal(snapshot.Fingerprint, revision.PreviousRepositoryFingerprint);
+        Assert.Equal(PlanRevisionOutcome.Accepted, revision.Outcome);
+        Assert.Contains("corrected implementation plan", revision.StatusNote);
         Assert.Equal("Revised pricing snapshot plan", loaded.ImplementationPlan?.Title);
         Assert.Equal(WorkflowStatus.AwaitingPlanApproval, loaded.Status);
     }
@@ -352,7 +358,9 @@ public sealed class SqlitePersistenceTests : IDisposable
         Assert.Null(loaded.PlanApprovedAt);
         Assert.Equal(evidence.Id, Assert.Single(loaded.EvidenceItems).Id);
         ImplementationPlanValidator.Validate(loaded.ImplementationPlan!, loaded.RepositorySnapshot!, loaded.EvidenceItems);
-        Assert.Single(loaded.PlanRevisionNotes);
+        var revision = Assert.Single(loaded.PlanRevisionNotes);
+        Assert.Equal(PlanRevisionOutcome.RejectedAndPreviousProposalRestored, revision.Outcome);
+        Assert.Contains("not approved automatically", revision.StatusNote);
     }
 
     [Fact]

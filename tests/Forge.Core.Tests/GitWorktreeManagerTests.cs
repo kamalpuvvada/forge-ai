@@ -943,6 +943,134 @@ public sealed class GitWorktreeManagerTests : IDisposable
         }
     }
 
+    [Fact]
+    public async Task Read_only_workspace_observation_fails_closed_for_reparse_collision_and_malformed_metadata()
+    {
+        InitializeRepository();
+        var snapshot = Snapshot();
+        var plan = Plan(snapshot);
+        var manager = Manager();
+        var reservation = await manager.ReserveAsync(Guid.NewGuid(), _root, snapshot, plan);
+        var prepared = await manager.PrepareAsync(_root, reservation.Workspace, plan,
+            new ImplementationLimits(), reservation.ActiveCheckout);
+        await prepared.WorkspaceLock.DisposeAsync();
+        var workspacePath = Path.Combine(_worktrees, prepared.Workspace.Token);
+        var gitLink = Path.Combine(workspacePath, ".git");
+        var originalGitLink = await File.ReadAllTextAsync(gitLink);
+
+        Assert.True(await manager.IsObservedAvailableReadOnlyAsync(_root, prepared.Workspace, plan, null));
+        Assert.False(await manager.IsObservedAvailableReadOnlyAsync(_root + "-absent", prepared.Workspace, plan, null));
+        var absentRootManager = new GitWorktreeManager(CreateRunner(), new RepositoryFileSafetyPolicy(),
+            new ImplementationWorkspaceOptions { WorktreeRoot = _worktrees + "-absent" });
+        Assert.False(await absentRootManager.IsObservedAvailableReadOnlyAsync(_root, prepared.Workspace, plan, null));
+        Assert.False(Directory.Exists(_worktrees + "-absent"));
+
+        var rootReparse = new ObservationFileSystem(_worktrees);
+        Assert.False(await Manager(files: rootReparse)
+            .IsObservedAvailableReadOnlyAsync(_root, prepared.Workspace, plan, null));
+        var workspaceReparse = new ObservationFileSystem(workspacePath);
+        Assert.False(await Manager(files: workspaceReparse)
+            .IsObservedAvailableReadOnlyAsync(_root, prepared.Workspace, plan, null));
+        var parentReparse = new ObservationFileSystem(Path.GetDirectoryName(_worktrees));
+        Assert.False(await Manager(files: parentReparse)
+            .IsObservedAvailableReadOnlyAsync(_root, prepared.Workspace, plan, null));
+        var inaccessibleParent = new ObservationFileSystem(inaccessiblePath: Path.GetDirectoryName(_worktrees));
+        Assert.False(await Manager(files: inaccessibleParent)
+            .IsObservedAvailableReadOnlyAsync(_root, prepared.Workspace, plan, null));
+
+        File.Delete(gitLink);
+        Assert.False(await manager.IsObservedAvailableReadOnlyAsync(_root, prepared.Workspace, plan, null));
+        Directory.CreateDirectory(gitLink);
+        Assert.False(await manager.IsObservedAvailableReadOnlyAsync(_root, prepared.Workspace, plan, null));
+        Directory.Delete(gitLink);
+        await File.WriteAllTextAsync(gitLink, "gitdir: relative-or-malformed\nextra-line\n");
+        Assert.False(await manager.IsObservedAvailableReadOnlyAsync(_root, prepared.Workspace, plan, null));
+        await File.WriteAllTextAsync(gitLink, originalGitLink);
+
+        const string collisionToken = "abcdefabcdefabcdefabcdefabcdefab";
+        var collisionPath = Path.Combine(_worktrees, collisionToken);
+        Directory.CreateDirectory(collisionPath);
+        var collision = prepared.Workspace with
+        {
+            Token = collisionToken,
+            Branch = $"forge/task-{collisionToken}",
+            OwnershipReference = $"refs/forge/tasks/{collisionToken}"
+        };
+        Assert.False(await manager.IsObservedAvailableReadOnlyAsync(_root, collision, plan, null));
+        Assert.False(await manager.IsObservedAvailableReadOnlyAsync(_root,
+            collision with { Token = "../outside" }, plan, null));
+    }
+
+    [Fact]
+    public async Task Read_only_observation_supports_linked_source_worktrees_and_rejects_malformed_source_metadata()
+    {
+        InitializeRepository();
+        var linkedSource = Path.Combine(Path.GetTempPath(), $"forge-linked-source-{Guid.NewGuid():N}");
+        try
+        {
+            Git("worktree", "add", "-b", $"linked-source-{Guid.NewGuid():N}", linkedSource, "HEAD");
+            var head = GitAt(linkedSource, "rev-parse", "HEAD").Trim();
+            var snapshot = new RepositorySnapshot(linkedSource, true,
+                GitAt(linkedSource, "branch", "--show-current").Trim(), head[..8], head, "clean",
+                3, 3, 0, ["C#/.NET"], [".cs", ".txt", ".props"], [], [], [], DateTimeOffset.UtcNow,
+                "linked-fingerprint",
+                [
+                    new RepositoryFileMetadata("src/App.cs", ".cs", 21, 1, "source", false, "App", ["App"]),
+                    new RepositoryFileMetadata("docs/Delete.txt", ".txt", 10, 1, "source", false, "docs", []),
+                    new RepositoryFileMetadata("Repository.props", ".props", 24, 1, "configuration", false, null, [])
+                ], "status");
+            var plan = Plan(snapshot);
+            var manager = Manager();
+            Assert.Equal(string.Empty, GitAt(linkedSource, "status", "--porcelain=v1", "--untracked-files=all"));
+            var isolatedStatus = await CreateRunner().RunAsync(linkedSource,
+                ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames"]);
+            Assert.Equal(string.Empty, isolatedStatus.Output);
+            var reservation = await manager.ReserveAsync(Guid.NewGuid(), linkedSource, snapshot, plan);
+            var prepared = await manager.PrepareAsync(linkedSource, reservation.Workspace, plan,
+                new ImplementationLimits(), reservation.ActiveCheckout);
+            var output = (await new FakeImplementationEngine().GenerateAsync(new ImplementationContext(
+                "Approved", plan, prepared.Files, DateTimeOffset.UtcNow))).Output;
+            var result = await manager.ApplyAsync(linkedSource, prepared, output, new ImplementationLimits(),
+                DateTimeOffset.UtcNow);
+            await prepared.WorkspaceLock.DisposeAsync();
+
+            Assert.True(await manager.IsObservedAvailableReadOnlyAsync(linkedSource, prepared.Workspace, plan, result));
+
+            var sourceGitLink = Path.Combine(linkedSource, ".git");
+            var originalGitLink = await File.ReadAllTextAsync(sourceGitLink);
+            var metadataPath = originalGitLink["gitdir: ".Length..].Trim();
+            File.SetAttributes(sourceGitLink, FileAttributes.Normal);
+            await File.WriteAllTextAsync(sourceGitLink, "gitdir: ../relative-escape\n");
+            Assert.False(await manager.IsObservedAvailableReadOnlyAsync(linkedSource, prepared.Workspace, plan, result));
+            await File.WriteAllTextAsync(sourceGitLink, "gitdir: malformed\nextra\n");
+            Assert.False(await manager.IsObservedAvailableReadOnlyAsync(linkedSource, prepared.Workspace, plan, result));
+            await File.WriteAllTextAsync(sourceGitLink, "gitdir: " + new string('x', 5_000));
+            Assert.False(await manager.IsObservedAvailableReadOnlyAsync(linkedSource, prepared.Workspace, plan, result));
+            await File.WriteAllTextAsync(sourceGitLink, originalGitLink);
+
+            Assert.False(await Manager(files: new ObservationFileSystem(metadataPath))
+                .IsObservedAvailableReadOnlyAsync(linkedSource, prepared.Workspace, plan, result));
+            Assert.False(await manager.IsObservedAvailableReadOnlyAsync(linkedSource,
+                prepared.Workspace with { GitCommonDirectoryIdentity = new string('0', 64) }, plan, result));
+            Assert.False(await manager.IsObservedAvailableReadOnlyAsync(linkedSource,
+                prepared.Workspace with { RepositoryIdentity = new string('0', 64) }, plan, result));
+            Assert.False(await manager.IsObservedAvailableReadOnlyAsync(linkedSource + "-missing",
+                prepared.Workspace, plan, result));
+
+            File.Delete(sourceGitLink);
+            Directory.CreateDirectory(sourceGitLink);
+            Assert.False(await manager.IsObservedAvailableReadOnlyAsync(linkedSource, prepared.Workspace, plan, result));
+            Directory.Delete(sourceGitLink);
+            await File.WriteAllTextAsync(sourceGitLink, originalGitLink);
+            Assert.True(await manager.IsObservedAvailableReadOnlyAsync(linkedSource, prepared.Workspace, plan, result));
+        }
+        finally
+        {
+            try { Git("worktree", "remove", "--force", linkedSource); } catch { }
+            if (Directory.Exists(linkedSource)) Directory.Delete(linkedSource, true);
+        }
+    }
+
     private GitWorktreeManager Manager(IGitProcessRunner? runner = null, IImplementationFileSystem? files = null) => new(
         runner ?? CreateRunner(),
         new RepositoryFileSafetyPolicy(),
@@ -973,6 +1101,7 @@ public sealed class GitWorktreeManagerTests : IDisposable
         Git("init");
         Git("config", "user.email", "forge-tests@example.invalid");
         Git("config", "user.name", "Forge Tests");
+        Git("config", "core.autocrlf", "false");
         Git("add", ".");
         Git("commit", "-m", "initial");
     }
@@ -1185,6 +1314,40 @@ public sealed class GitWorktreeManagerTests : IDisposable
                 Cancellation?.Cancel();
         }
         public void DeleteFile(string path) => inner.DeleteFile(path);
+    }
+
+    private sealed class ObservationFileSystem(string? reparsePath = null, string? inaccessiblePath = null)
+        : IImplementationFileSystem
+    {
+        private readonly PhysicalImplementationFileSystem inner = new();
+        private readonly string? reparsePath = reparsePath is null
+            ? null
+            : Path.GetFullPath(reparsePath).TrimEnd('\\', '/');
+        private readonly string? inaccessiblePath = inaccessiblePath is null
+            ? null
+            : Path.GetFullPath(inaccessiblePath).TrimEnd('\\', '/');
+        public bool FileExists(string path) => inner.FileExists(path);
+        public bool DirectoryExists(string path) => inner.DirectoryExists(path);
+        public void CreateDirectory(string path) => inner.CreateDirectory(path);
+        public Task<byte[]> ReadAllBytesAsync(string path, CancellationToken cancellationToken) =>
+            inner.ReadAllBytesAsync(path, cancellationToken);
+        public Task WriteReplacementAsync(string path, byte[] content, bool overwrite,
+            CancellationToken cancellationToken) => inner.WriteReplacementAsync(path, content, overwrite, cancellationToken);
+        public void DeleteFile(string path) => inner.DeleteFile(path);
+        public SafeDirectoryEntry Inspect(string path)
+        {
+            if (inaccessiblePath is not null && string.Equals(Path.GetFullPath(path).TrimEnd('\\', '/'),
+                    inaccessiblePath, StringComparison.OrdinalIgnoreCase))
+                throw new UnauthorizedAccessException("Injected inaccessible ancestry.");
+            var entry = inner.Inspect(path);
+            return reparsePath is not null && string.Equals(Path.GetFullPath(path).TrimEnd('\\', '/'), reparsePath,
+                StringComparison.OrdinalIgnoreCase) ? entry with { IsReparseOrLink = true } : entry;
+        }
+        public bool IsReparsePoint(string path) =>
+            reparsePath is not null && string.Equals(Path.GetFullPath(path).TrimEnd('\\', '/'), reparsePath,
+                StringComparison.OrdinalIgnoreCase) || inner.IsReparsePoint(path);
+        public bool TryReadSmallTextFile(string path, int maximumCharacters, out string value) =>
+            inner.TryReadSmallTextFile(path, maximumCharacters, out value);
     }
 
     public void Dispose()

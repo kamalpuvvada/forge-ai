@@ -17,6 +17,122 @@ public sealed class GitProcessRunnerTests : IDisposable
     private readonly string safetyRoot = Path.Combine(Path.GetTempPath(), $"forge-git-safety-{Guid.NewGuid():N}");
 
     [Fact]
+    public async Task Construction_is_non_mutating_and_first_operational_command_creates_safety_directories()
+    {
+        InitializeRepository();
+
+        var runner = Runner();
+
+        Assert.False(Directory.Exists(safetyRoot));
+
+        var result = await runner.RunAsync(root, ["status", "--short"]);
+
+        Assert.Equal(0, result.ExitCode);
+        Assert.True(Directory.Exists(safetyRoot));
+        Assert.Empty(Directory.EnumerateFileSystemEntries(Path.Combine(safetyRoot, ".empty-hooks")));
+        Assert.Empty(Directory.EnumerateFileSystemEntries(Path.Combine(safetyRoot, ".git-home")));
+    }
+
+    [Fact]
+    public void Malformed_owned_directory_configuration_is_rejected_without_writing()
+    {
+        var escaped = Path.Combine(Path.GetTempPath(), $"forge-git-escaped-{Guid.NewGuid():N}");
+        try
+        {
+            var exception = Assert.Throws<ImplementationException>(() => new GitProcessRunner(new GitProcessOptions
+            {
+                OwnedRoot = safetyRoot,
+                HooksDirectory = escaped,
+                SafeHomeDirectory = Path.Combine(safetyRoot, ".git-home")
+            }));
+
+            Assert.Equal("implementation_workspace_configuration", exception.Category);
+            Assert.False(Directory.Exists(safetyRoot));
+            Assert.False(Directory.Exists(escaped));
+        }
+        finally
+        {
+            if (Directory.Exists(escaped)) Directory.Delete(escaped, true);
+        }
+    }
+
+    [Fact]
+    public async Task Operational_initialization_rejects_unsafe_or_inaccessible_ancestors_before_git_starts()
+    {
+        InitializeRepository();
+        var parent = Path.Combine(safetyRoot, "parent");
+        var owned = Path.Combine(parent, "owned");
+        Directory.CreateDirectory(parent);
+        Directory.CreateDirectory(owned);
+
+        foreach (var fileSystem in new[]
+                 {
+                     new InjectedSafeDirectoryFileSystem(reparsePath: parent),
+                     new InjectedSafeDirectoryFileSystem(inaccessiblePath: parent),
+                     new InjectedSafeDirectoryFileSystem(reparsePath: owned)
+                 })
+        {
+            var runner = Runner(owned, fileSystem);
+            var exception = await Assert.ThrowsAsync<ImplementationException>(() =>
+                runner.RunAsync(root, ["status", "--short"]));
+            Assert.Equal("implementation_workspace_configuration", exception.Category);
+            Assert.False(Directory.Exists(Path.Combine(owned, ".empty-hooks")));
+            Assert.False(Directory.Exists(Path.Combine(owned, ".git-home")));
+        }
+    }
+
+    [Fact]
+    public async Task Operational_initialization_revalidates_after_each_created_segment()
+    {
+        InitializeRepository();
+        var parent = Path.Combine(safetyRoot, "race-parent");
+        var owned = Path.Combine(parent, "owned");
+        Directory.CreateDirectory(parent);
+        var fileSystem = new InjectedSafeDirectoryFileSystem(
+            reparseAfterCreatePath: parent,
+            createTriggerPath: owned);
+        var runner = Runner(owned, fileSystem);
+
+        var exception = await Assert.ThrowsAsync<ImplementationException>(() =>
+            runner.RunAsync(root, ["status", "--short"]));
+
+        Assert.Equal("implementation_workspace_configuration", exception.Category);
+        Assert.True(Directory.Exists(owned));
+        Assert.False(Directory.Exists(Path.Combine(owned, ".empty-hooks")));
+        Assert.False(Directory.Exists(Path.Combine(owned, ".git-home")));
+    }
+
+    [Fact]
+    public async Task Real_ancestor_symbolic_link_is_rejected_without_creating_through_it_when_supported()
+    {
+        InitializeRepository();
+        var link = Path.Combine(Path.GetTempPath(), $"forge-ancestry-link-{Guid.NewGuid():N}");
+        var target = Path.Combine(Path.GetTempPath(), $"forge-ancestry-target-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(target);
+        try
+        {
+            try { Directory.CreateSymbolicLink(link, target); }
+            catch (Exception exception) when (exception is UnauthorizedAccessException or IOException or PlatformNotSupportedException)
+            {
+                return;
+            }
+            var owned = Path.Combine(link, "owned");
+            var runner = Runner(owned, new PhysicalSafeDirectoryFileSystem());
+
+            var rejection = await Assert.ThrowsAsync<ImplementationException>(() =>
+                runner.RunAsync(root, ["status", "--short"]));
+
+            Assert.Equal("implementation_workspace_configuration", rejection.Category);
+            Assert.False(Directory.Exists(Path.Combine(target, "owned")));
+        }
+        finally
+        {
+            if (Directory.Exists(link)) Directory.Delete(link);
+            if (Directory.Exists(target)) Directory.Delete(target, true);
+        }
+    }
+
+    [Fact]
     public async Task Timeout_and_mutating_cancellation_kill_the_git_process_tree_and_require_recovery()
     {
         InitializeRepository();
@@ -138,6 +254,13 @@ public sealed class GitProcessRunnerTests : IDisposable
         MaximumErrorCharacters = maximumError
     });
 
+    private GitProcessRunner Runner(string ownedRoot, ISafeDirectoryFileSystem fileSystem) => new(new GitProcessOptions
+    {
+        OwnedRoot = ownedRoot,
+        HooksDirectory = Path.Combine(ownedRoot, ".empty-hooks"),
+        SafeHomeDirectory = Path.Combine(ownedRoot, ".git-home")
+    }, new SafeDirectoryAncestry(fileSystem));
+
     private void InitializeRepository()
     {
         Directory.CreateDirectory(root);
@@ -165,6 +288,37 @@ public sealed class GitProcessRunnerTests : IDisposable
         process.WaitForExit();
         Assert.True(process.ExitCode == 0, error);
         return output;
+    }
+
+    private sealed class InjectedSafeDirectoryFileSystem(
+        string? reparsePath = null,
+        string? inaccessiblePath = null,
+        string? reparseAfterCreatePath = null,
+        string? createTriggerPath = null) : ISafeDirectoryFileSystem
+    {
+        private readonly PhysicalSafeDirectoryFileSystem inner = new();
+        private bool raceTriggered;
+        public SafeDirectoryEntry Inspect(string path)
+        {
+            var normalized = Path.GetFullPath(path).TrimEnd('\\', '/');
+            if (inaccessiblePath is not null && PathsEqual(normalized, inaccessiblePath))
+                throw new UnauthorizedAccessException("Injected inaccessible ancestor.");
+            var entry = inner.Inspect(path);
+            if (reparsePath is not null && PathsEqual(normalized, reparsePath) ||
+                raceTriggered && reparseAfterCreatePath is not null && PathsEqual(normalized, reparseAfterCreatePath))
+                return entry with { IsReparseOrLink = true };
+            return entry;
+        }
+
+        public void CreateDirectory(string path)
+        {
+            inner.CreateDirectory(path);
+            if (createTriggerPath is not null && PathsEqual(path, createTriggerPath)) raceTriggered = true;
+        }
+
+        private static bool PathsEqual(string left, string right) =>
+            string.Equals(Path.GetFullPath(left).TrimEnd('\\', '/'), Path.GetFullPath(right).TrimEnd('\\', '/'),
+                StringComparison.OrdinalIgnoreCase);
     }
 
     public void Dispose()

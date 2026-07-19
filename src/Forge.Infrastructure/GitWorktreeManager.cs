@@ -12,18 +12,35 @@ public sealed class ImplementationWorkspaceOptions
         "ForgeAI", "worktrees");
 }
 
-public interface IImplementationFileSystem
+public interface IImplementationFileSystem : ISafeDirectoryFileSystem
 {
     bool FileExists(string path);
     bool DirectoryExists(string path);
-    void CreateDirectory(string path);
     Task<byte[]> ReadAllBytesAsync(string path, CancellationToken cancellationToken);
     Task WriteReplacementAsync(string path, byte[] content, bool overwrite, CancellationToken cancellationToken);
     void DeleteFile(string path);
+    SafeDirectoryEntry ISafeDirectoryFileSystem.Inspect(string path) =>
+        new PhysicalSafeDirectoryFileSystem().Inspect(path);
+    bool IsReparsePoint(string path) => (File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0;
+    bool TryReadSmallTextFile(string path, int maximumCharacters, out string value)
+    {
+        value = string.Empty;
+        try
+        {
+            if (!File.Exists(path) || new FileInfo(path).Length > maximumCharacters * 4L) return false;
+            value = File.ReadAllText(path);
+            return value.Length <= maximumCharacters;
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or DecoderFallbackException)
+        {
+            return false;
+        }
+    }
 }
 
 public sealed class PhysicalImplementationFileSystem : IImplementationFileSystem
 {
+    private readonly PhysicalSafeDirectoryFileSystem directoryFileSystem = new();
     public bool FileExists(string path) => File.Exists(path);
     public bool DirectoryExists(string path) => Directory.Exists(path);
     public void CreateDirectory(string path) => Directory.CreateDirectory(path);
@@ -52,6 +69,22 @@ public sealed class PhysicalImplementationFileSystem : IImplementationFileSystem
     }
 
     public void DeleteFile(string path) => File.Delete(path);
+    public SafeDirectoryEntry Inspect(string path) => directoryFileSystem.Inspect(path);
+    public bool IsReparsePoint(string path) => (File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0;
+    public bool TryReadSmallTextFile(string path, int maximumCharacters, out string value)
+    {
+        value = string.Empty;
+        try
+        {
+            if (!File.Exists(path) || new FileInfo(path).Length > maximumCharacters * 4L) return false;
+            value = File.ReadAllText(path);
+            return value.Length <= maximumCharacters;
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or DecoderFallbackException)
+        {
+            return false;
+        }
+    }
 }
 
 public sealed class GitWorktreeManager : IImplementationWorkspaceManager
@@ -60,17 +93,20 @@ public sealed class GitWorktreeManager : IImplementationWorkspaceManager
     private readonly RepositoryFileSafetyPolicy fileSafety;
     private readonly ImplementationWorkspaceOptions options;
     private readonly IImplementationFileSystem files;
+    private readonly ISafeDirectoryAncestry ancestry;
 
     public GitWorktreeManager(
         IGitProcessRunner git,
         RepositoryFileSafetyPolicy fileSafety,
         ImplementationWorkspaceOptions options,
-        IImplementationFileSystem? files = null)
+        IImplementationFileSystem? files = null,
+        ISafeDirectoryAncestry? ancestry = null)
     {
         this.git = git;
         this.fileSafety = fileSafety;
         this.options = options;
         this.files = files ?? new PhysicalImplementationFileSystem();
+        this.ancestry = ancestry ?? new SafeDirectoryAncestry(this.files);
     }
 
     public async Task<ImplementationReservation> ReserveAsync(
@@ -523,6 +559,138 @@ public sealed class GitWorktreeManager : IImplementationWorkspaceManager
         {
             return false;
         }
+    }
+
+    public Task<bool> IsObservedAvailableReadOnlyAsync(
+        string repositoryPath,
+        ImplementationWorkspace workspace,
+        ImplementationPlan plan,
+        ImplementationResult? result,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        try
+        {
+            var worktreeRoot = NormalizeDirectory(options.WorktreeRoot);
+            if (!ancestry.IsExistingSafe(worktreeRoot)) return Task.FromResult(false);
+            var workspacePath = ResolveWorkspacePath(worktreeRoot, workspace.Token);
+            if (!ancestry.IsExistingSafe(workspacePath)) return Task.FromResult(false);
+            if (!ObservedWorkspaceIdentityIsValid(repositoryPath, workspacePath, workspace))
+                return Task.FromResult(false);
+            if (result is not null &&
+                (!string.Equals(result.BaseCommitSha, workspace.BaseCommitSha, StringComparison.Ordinal) ||
+                 !string.Equals(result.Branch, workspace.Branch, StringComparison.Ordinal)))
+                return Task.FromResult(false);
+            return Task.FromResult(true);
+        }
+        catch (Exception exception) when (exception is ImplementationException or IOException or
+                                          UnauthorizedAccessException or ArgumentException)
+        {
+            return Task.FromResult(false);
+        }
+    }
+
+    private bool ObservedWorkspaceIdentityIsValid(
+        string repositoryPath,
+        string workspacePath,
+        ImplementationWorkspace workspace)
+    {
+        if (string.IsNullOrWhiteSpace(workspace.RepositoryIdentity) ||
+            string.IsNullOrWhiteSpace(workspace.GitCommonDirectoryIdentity) ||
+            !string.Equals(workspace.Branch, $"forge/task-{workspace.Token}", StringComparison.Ordinal) ||
+            !string.Equals(workspace.OwnershipReference, $"refs/forge/tasks/{workspace.Token}", StringComparison.Ordinal))
+            return false;
+
+        var repositoryRoot = NormalizeDirectory(repositoryPath);
+        if (!ancestry.IsExistingSafe(repositoryRoot) ||
+            !string.Equals(HashCanonicalPath(repositoryRoot), workspace.RepositoryIdentity, StringComparison.Ordinal))
+            return false;
+        if (!TryResolveObservedSourceCommonDirectory(repositoryRoot, out var sourceCommonDirectory) ||
+            !string.Equals(HashCanonicalPath(sourceCommonDirectory), workspace.GitCommonDirectoryIdentity,
+                StringComparison.Ordinal)) return false;
+
+        return TryResolveObservedLinkedCheckout(workspacePath, $"refs/heads/{workspace.Branch}",
+                   out var workspaceCommonDirectory) &&
+               PathsEqual(workspaceCommonDirectory, sourceCommonDirectory) &&
+               string.Equals(HashCanonicalPath(workspaceCommonDirectory), workspace.GitCommonDirectoryIdentity,
+                   StringComparison.Ordinal);
+    }
+
+    private bool TryResolveObservedSourceCommonDirectory(string repositoryRoot, out string commonDirectory)
+    {
+        commonDirectory = string.Empty;
+        var gitEntry = Path.Combine(repositoryRoot, ".git");
+        SafeDirectoryEntry entry;
+        try { entry = files.Inspect(gitEntry); }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { return false; }
+        if (entry.IsReparseOrLink) return false;
+        if (entry.Kind == SafeDirectoryEntryKind.Directory)
+        {
+            if (!ancestry.IsExistingSafe(gitEntry)) return false;
+            commonDirectory = NormalizeDirectory(gitEntry);
+            return true;
+        }
+        if (entry.Kind != SafeDirectoryEntryKind.Other) return false;
+        return TryResolveObservedLinkedCheckout(repositoryRoot, null, out commonDirectory);
+    }
+
+    private bool TryResolveObservedLinkedCheckout(
+        string checkoutPath,
+        string? expectedHeadReference,
+        out string commonDirectory)
+    {
+        commonDirectory = string.Empty;
+        var gitLink = Path.Combine(checkoutPath, ".git");
+        if (!ObservedRegularTextFile(gitLink, out var gitLinkText) ||
+            !TryParseSingleLineValue(gitLinkText, "gitdir: ", out var metadataValue) ||
+            !Path.IsPathFullyQualified(metadataValue)) return false;
+        var metadataDirectory = NormalizeDirectory(metadataValue);
+        if (!ancestry.IsExistingSafe(metadataDirectory)) return false;
+
+        var backLink = Path.Combine(metadataDirectory, "gitdir");
+        var commonLink = Path.Combine(metadataDirectory, "commondir");
+        var head = Path.Combine(metadataDirectory, "HEAD");
+        if (!ObservedRegularTextFile(backLink, out var backLinkText) ||
+            !ObservedRegularTextFile(commonLink, out var commonLinkText) ||
+            !ObservedRegularTextFile(head, out var headText) ||
+            !TryParseSingleLineValue(backLinkText, string.Empty, out var backLinkValue) ||
+            !Path.IsPathFullyQualified(backLinkValue) || !PathsEqual(backLinkValue, gitLink) ||
+            !TryParseSingleLineValue(commonLinkText, string.Empty, out var commonLinkValue)) return false;
+
+        var resolvedCommon = Path.GetFullPath(commonLinkValue, metadataDirectory);
+        if (!ancestry.IsExistingSafe(resolvedCommon)) return false;
+        var worktreesDirectory = Path.GetDirectoryName(metadataDirectory);
+        if (worktreesDirectory is null ||
+            !string.Equals(Path.GetFileName(worktreesDirectory), "worktrees", StringComparison.OrdinalIgnoreCase) ||
+            !PathsEqual(Path.GetDirectoryName(worktreesDirectory) ?? string.Empty, resolvedCommon)) return false;
+
+        if (!TryParseSingleLineValue(headText, "ref: ", out var headReference) ||
+            !headReference.StartsWith("refs/heads/", StringComparison.Ordinal) ||
+            expectedHeadReference is not null && !string.Equals(headReference, expectedHeadReference, StringComparison.Ordinal))
+            return false;
+        commonDirectory = NormalizeDirectory(resolvedCommon);
+        return true;
+    }
+
+    private bool ObservedRegularTextFile(string path, out string value)
+    {
+        value = string.Empty;
+        SafeDirectoryEntry entry;
+        try { entry = files.Inspect(path); }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { return false; }
+        var parent = Path.GetDirectoryName(path);
+        return parent is not null && ancestry.IsExistingSafe(parent) && entry.Kind == SafeDirectoryEntryKind.Other &&
+               !entry.IsReparseOrLink && files.TryReadSmallTextFile(path, 4_096, out value);
+    }
+
+    private static bool TryParseSingleLineValue(string text, string prefix, out string value)
+    {
+        value = string.Empty;
+        var normalized = text.Replace("\r\n", "\n", StringComparison.Ordinal).TrimEnd('\n');
+        if (normalized.Length == 0 || normalized.Contains('\n') || !normalized.StartsWith(prefix, StringComparison.Ordinal))
+            return false;
+        value = normalized[prefix.Length..].Trim();
+        return value.Length > 0;
     }
 
     public Task VerifyActiveCheckoutAsync(

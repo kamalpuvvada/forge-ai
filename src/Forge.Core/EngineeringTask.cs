@@ -79,6 +79,10 @@ public sealed class EngineeringTask
                 CurrentPendingQuestion = null;
                 RequirementSummary = evaluation.Summary;
                 Status = WorkflowStatus.AwaitingRequirementApproval;
+                ResolveLatestRequirementRevision(
+                    RequirementRevisionOutcome.ReplacementSummaryGenerated,
+                    now,
+                    "A replacement requirement summary was generated and awaits approval.");
                 break;
             default:
                 throw new WorkflowException("Clarification evaluation must contain exactly one valid decision.");
@@ -124,6 +128,10 @@ public sealed class EngineeringTask
             throw new WorkflowException("A requirement summary must exist before it can be approved.");
         RequirementApprovedAt = now;
         Status = WorkflowStatus.ReadyForPlanning;
+        ResolveLatestRequirementRevision(
+            RequirementRevisionOutcome.Approved,
+            now,
+            "The replacement requirement summary was approved.");
         UpdatedAt = now;
     }
 
@@ -238,6 +246,18 @@ public sealed class EngineeringTask
         ImplementationPlan = plan;
         PlanCreatedAt = plan.CreatedAt;
         Status = WorkflowStatus.AwaitingPlanApproval;
+        UpdatedAt = now;
+    }
+
+    public void ResolvePlanRevisionAccepted(DateTimeOffset now)
+    {
+        EnsureStatus(WorkflowStatus.AwaitingPlanApproval);
+        if (_planRevisionNotes.Count == 0 || _planRevisionNotes[^1].Outcome != PlanRevisionOutcome.Submitted)
+            throw new WorkflowException("A submitted plan revision is required before recording an accepted correction.");
+        ResolveLatestPlanRevision(
+            PlanRevisionOutcome.Accepted,
+            now,
+            "A corrected implementation plan was generated and awaits approval.");
         UpdatedAt = now;
     }
 
@@ -435,6 +455,10 @@ public sealed class EngineeringTask
         PlanCreatedAt = revision.PreviousPlan.CreatedAt;
         PlanApprovedAt = null;
         Status = WorkflowStatus.AwaitingPlanApproval;
+        ResolveLatestPlanRevision(
+            PlanRevisionOutcome.RejectedAndPreviousProposalRestored,
+            now,
+            "The correction was rejected and the previous proposed plan was restored for review; it was not approved automatically.");
         UpdatedAt = now;
     }
 
@@ -559,6 +583,28 @@ public sealed class EngineeringTask
     {
         if (Status != expected)
             throw new WorkflowException($"Action requires {expected} status; current status is {Status}.");
+    }
+
+    private void ResolveLatestRequirementRevision(
+        RequirementRevisionOutcome outcome,
+        DateTimeOffset now,
+        string note)
+    {
+        if (_requirementRevisionNotes.Count == 0) return;
+        var latest = _requirementRevisionNotes[^1];
+        if (latest.Outcome == RequirementRevisionOutcome.Approved) return;
+        _requirementRevisionNotes[^1] = latest with { Outcome = outcome, ResolvedAt = now, StatusNote = note };
+    }
+
+    private void ResolveLatestPlanRevision(
+        PlanRevisionOutcome outcome,
+        DateTimeOffset now,
+        string note)
+    {
+        if (_planRevisionNotes.Count == 0) return;
+        var latest = _planRevisionNotes[^1];
+        if (latest.Outcome != PlanRevisionOutcome.Submitted) return;
+        _planRevisionNotes[^1] = latest with { Outcome = outcome, ResolvedAt = now, StatusNote = note };
     }
 
     private void RebuildClarifiedRequirement()

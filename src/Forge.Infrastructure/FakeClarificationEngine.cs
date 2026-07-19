@@ -55,7 +55,7 @@ public sealed class FakeClarificationEngine : IClarificationEngine
         }
 
         summary.AppendLine()
-            .Append("Development note: assembled by deterministic fake logic. No repository inspection or AI model call occurred.");
+            .Append("Development note: requirement summary assembled by deterministic fake logic. At this summary-generation stage, no repository inspection or AI model call had occurred.");
         return summary.ToString();
     }
 }

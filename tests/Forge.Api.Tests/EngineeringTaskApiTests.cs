@@ -2,6 +2,8 @@ using System.Net;
 using System.Net.Http.Json;
 using System.Diagnostics;
 using System.Collections.Concurrent;
+using System.Globalization;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using Forge.Api.Contracts;
@@ -127,6 +129,41 @@ public sealed class EngineeringTaskApiTests : IClassFixture<FakeModeFactory>
         Assert.Equal(HttpStatusCode.NotFound, invalid.StatusCode);
         Assert.Equal(HttpStatusCode.NotFound, missing.StatusCode);
         Assert.Equal("task_not_found", problem.GetProperty("code").GetString());
+    }
+
+    [Theory]
+    [InlineData("GET", "/api/tasks/{0}")]
+    [InlineData("GET", "/api/tasks/{0}/export/pdf")]
+    [InlineData("GET", "/api/tasks/{0}/export/plan-pdf")]
+    [InlineData("POST", "/api/tasks/{0}/requirement-approval")]
+    public async Task Missing_task_actions_return_handled_problem_details_without_unhandled_error_logging(
+        string method,
+        string routeTemplate)
+    {
+        await using var factory = new MissingTaskLoggingFactory();
+        using var client = factory.CreateClient();
+        var route = string.Format(CultureInfo.InvariantCulture, routeTemplate, Guid.NewGuid());
+
+        using var response = await client.SendAsync(new HttpRequestMessage(new HttpMethod(method), route));
+        var body = await response.Content.ReadAsStringAsync();
+        var problem = JsonDocument.Parse(body).RootElement;
+
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+        Assert.Equal("application/problem+json", response.Content.Headers.ContentType?.MediaType);
+        Assert.Equal("Engineering task not found", problem.GetProperty("title").GetString());
+        Assert.Equal("task_not_found", problem.GetProperty("code").GetString());
+        Assert.False(string.IsNullOrWhiteSpace(problem.GetProperty("traceId").GetString()));
+        Assert.DoesNotContain("C:\\", body, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("SQLite", body, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains(factory.Logs.Entries, entry =>
+            entry.Category.EndsWith(nameof(EngineeringTaskNotFoundExceptionFilter), StringComparison.Ordinal) &&
+            entry.Level is LogLevel.Information or LogLevel.Warning &&
+            entry.Message.Contains("Engineering task was not found", StringComparison.Ordinal));
+        Assert.DoesNotContain(factory.Logs.Entries, entry =>
+            entry.Level == LogLevel.Error &&
+            entry.Category.Contains("ExceptionHandlerMiddleware", StringComparison.Ordinal));
+        Assert.DoesNotContain(factory.Logs.Entries, entry => !string.IsNullOrWhiteSpace(entry.ExceptionText));
+        Assert.DoesNotContain(" at ", factory.Logs.Text, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -346,6 +383,87 @@ public sealed class EngineeringTaskApiTests : IClassFixture<FakeModeFactory>
     }
 
     [Fact]
+    public async Task Task_pdf_export_observes_runtime_read_only_without_creating_locks_or_reverifying_checkout()
+    {
+        await using var factory = new FakeModeFactory();
+        using var client = factory.CreateClient();
+        var repository = factory.TargetRepositoryPath;
+        var created = await client.PostAsJsonAsync("/api/tasks", new
+        {
+            repository,
+            requirement = "Modify report export. Acceptance criteria: a bounded diff is available. Validation: inspect the diff."
+        });
+        created.EnsureSuccessStatusCode();
+        var id = (await created.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("id").GetGuid();
+        (await client.PostAsync($"/api/tasks/{id}/requirement-approval", null)).EnsureSuccessStatusCode();
+        (await client.PostAsync($"/api/tasks/{id}/repository-analysis", null)).EnsureSuccessStatusCode();
+        (await client.PostAsync($"/api/tasks/{id}/plan", null)).EnsureSuccessStatusCode();
+        (await client.PostAsync($"/api/tasks/{id}/plan-approval", null)).EnsureSuccessStatusCode();
+        var implementation = await client.PostAsync($"/api/tasks/{id}/implementation", null);
+        Assert.True(implementation.IsSuccessStatusCode, await implementation.Content.ReadAsStringAsync());
+
+        var locksDirectory = Path.Combine(factory.WorktreeRoot, ".locks");
+        if (Directory.Exists(locksDirectory)) Directory.Delete(locksDirectory, recursive: true);
+        Assert.False(Directory.Exists(locksDirectory));
+        var activeFile = Path.Combine(repository, "src", "ReportExportService.cs");
+        await File.AppendAllTextAsync(activeFile, "// active checkout changed after completion\n");
+        var activeFileBeforeExport = FileIdentity(activeFile);
+        var filesystemBefore = DirectoryIdentity(factory.WorktreeRoot);
+        var persistedBefore = await ReadPersistedStateAsync(factory.DatabasePath, id);
+        SqliteConnection.ClearAllPools();
+        var databaseBefore = FileIdentity(factory.DatabasePath);
+
+        var response = await client.GetAsync($"/api/tasks/{id}/export/pdf");
+        response.EnsureSuccessStatusCode();
+        var text = ExtractPdf(await response.Content.ReadAsByteArrayAsync());
+
+        Assert.Equal(filesystemBefore, DirectoryIdentity(factory.WorktreeRoot));
+        Assert.Equal(persistedBefore, await ReadPersistedStateAsync(factory.DatabasePath, id));
+        SqliteConnection.ClearAllPools();
+        Assert.Equal(databaseBefore, FileIdentity(factory.DatabasePath));
+        Assert.Equal(activeFileBeforeExport, FileIdentity(activeFile));
+        Assert.False(Directory.Exists(locksDirectory));
+        Assert.Contains("Active checkout verified when implementation completed: yes", text);
+        Assert.Contains("Valid non-reparse isolated worktree metadata observed at export time: yes", text);
+        Assert.Contains("Read-only export-time observation", text);
+        Assert.DoesNotContain("Active checkout verified at export time", text);
+        Assert.DoesNotContain("Active checkout reverified", text, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task Fresh_host_first_pdf_export_does_not_initialize_git_runner_directories_or_mutate_persistence()
+    {
+        await using var factory = new FakeModeFactory();
+        Directory.CreateDirectory(Path.GetDirectoryName(factory.DatabasePath)!);
+        var connectionString = $"Data Source={factory.DatabasePath}";
+        await new SqliteDatabaseInitializer(connectionString).InitializeAsync();
+        var repository = new SqliteEngineeringTaskRepository(connectionString);
+        var task = CreatePersistedImplementationAttempt();
+        await repository.SaveAsync(task);
+        SqliteConnection.ClearAllPools();
+        Assert.False(Directory.Exists(factory.WorktreeRoot));
+        var persistedBefore = await ReadPersistedJsonAsync(factory.DatabasePath, task.Id);
+        SqliteConnection.ClearAllPools();
+        var databaseBefore = FileIdentity(factory.DatabasePath);
+
+        using var client = factory.CreateClient();
+        using var response = await client.GetAsync($"/api/tasks/{task.Id}/export/pdf");
+        var bytes = await response.Content.ReadAsByteArrayAsync();
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var text = ExtractPdf(bytes);
+        Assert.Contains("Valid non-reparse isolated worktree metadata observed at export time: no", text);
+        Assert.Contains("No implementation result was persisted.", text);
+        Assert.False(Directory.Exists(factory.WorktreeRoot));
+        Assert.False(Directory.Exists(Path.Combine(factory.WorktreeRoot, ".empty-hooks")));
+        Assert.False(Directory.Exists(Path.Combine(factory.WorktreeRoot, ".git-home")));
+        Assert.False(Directory.Exists(Path.Combine(factory.WorktreeRoot, ".locks")));
+        Assert.Equal(persistedBefore, await ReadPersistedJsonAsync(factory.DatabasePath, task.Id));
+        SqliteConnection.ClearAllPools();
+        Assert.Equal(databaseBefore, FileIdentity(factory.DatabasePath));
+    }
+
+    [Fact]
     public async Task Sensitive_implementation_failure_is_absent_from_problem_dto_database_logs_and_pdfs()
     {
         await using var factory = new SensitiveImplementationFailureFactory();
@@ -545,6 +663,29 @@ public sealed class EngineeringTaskApiTests : IClassFixture<FakeModeFactory>
         Assert.Equal(HttpStatusCode.InternalServerError, response.StatusCode);
         Assert.Contains("server_error", body);
         Assert.DoesNotContain("sensitive-pdf-generator-detail", body);
+        Assert.Contains(factory.Logs.Entries, entry => entry.Level == LogLevel.Error);
+        Assert.Contains("InvalidOperationException", factory.Logs.Text, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Unrelated_key_not_found_exception_remains_an_unexpected_server_failure()
+    {
+        await using var factory = new GenericKeyNotFoundPdfFactory();
+        using var client = factory.CreateClient();
+        var created = await client.PostAsJsonAsync("/api/tasks", new
+        {
+            repository = "C:/repo",
+            requirement = "Add report export. Acceptance criteria: export works. Validation: inspect the report."
+        });
+        created.EnsureSuccessStatusCode();
+        var id = (await created.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("id").GetGuid();
+
+        var response = await client.GetAsync($"/api/tasks/{id}/export/pdf");
+        var problem = await response.Content.ReadFromJsonAsync<JsonElement>();
+
+        Assert.Equal(HttpStatusCode.InternalServerError, response.StatusCode);
+        Assert.Equal("server_error", problem.GetProperty("code").GetString());
+        Assert.DoesNotContain("dictionary storage defect", problem.ToString(), StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -646,26 +787,7 @@ public sealed class EngineeringTaskApiTests : IClassFixture<FakeModeFactory>
         await using var factory = new FakeModeFactory();
         using var client = factory.CreateClient();
         var repository = await CreatePlanConstraintTargetAsync(factory);
-        var requirement = """
-            Prepare a safe manual-validation change in this repository.
-
-            Modify these existing files only:
-            - src/GreetingService.cs
-            - config/settings.json
-            - README.md
-
-            The purpose is to demonstrate Forge AI's isolated implementation and diff-review workflow in Fake mode. Do not run the target project's build or tests. Do not stage, commit, push, or create a pull request.
-
-            Acceptance criteria:
-            - The approved plan identifies only the three existing files listed above.
-            - Implementation changes are created only in an isolated Forge worktree.
-            - The original target checkout remains completely unchanged.
-            - A bounded and clearly labelled Fake implementation diff is available for review.
-
-            Validation:
-            - Review the Forge-generated file list, hashes, byte and line counts, and diff previews.
-            - Compare the target repository branch, HEAD, status, index, and file hashes before and after implementation.
-            """;
+        var requirement = ExactManualRequirement();
         var created = await client.PostAsJsonAsync("/api/tasks", new { repository, requirement });
         created.EnsureSuccessStatusCode();
         var id = (await created.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("id").GetGuid();
@@ -721,6 +843,77 @@ public sealed class EngineeringTaskApiTests : IClassFixture<FakeModeFactory>
         var corrected = await secondCorrection.Content.ReadFromJsonAsync<JsonElement>();
         Assert.Equal("AwaitingPlanApproval", corrected.GetProperty("status").GetString());
         Assert.Equal(2, corrected.GetProperty("planRevisionNotes").GetArrayLength());
+    }
+
+    [Fact]
+    public async Task Exact_manual_task_report_exports_complete_three_file_plan_and_review_without_mutation()
+    {
+        await using var factory = new FakeModeFactory();
+        using var client = factory.CreateClient();
+        var repository = await CreatePlanConstraintTargetAsync(factory);
+        var created = await client.PostAsJsonAsync("/api/tasks", new
+        {
+            repository,
+            requirement = ExactManualRequirement()
+        });
+        created.EnsureSuccessStatusCode();
+        var id = (await created.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("id").GetGuid();
+        (await client.PostAsync($"/api/tasks/{id}/requirement-approval", null)).EnsureSuccessStatusCode();
+        (await client.PostAsync($"/api/tasks/{id}/repository-analysis", null)).EnsureSuccessStatusCode();
+        (await client.PostAsync($"/api/tasks/{id}/plan", null)).EnsureSuccessStatusCode();
+        (await client.PostAsync($"/api/tasks/{id}/plan-approval", null)).EnsureSuccessStatusCode();
+        var implementation = await client.PostAsync($"/api/tasks/{id}/implementation", null);
+        Assert.True(implementation.IsSuccessStatusCode, await implementation.Content.ReadAsStringAsync());
+        var implemented = await implementation.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Equal("AwaitingImplementationReview", implemented.GetProperty("status").GetString());
+        Assert.Equal(3, implemented.GetProperty("implementationResult").GetProperty("changedFiles").GetArrayLength());
+        var persistedBefore = await ReadPersistedJsonAsync(factory.DatabasePath, id);
+
+        var reportResponse = await client.GetAsync($"/api/tasks/{id}/export/pdf");
+        reportResponse.EnsureSuccessStatusCode();
+        var text = ExtractPdf(await reportResponse.Content.ReadAsByteArrayAsync());
+        var persistedAfter = await ReadPersistedJsonAsync(factory.DatabasePath, id);
+
+        Assert.Equal(persistedBefore, persistedAfter);
+        Assert.Contains("Repository analysis", text);
+        Assert.Contains("Plan approval status: APPROVED", text);
+        Assert.Contains("Implementation review", text);
+        Assert.Contains("Changed-file review", text);
+        var rawBranch = implemented.GetProperty("implementationResult").GetProperty("branch").GetString()!;
+        Assert.Contains("forge/task-[internal-id-redacted]", text, StringComparison.Ordinal);
+        Assert.DoesNotContain(rawBranch, text, StringComparison.Ordinal);
+        Assert.DoesNotContain("Workspace token", text, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("Relative path: ManualTarget.csproj", text);
+        Assert.Equal(1, CountOccurrences(text, "ManualTarget.csproj"));
+        Assert.DoesNotContain("Affected file 1: ManualTarget.csproj", text, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("Affected file 2: ManualTarget.csproj", text, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("Affected file 3: ManualTarget.csproj", text, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("Changed file 1: ManualTarget.csproj", text, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("Changed file 2: ManualTarget.csproj", text, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("Changed file 3: ManualTarget.csproj", text, StringComparison.OrdinalIgnoreCase);
+        foreach (var path in new[] { "src/GreetingService.cs", "config/settings.json", "README.md" })
+        {
+            Assert.Contains($"Affected file", text);
+            Assert.Contains(path, text);
+        }
+        foreach (var file in implemented.GetProperty("implementationResult").GetProperty("changedFiles").EnumerateArray())
+        {
+            Assert.Contains(file.GetProperty("path").GetString()!, text, StringComparison.Ordinal);
+            Assert.Contains(file.GetProperty("originalContentSha256").GetString()!, text, StringComparison.Ordinal);
+            Assert.Contains(file.GetProperty("newContentSha256").GetString()!, text, StringComparison.Ordinal);
+            Assert.Contains($"Original bytes: {file.GetProperty("originalBytes").GetInt64():N0}", text);
+            Assert.Contains($"Generated bytes: {file.GetProperty("newBytes").GetInt64():N0}", text);
+            Assert.Contains($"Original lines: {file.GetProperty("originalLines").GetInt32():N0}", text);
+            Assert.Contains($"Generated lines: {file.GetProperty("newLines").GetInt32():N0}", text);
+        }
+        Assert.Equal(3, CountOccurrences(text, "Original SHA-256:"));
+        Assert.Equal(3, CountOccurrences(text, "Generated SHA-256:"));
+        Assert.Equal(3, CountOccurrences(text, "Bounded diff preview:"));
+        Assert.Contains("Valid non-reparse isolated worktree metadata observed at export time: yes", text);
+        Assert.Contains("Active checkout verified when implementation completed: yes", text);
+        Assert.Contains("Attempt disposition: Completed", text);
+        Assert.DoesNotContain(repository, text, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(factory.WorktreeRoot, text, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -954,6 +1147,60 @@ public sealed class EngineeringTaskApiTests : IClassFixture<FakeModeFactory>
         Assert.Equal(0, response.Telemetry.CostUnavailableCallCount);
     }
 
+    private static string ExactManualRequirement() => """
+        Prepare a safe manual-validation change in this repository.
+
+        Modify these existing files only:
+        - src/GreetingService.cs
+        - config/settings.json
+        - README.md
+
+        The purpose is to demonstrate Forge AI's isolated implementation and diff-review workflow in Fake mode. Do not run the target project's build or tests. Do not stage, commit, push, or create a pull request.
+
+        Acceptance criteria:
+        - The approved plan identifies only the three existing files listed above.
+        - Implementation changes are created only in an isolated Forge worktree.
+        - The original target checkout remains completely unchanged.
+        - A bounded and clearly labelled Fake implementation diff is available for review.
+
+        Validation:
+        - Review the Forge-generated file list, hashes, byte and line counts, and diff previews.
+        - Compare the target repository branch, HEAD, status, index, and file hashes before and after implementation.
+        """;
+
+    private static EngineeringTask CreatePersistedImplementationAttempt()
+    {
+        var now = DateTimeOffset.UtcNow.AddMinutes(-10);
+        var task = EngineeringTask.Create("C:/persisted/source-repository", "Generate a safe report.", now);
+        task.ApplyClarificationEvaluation(ClarificationEvaluation.Summarize("Generate a safe report."), now);
+        task.ApproveRequirementSummary(now.AddMinutes(1));
+        task.BeginRepositoryAnalysis(now.AddMinutes(2));
+        var metadata = new RepositoryFileMetadata("src/App.cs", ".cs", 20, 1, "source", false, "App", ["App"]);
+        var snapshot = new RepositorySnapshot("C:/persisted/source-repository", true, "main", "aaaaaaaa",
+            new string('a', 40), "clean", 1, 1, 0, ["C#"], [".cs"], ["Forge.csproj"], [], [],
+            now.AddMinutes(2), new string('f', 64), [metadata], new string('d', 64));
+        var evidence = new EvidenceItem("E1", "src/App.cs", 1, 1, "class App {}", "Direct evidence", 10,
+            new string('e', 64));
+        task.StoreRepositorySnapshot(snapshot, now.AddMinutes(2));
+        task.StoreEvidence(new EvidenceSelection([evidence], 1, 1, evidence.Excerpt.Length), now.AddMinutes(2));
+        var plan = new ImplementationPlan("Implement report", "Generate a safe report.", "The file is persisted.",
+            [new PlannedFileChange("src/App.cs", PlannedFileAction.Modify, "Update the source.", ["E1"], .9m)],
+            [new ImplementationStep(1, "Update the source.", ["src/App.cs"], ["E1"], "The source changes.")],
+            ["inspect diff"], [], [], [],
+            [new RequirementCoverageItem("Generate the report.", ["src/App.cs"], [1])],
+            "A bounded report change.", PlanningSource.DeterministicFake, null, now.AddMinutes(3), snapshot.Fingerprint);
+        task.StoreImplementationPlan(plan, now.AddMinutes(3), TimeSpan.FromMinutes(30));
+        task.ApproveImplementationPlan(now.AddMinutes(4));
+        const string token = "0123456789abcdef0123456789abcdef";
+        var workspace = new ImplementationWorkspace(token, $"forge/task-{token}", snapshot.FullHeadSha!,
+            ImplementationWorkspacePhase.Reserved, now.AddMinutes(5), now.AddMinutes(5), false,
+            new string('1', 64), new string('2', 64), $"refs/forge/tasks/{token}");
+        var lease = new ImplementationLease(Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(),
+            now.AddMinutes(5), now.AddMinutes(5), now.AddMinutes(6));
+        task.BeginImplementation(workspace, lease, now.AddMinutes(5));
+        return task;
+    }
+
     private static async Task<string> CreatePlanConstraintTargetAsync(FakeModeFactory factory)
     {
         var repository = Path.Combine(Path.GetDirectoryName(factory.DatabasePath)!, "plan-constraint-target");
@@ -1000,6 +1247,52 @@ public sealed class EngineeringTaskApiTests : IClassFixture<FakeModeFactory>
         Assert.True(await reader.ReadAsync());
         return string.Join('|', Enumerable.Range(0, reader.FieldCount)
             .Select(index => reader.IsDBNull(index) ? "<null>" : reader.GetValue(index).ToString()));
+    }
+
+    private static async Task<string> ReadPersistedJsonAsync(string databasePath, Guid id)
+    {
+        await using var connection = new SqliteConnection($"Data Source={databasePath}");
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT ClarificationAnswers, RequirementRevisionNotes, ModelCalls, RepositorySnapshot,
+                   EvidenceItems, ImplementationPlan, PlanRevisionNotes, ImplementationWorkspace,
+                   ImplementationResult, LastImplementationFailure, ImplementationLease
+            FROM EngineeringTasks WHERE Id = $id;
+            """;
+        command.Parameters.AddWithValue("$id", id.ToString());
+        await using var reader = await command.ExecuteReaderAsync();
+        Assert.True(await reader.ReadAsync());
+        return string.Join('|', Enumerable.Range(0, reader.FieldCount)
+            .Select(index => reader.IsDBNull(index) ? "<null>" : reader.GetString(index)));
+    }
+
+    private static int CountOccurrences(string value, string expected)
+    {
+        var count = 0;
+        for (var index = 0; (index = value.IndexOf(expected, index, StringComparison.Ordinal)) >= 0;
+             index += expected.Length)
+            count++;
+        return count;
+    }
+
+    private static string FileIdentity(string path)
+    {
+        var bytes = File.ReadAllBytes(path);
+        var info = new FileInfo(path);
+        return $"{bytes.LongLength}:{info.LastWriteTimeUtc:O}:{Convert.ToHexString(SHA256.HashData(bytes))}";
+    }
+
+    private static string DirectoryIdentity(string root)
+    {
+        if (!Directory.Exists(root)) return "<missing>";
+        return string.Join('\n', Directory.EnumerateFileSystemEntries(root, "*", SearchOption.AllDirectories)
+            .Order(StringComparer.OrdinalIgnoreCase)
+            .Select(path =>
+            {
+                var relative = Path.GetRelativePath(root, path).Replace('\\', '/');
+                return Directory.Exists(path) ? $"D|{relative}" : $"F|{relative}|{FileIdentity(path)}";
+            }));
     }
 }
 
@@ -1357,6 +1650,8 @@ internal static class ApiTestDatabaseGuard
 
 public sealed class PdfFailureFactory : FakeModeFactory
 {
+    public ApiLogCapture Logs { get; } = new();
+
     protected override void ConfigureWebHost(IWebHostBuilder builder)
     {
         base.ConfigureWebHost(builder);
@@ -1364,12 +1659,76 @@ public sealed class PdfFailureFactory : FakeModeFactory
         {
             services.RemoveAll<IEngineeringTaskPdfExporter>();
             services.AddSingleton<IEngineeringTaskPdfExporter, FailingPdfExporter>();
+            services.AddSingleton<ILoggerProvider>(Logs);
         });
     }
 
     private sealed class FailingPdfExporter : IEngineeringTaskPdfExporter
     {
-        public byte[] Export(EngineeringTask task) =>
+        public byte[] Export(EngineeringTask task, ImplementationReportRuntimeStatus? runtimeStatus = null) =>
             throw new InvalidOperationException("sensitive-pdf-generator-detail");
+    }
+}
+
+public sealed class MissingTaskLoggingFactory : FakeModeFactory
+{
+    public ApiLogCapture Logs { get; } = new();
+
+    protected override void ConfigureWebHost(IWebHostBuilder builder)
+    {
+        base.ConfigureWebHost(builder);
+        builder.ConfigureServices(services => services.AddSingleton<ILoggerProvider>(Logs));
+    }
+}
+
+public sealed class GenericKeyNotFoundPdfFactory : FakeModeFactory
+{
+    protected override void ConfigureWebHost(IWebHostBuilder builder)
+    {
+        base.ConfigureWebHost(builder);
+        builder.ConfigureServices(services =>
+        {
+            services.RemoveAll<IEngineeringTaskPdfExporter>();
+            services.AddSingleton<IEngineeringTaskPdfExporter, GenericKeyNotFoundPdfExporter>();
+        });
+    }
+
+    private sealed class GenericKeyNotFoundPdfExporter : IEngineeringTaskPdfExporter
+    {
+        public byte[] Export(EngineeringTask task, ImplementationReportRuntimeStatus? runtimeStatus = null) =>
+            throw new KeyNotFoundException("dictionary storage defect");
+    }
+}
+
+public sealed record ApiLogEntry(
+    string Category,
+    LogLevel Level,
+    string Message,
+    string? ExceptionText);
+
+public sealed class ApiLogCapture : ILoggerProvider
+{
+    private readonly ConcurrentQueue<ApiLogEntry> entries = new();
+    public IReadOnlyList<ApiLogEntry> Entries => entries.ToArray();
+    public string Text => string.Join('\n', entries.Select(entry =>
+        $"{entry.Level} {entry.Category}: {entry.Message}{Environment.NewLine}{entry.ExceptionText}"));
+
+    public ILogger CreateLogger(string categoryName) => new CapturingLogger(categoryName, entries);
+    public void Dispose() { }
+
+    private sealed class CapturingLogger(
+        string category,
+        ConcurrentQueue<ApiLogEntry> entries) : ILogger
+    {
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            LogLevel logLevel,
+            EventId eventId,
+            TState state,
+            Exception? exception,
+            Func<TState, Exception?, string> formatter) =>
+            entries.Enqueue(new ApiLogEntry(category, logLevel, formatter(state, exception), exception?.ToString()));
     }
 }
