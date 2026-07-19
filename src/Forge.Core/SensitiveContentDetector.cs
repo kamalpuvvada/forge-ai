@@ -9,7 +9,8 @@ public static partial class SensitiveContentDetector
         if (string.IsNullOrEmpty(value)) return false;
         return AuthorizationRegex().IsMatch(value) || PrivateKeyRegex().IsMatch(value) ||
                CredentialUriRegex().IsMatch(value) || AccessTokenRegex().IsMatch(value) ||
-               PasswordConnectionStringRegex().IsMatch(value) || SecretAssignmentRegex().IsMatch(value);
+               PasswordConnectionStringRegex().IsMatch(value) || SecretAssignmentRegex().IsMatch(value) ||
+               HasCredentialGatedEntropy(value);
     }
 
     [GeneratedRegex(@"(?im)\bauthorization\s*:\s*(?:bearer|basic)\s+[A-Za-z0-9+/._~=-]{8,}", RegexOptions.CultureInvariant)]
@@ -29,4 +30,21 @@ public static partial class SensitiveContentDetector
 
     [GeneratedRegex("""(?im)\b(?:api[_-]?key|client[_-]?secret|access[_-]?token|auth[_-]?token|password|passwd|pwd)\b\s*[:=]\s*['"]?[A-Za-z0-9+/._~=-]{8,}""", RegexOptions.CultureInvariant)]
     private static partial Regex SecretAssignmentRegex();
+
+    private static bool HasCredentialGatedEntropy(string value)
+    {
+        foreach (Match match in CredentialEntropyRegex().Matches(value))
+        {
+            var candidate = match.Groups[1].Value;
+            var classes = (candidate.Any(char.IsLower) ? 1 : 0) +
+                          (candidate.Any(char.IsUpper) ? 1 : 0) +
+                          (candidate.Any(char.IsDigit) ? 1 : 0) +
+                          (candidate.Any(character => "+/=_-.~".Contains(character, StringComparison.Ordinal)) ? 1 : 0);
+            if (classes >= 3 && candidate.Distinct().Take(12).Count() >= 12) return true;
+        }
+        return false;
+    }
+
+    [GeneratedRegex("""(?im)\b(?:credential|secret|token|api[_-]?key|private[_-]?key)\b\s*[:=]\s*['"]?([A-Za-z0-9+/=_\-.~]{24,})""", RegexOptions.CultureInvariant)]
+    private static partial Regex CredentialEntropyRegex();
 }

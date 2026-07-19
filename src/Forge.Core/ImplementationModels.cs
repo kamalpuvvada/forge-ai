@@ -190,7 +190,8 @@ public sealed record ActiveCheckoutSignature(
 
 public sealed record ImplementationReservation(
     ImplementationWorkspace Workspace,
-    ActiveCheckoutSignature ActiveCheckout);
+    ActiveCheckoutSignature ActiveCheckout,
+    IReadOnlyList<ImplementationFileContext>? Files = null);
 
 public sealed record PreparedImplementationWorkspace(
     ImplementationWorkspace Workspace,
@@ -228,6 +229,16 @@ public interface IImplementationWorkspaceManager
         ImplementationLimits limits,
         ActiveCheckoutSignature activeCheckout,
         CancellationToken cancellationToken = default);
+
+    Task<PreparedImplementationWorkspace> PrepareAsync(
+        string repositoryPath,
+        ImplementationWorkspace workspace,
+        ImplementationPlan plan,
+        ImplementationLimits limits,
+        ActiveCheckoutSignature activeCheckout,
+        IReadOnlyList<ImplementationFileContext> preflightFiles,
+        CancellationToken cancellationToken = default) =>
+        PrepareAsync(repositoryPath, workspace, plan, limits, activeCheckout, cancellationToken);
 
     Task<ImplementationResult> ApplyAsync(
         string repositoryPath,
@@ -271,5 +282,9 @@ public sealed class TaskConcurrencyException(string safeMessage) : Exception(saf
 
 public sealed class TaskDataCorruptException(string safeMessage, Exception? innerException = null)
     : Exception(safeMessage, innerException);
+
+public sealed class TaskPersistenceException(
+    string safeMessage = "Task persistence is temporarily unavailable.",
+    Exception? innerException = null) : Exception(safeMessage, innerException);
 
 public sealed record ImplementationProcessIdentity(Guid OwnerId);

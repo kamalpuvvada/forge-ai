@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Data.Common;
 using System.Text;
 using System.Text.Json;
 using Forge.Core;
@@ -15,6 +16,7 @@ public sealed class SqliteEngineeringTaskRepository : IEngineeringTaskRepository
     private readonly string connectionString;
     private readonly ImplementationLimits implementationLimits;
     private readonly TimeProvider? timeProvider;
+    private readonly Func<CancellationToken, Task>? afterImplementationBoundsRead;
 
     public SqliteEngineeringTaskRepository(string connectionString, ImplementationLimits? implementationLimits = null,
         TimeProvider? timeProvider = null)
@@ -24,7 +26,31 @@ public sealed class SqliteEngineeringTaskRepository : IEngineeringTaskRepository
         this.timeProvider = timeProvider;
     }
 
+    internal SqliteEngineeringTaskRepository(
+        string connectionString,
+        ImplementationLimits implementationLimits,
+        TimeProvider? timeProvider,
+        Func<CancellationToken, Task> afterImplementationBoundsRead)
+        : this(connectionString, implementationLimits, timeProvider)
+    {
+        this.afterImplementationBoundsRead = afterImplementationBoundsRead;
+    }
+
     public async Task<IReadOnlyList<EngineeringTaskSummary>> ListRecentAsync(
+        int maximumCount,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            return await ListRecentCoreAsync(maximumCount, cancellationToken);
+        }
+        catch (DbException exception)
+        {
+            throw PersistenceFailure(exception);
+        }
+    }
+
+    private async Task<IReadOnlyList<EngineeringTaskSummary>> ListRecentCoreAsync(
         int maximumCount,
         CancellationToken cancellationToken = default)
     {
@@ -60,14 +86,39 @@ public sealed class SqliteEngineeringTaskRepository : IEngineeringTaskRepository
 
     public async Task<EngineeringTask?> GetAsync(Guid id, CancellationToken cancellationToken = default)
     {
+        try
+        {
+            return await GetCoreAsync(id, cancellationToken);
+        }
+        catch (DbException exception)
+        {
+            throw PersistenceFailure(exception);
+        }
+    }
+
+    private async Task<EngineeringTask?> GetCoreAsync(Guid id, CancellationToken cancellationToken)
+    {
         await using var connection = new SqliteConnection(connectionString);
         await connection.OpenAsync(cancellationToken);
-        await ValidateImplementationJsonBoundsBeforeReadAsync(connection, id, cancellationToken);
         await using var command = connection.CreateCommand();
-        command.CommandText = "SELECT * FROM EngineeringTasks WHERE Id = $id";
+        command.CommandText = """
+            SELECT EngineeringTasks.*,
+              length(ImplementationWorkspace) AS ImplementationWorkspaceCharacters,
+              length(CAST(ImplementationWorkspace AS BLOB)) AS ImplementationWorkspaceBytes,
+              length(ImplementationResult) AS ImplementationResultCharacters,
+              length(CAST(ImplementationResult AS BLOB)) AS ImplementationResultBytes,
+              length(LastImplementationFailure) AS ImplementationFailureCharacters,
+              length(CAST(LastImplementationFailure AS BLOB)) AS ImplementationFailureBytes,
+              length(ImplementationLease) AS ImplementationLeaseCharacters,
+              length(CAST(ImplementationLease AS BLOB)) AS ImplementationLeaseBytes
+            FROM EngineeringTasks WHERE Id = $id;
+            """;
         command.Parameters.AddWithValue("$id", id.ToString());
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
         if (!await reader.ReadAsync(cancellationToken)) return null;
+        ValidateImplementationJsonBoundsBeforeRead(reader);
+        if (afterImplementationBoundsRead is not null)
+            await afterImplementationBoundsRead(cancellationToken);
 
         var answers = JsonSerializer.Deserialize<List<ClarificationAnswer>>(reader.GetString(reader.GetOrdinal("ClarificationAnswers")), JsonOptions) ?? [];
         var revisionNotes = JsonSerializer.Deserialize<List<RequirementRevisionNote>>(reader.GetString(reader.GetOrdinal("RequirementRevisionNotes")), JsonOptions) ?? [];
@@ -103,7 +154,8 @@ public sealed class SqliteEngineeringTaskRepository : IEngineeringTaskRepository
             implementationLimits,
             ReadNullableDate(reader, "ImplementationStartedAt"),
             ReadNullableDate(reader, "ImplementationCompletedAt"),
-            timeProvider?.GetUtcNow());
+            timeProvider?.GetUtcNow(),
+            ParseDate(reader.GetString(reader.GetOrdinal("UpdatedAt"))));
         return EngineeringTask.Rehydrate(
             Guid.Parse(reader.GetString(reader.GetOrdinal("Id"))),
             reader.GetString(reader.GetOrdinal("Repository")),
@@ -140,11 +192,23 @@ public sealed class SqliteEngineeringTaskRepository : IEngineeringTaskRepository
 
     public async Task SaveAsync(EngineeringTask task, CancellationToken cancellationToken = default)
     {
+        try
+        {
+            await SaveCoreAsync(task, cancellationToken);
+        }
+        catch (DbException exception)
+        {
+            throw PersistenceFailure(exception);
+        }
+    }
+
+    private async Task SaveCoreAsync(EngineeringTask task, CancellationToken cancellationToken)
+    {
         PersistedImplementationValidator.Validate(
             task.Status, task.PlanApprovedAt, task.ImplementationPlan, task.ImplementationWorkspace,
             task.ImplementationResult, task.LastImplementationFailure, task.ImplementationLease,
             implementationLimits, task.ImplementationStartedAt, task.ImplementationCompletedAt,
-            timeProvider?.GetUtcNow());
+            timeProvider?.GetUtcNow(), task.UpdatedAt);
         var workspaceJson = SerializeImplementation(task.ImplementationWorkspace);
         var resultJson = SerializeImplementation(task.ImplementationResult);
         var failureJson = SerializeImplementation(task.LastImplementationFailure);
@@ -265,31 +329,25 @@ public sealed class SqliteEngineeringTaskRepository : IEngineeringTaskRepository
         return value is null ? null : JsonSerializer.Deserialize<T>(value, JsonOptions);
     }
 
-    private async Task ValidateImplementationJsonBoundsBeforeReadAsync(
-        SqliteConnection connection,
-        Guid id,
-        CancellationToken cancellationToken)
+    private void ValidateImplementationJsonBoundsBeforeRead(SqliteDataReader reader)
     {
-        await using var command = connection.CreateCommand();
-        command.CommandText = """
-            SELECT
-              length(ImplementationWorkspace), length(CAST(ImplementationWorkspace AS BLOB)),
-              length(ImplementationResult), length(CAST(ImplementationResult AS BLOB)),
-              length(LastImplementationFailure), length(CAST(LastImplementationFailure AS BLOB)),
-              length(ImplementationLease), length(CAST(ImplementationLease AS BLOB))
-            FROM EngineeringTasks WHERE Id = $id;
-            """;
-        command.Parameters.AddWithValue("$id", id.ToString());
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
-        if (!await reader.ReadAsync(cancellationToken)) return;
         long characters = 0;
         long bytes = 0;
+        var names = new[]
+        {
+            ("ImplementationWorkspaceCharacters", "ImplementationWorkspaceBytes"),
+            ("ImplementationResultCharacters", "ImplementationResultBytes"),
+            ("ImplementationFailureCharacters", "ImplementationFailureBytes"),
+            ("ImplementationLeaseCharacters", "ImplementationLeaseBytes")
+        };
         try
         {
-            for (var index = 0; index < 8; index += 2)
+            foreach (var (characterName, byteName) in names)
             {
-                if (!reader.IsDBNull(index)) characters = checked(characters + reader.GetInt64(index));
-                if (!reader.IsDBNull(index + 1)) bytes = checked(bytes + reader.GetInt64(index + 1));
+                var characterOrdinal = reader.GetOrdinal(characterName);
+                var byteOrdinal = reader.GetOrdinal(byteName);
+                if (!reader.IsDBNull(characterOrdinal)) characters = checked(characters + reader.GetInt64(characterOrdinal));
+                if (!reader.IsDBNull(byteOrdinal)) bytes = checked(bytes + reader.GetInt64(byteOrdinal));
             }
         }
         catch (OverflowException exception)
@@ -299,6 +357,9 @@ public sealed class SqliteEngineeringTaskRepository : IEngineeringTaskRepository
         if (characters > implementationLimits.MaximumPersistedImplementationJsonCharacters ||
             bytes > implementationLimits.MaximumPersistedImplementationJsonBytes) throw Corrupt();
     }
+
+    private static TaskPersistenceException PersistenceFailure(DbException _) => new(
+        "Task persistence is temporarily unavailable. Retry the request after storage access is restored.");
 
     private T? DeserializeImplementation<T>(string? value) where T : class
     {

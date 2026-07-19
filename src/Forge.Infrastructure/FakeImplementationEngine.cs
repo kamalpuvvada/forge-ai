@@ -125,7 +125,8 @@ public sealed class FakeImplementationEngine : IImplementationEngine
         }
         catch (JsonException)
         {
-            throw Unsupported(path);
+            throw new ImplementationException("implementation_terminal_incompatibility",
+                $"Approved JSON path '{path}' is not valid deterministic Fake input.");
         }
     }
 

@@ -247,7 +247,7 @@ public sealed class EngineeringTask
         EnsureValidLease(lease);
         if (ImplementationPlan is null || PlanApprovedAt is null)
             throw new WorkflowException("A complete approved implementation plan is required before implementation generation.");
-        ImplementationWorkspace = workspace;
+        ImplementationWorkspace = workspace with { UpdatedAt = now };
         ImplementationResult = null;
         LastImplementationFailure = null;
         ImplementationStartedAt = now;
@@ -288,7 +288,7 @@ public sealed class EngineeringTask
             throw new WorkflowException("The implementation workspace identity cannot be changed.");
         EnsureImplementationLease(attemptId, ownerId, now);
         ExpectedImplementationLeaseIdForSave = ImplementationLease!.LeaseId;
-        ImplementationWorkspace = workspace;
+        ImplementationWorkspace = workspace with { UpdatedAt = now };
         var leaseDuration = TimeSpan.FromSeconds(ImplementationLease!.EffectiveDurationSeconds);
         if (leaseDuration <= TimeSpan.Zero) leaseDuration = TimeSpan.FromMinutes(5);
         ImplementationLease = ImplementationLease with { HeartbeatAt = now, ExpiresAt = now.Add(leaseDuration) };
@@ -316,9 +316,9 @@ public sealed class EngineeringTask
         else if (ImplementationWorkspace is not null)
             ImplementationWorkspace = ImplementationWorkspace with
             {
-                Phase = ImplementationWorkspace.Phase == ImplementationWorkspacePhase.WorkspacePreparing
-                    ? ImplementationWorkspacePhase.RecoveryRequired
-                    : ImplementationWorkspace.Phase,
+                Phase = failure.SafeToResume
+                    ? ImplementationWorkspace.Phase
+                    : ImplementationWorkspacePhase.Interrupted,
                 UpdatedAt = now
             };
         ImplementationLease = null;
@@ -344,7 +344,7 @@ public sealed class EngineeringTask
             UpdatedAt = now,
             IsAvailable = true
         };
-        ImplementationCompletedAt = result.CompletedAt;
+        ImplementationCompletedAt = now;
         ImplementationLease = null;
         Status = WorkflowStatus.AwaitingImplementationReview;
         UpdatedAt = now;

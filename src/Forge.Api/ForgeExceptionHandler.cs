@@ -19,6 +19,9 @@ public sealed class ForgeExceptionHandler(
             WorkflowException => (409, "Invalid workflow action", exception.Message, "workflow_conflict"),
             TaskConcurrencyException => (409, "Task changed concurrently", exception.Message, "task_concurrency_conflict"),
             TaskDataCorruptException => (409, "Stored task data is invalid", exception.Message, "task_data_corrupt"),
+            TaskPersistenceException => (503, "Task persistence unavailable",
+                "Task persistence is temporarily unavailable. Retry the request after storage access is restored.",
+                "task_persistence_unavailable"),
             RepositoryDiscoveryException discovery => discovery.Category switch
             {
                 "inaccessible_path" => (403, "Repository path inaccessible", discovery.Message, "repository_inaccessible"),
@@ -26,19 +29,7 @@ public sealed class ForgeExceptionHandler(
                 "analysis_limits" => (422, "Repository analysis limit", discovery.Message, "repository_analysis_limit"),
                 _ => (400, "Repository path invalid", discovery.Message, "repository_missing_path")
             },
-            ImplementationException implementation => implementation.Category switch
-            {
-                "implementation_configuration" or "implementation_workspace_configuration" =>
-                    (503, "Implementation unavailable", implementation.Message, implementation.Category),
-                "implementation_repository_not_git" or "implementation_repository_dirty" or
-                "implementation_base_changed" or "implementation_repository_state" or
-                "implementation_workspace_conflict" or "implementation_active_checkout_changed" or
-                "implementation_recovery_required" =>
-                    (409, "Implementation workspace conflict", implementation.Message, implementation.Category),
-                "implementation_unsafe_path" =>
-                    (400, "Unsafe implementation path", implementation.Message, implementation.Category),
-                _ => (422, "Implementation generation rejected", implementation.Message, implementation.Category)
-            },
+            ImplementationException implementation => MapImplementationFailure(implementation),
             PlanningProviderException { Category: "missing_direct_evidence" } provider => (
                 422,
                 "Repository evidence does not support the plan",
@@ -84,5 +75,28 @@ public sealed class ForgeExceptionHandler(
             },
             Exception = exception
         });
+    }
+
+    private static (int Status, string Title, string Detail, string Code) MapImplementationFailure(
+        ImplementationException exception)
+    {
+        var safe = SensitiveContentDetector.ContainsSensitiveValue(exception.Category) ||
+                   SensitiveContentDetector.ContainsSensitiveValue(exception.Message)
+            ? new ImplementationException("implementation_failure",
+                "Implementation generation failed safely.", exception.RecoveryRequired)
+            : exception;
+        return safe.Category switch
+        {
+            "implementation_configuration" or "implementation_workspace_configuration" =>
+                (503, "Implementation unavailable", safe.Message, safe.Category),
+            "implementation_repository_not_git" or "implementation_repository_dirty" or
+                "implementation_base_changed" or "implementation_repository_state" or
+                "implementation_workspace_conflict" or "implementation_active_checkout_changed" or
+                "implementation_recovery_required" =>
+                (409, "Implementation workspace conflict", safe.Message, safe.Category),
+            "implementation_unsafe_path" =>
+                (400, "Unsafe implementation path", safe.Message, safe.Category),
+            _ => (422, "Implementation generation rejected", safe.Message, safe.Category)
+        };
     }
 }

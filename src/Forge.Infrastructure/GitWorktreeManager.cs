@@ -1,7 +1,6 @@
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
-using System.Text.Json.Nodes;
 using Forge.Core;
 
 namespace Forge.Infrastructure;
@@ -123,7 +122,7 @@ public sealed class GitWorktreeManager : IImplementationWorkspaceManager
             throw new ImplementationException("implementation_repository_dirty", "The selected repository must be completely clean, including untracked files.");
         if (!string.Equals(signature.HeadSha, snapshot.FullHeadSha, StringComparison.Ordinal))
             throw new ImplementationException("implementation_base_changed", "The repository HEAD changed after plan approval. Re-analyze and approve a new plan.");
-        await EnsureFakeContentEligibilityAsync(root, plan, limits, cancellationToken);
+        var preflightFiles = await BuildPreflightContextsAsync(root, plan, limits, cancellationToken);
 
         var token = taskId.ToString("N");
         var branch = $"forge/task-{token}";
@@ -144,16 +143,37 @@ public sealed class GitWorktreeManager : IImplementationWorkspaceManager
                 ImplementationWorkspacePhase.Reserved, now, now, false,
                 repositoryIdentity, commonIdentity, ownerReference,
                 signature.TrackedContentFingerprint, signature.TrackedFileCount, signature.TrackedBytes),
-            signature);
+            signature,
+            preflightFiles);
     }
 
-    public async Task<PreparedImplementationWorkspace> PrepareAsync(
+    public Task<PreparedImplementationWorkspace> PrepareAsync(
         string repositoryPath,
         ImplementationWorkspace workspace,
         ImplementationPlan plan,
         ImplementationLimits limits,
         ActiveCheckoutSignature activeCheckout,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default) =>
+        PrepareCoreAsync(repositoryPath, workspace, plan, limits, activeCheckout, null, cancellationToken);
+
+    public Task<PreparedImplementationWorkspace> PrepareAsync(
+        string repositoryPath,
+        ImplementationWorkspace workspace,
+        ImplementationPlan plan,
+        ImplementationLimits limits,
+        ActiveCheckoutSignature activeCheckout,
+        IReadOnlyList<ImplementationFileContext> preflightFiles,
+        CancellationToken cancellationToken = default) =>
+        PrepareCoreAsync(repositoryPath, workspace, plan, limits, activeCheckout, preflightFiles, cancellationToken);
+
+    private async Task<PreparedImplementationWorkspace> PrepareCoreAsync(
+        string repositoryPath,
+        ImplementationWorkspace workspace,
+        ImplementationPlan plan,
+        ImplementationLimits limits,
+        ActiveCheckoutSignature activeCheckout,
+        IReadOnlyList<ImplementationFileContext>? preflightFiles,
+        CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(workspace);
         ArgumentNullException.ThrowIfNull(plan);
@@ -170,6 +190,11 @@ public sealed class GitWorktreeManager : IImplementationWorkspaceManager
             await VerifyRepositoryIdentityAsync(root, workspace, cancellationToken);
             await EnsureNoActiveFiltersAsync(root, plan, cancellationToken);
             await EnsureActiveCheckoutUnchangedAsync(root, plan, limits, activeCheckout, cancellationToken);
+            if (preflightFiles is not null)
+            {
+                var currentPreflight = await BuildPreflightContextsAsync(root, plan, limits, cancellationToken);
+                EnsureContextsMatch(preflightFiles, currentPreflight);
+            }
             await VerifyOwnershipStateAsync(root, workspacePath, workspace.Branch, workspace.OwnershipReference,
                 workspace.BaseCommitSha, allowUnreserved: true, cancellationToken);
 
@@ -268,6 +293,8 @@ public sealed class GitWorktreeManager : IImplementationWorkspaceManager
                     throw new ImplementationException("implementation_input_limit", "Approved writable content exceeds the total implementation-context limit.");
                 contexts.Add(new ImplementationFileContext(path, planned.Action, content, ImplementationOutputValidator.Hash(content)));
             }
+
+            if (preflightFiles is not null) EnsureContextsMatch(preflightFiles, contexts);
 
             await EnsureActiveCheckoutUnchangedAsync(root, plan, limits, activeCheckout, cancellationToken);
             var now = DateTimeOffset.UtcNow;
@@ -620,16 +647,27 @@ public sealed class GitWorktreeManager : IImplementationWorkspaceManager
         }
     }
 
-    private async Task EnsureFakeContentEligibilityAsync(
+    private async Task<IReadOnlyList<ImplementationFileContext>> BuildPreflightContextsAsync(
         string root,
         ImplementationPlan plan,
         ImplementationLimits limits,
         CancellationToken cancellationToken)
     {
+        var contexts = new List<ImplementationFileContext>(plan.AffectedFiles.Count);
         var totalCharacters = 0;
-        foreach (var file in plan.AffectedFiles.Where(file => file.Action is PlannedFileAction.Modify or PlannedFileAction.Delete))
+        foreach (var file in plan.AffectedFiles)
         {
             var path = RepositoryPathRules.Normalize(file.Path);
+            if (file.Action == PlannedFileAction.Create)
+            {
+                fileSafety.ValidateEligiblePath(root, path, mayNotExist: true);
+                var createPath = fileSafety.ResolveContainedPath(root, path);
+                if (files.FileExists(createPath) || files.DirectoryExists(createPath))
+                    throw new ImplementationException("implementation_terminal_incompatibility",
+                        $"Approved create path '{path}' already exists.");
+                contexts.Add(new ImplementationFileContext(path, file.Action, null, null));
+                continue;
+            }
             await EnsureGitAncestorsAreRegularAsync(root, path, cancellationToken);
             await EnsureRegularTrackedFileAsync(root, path, cancellationToken);
             fileSafety.ValidateEligiblePath(root, path, mayNotExist: false);
@@ -641,20 +679,27 @@ public sealed class GitWorktreeManager : IImplementationWorkspaceManager
                 throw new ImplementationException("implementation_input_limit", "Approved writable content exceeds the total implementation-context limit.");
             if (SensitiveContentDetector.ContainsSensitiveValue(content))
                 throw new ImplementationException("implementation_sensitive_content", $"Approved path '{path}' contains sensitive values and cannot be generated safely.");
-            if (file.Action != PlannedFileAction.Modify ||
-                FakeImplementationCapabilityMatrix.GetStyle(path, file.Action) != FakeImplementationContentStyle.JsonObject) continue;
-            try
-            {
-                var node = JsonNode.Parse(content);
-                if (node is JsonObject objectNode && objectNode.ContainsKey("forgeDeterministicFake"))
-                    throw new ImplementationException("implementation_terminal_incompatibility",
-                        $"Deterministic Fake JSON marker already exists in '{path}'.");
-            }
-            catch (JsonException exception)
-            {
-                throw new ImplementationException("implementation_terminal_incompatibility",
-                    $"Approved JSON path '{path}' is not valid deterministic Fake input.", false, exception);
-            }
+            contexts.Add(new ImplementationFileContext(path, file.Action, content,
+                ImplementationOutputValidator.Hash(content)));
+        }
+        return contexts;
+    }
+
+    private static void EnsureContextsMatch(
+        IReadOnlyList<ImplementationFileContext> expected,
+        IReadOnlyList<ImplementationFileContext> actual)
+    {
+        if (expected.Count != actual.Count)
+            throw Recovery("The prepared implementation context no longer matches its validated preflight.");
+        for (var index = 0; index < expected.Count; index++)
+        {
+            var left = expected[index];
+            var right = actual[index];
+            if (!RepositoryPathRules.Comparer.Equals(RepositoryPathRules.Normalize(left.Path), RepositoryPathRules.Normalize(right.Path)) ||
+                left.PlannedAction != right.PlannedAction ||
+                !string.Equals(left.OriginalContentSha256, right.OriginalContentSha256, StringComparison.OrdinalIgnoreCase) ||
+                !string.Equals(left.OriginalContent, right.OriginalContent, StringComparison.Ordinal))
+                throw Recovery("The prepared implementation context no longer matches its validated preflight.");
         }
     }
 
@@ -874,6 +919,8 @@ public sealed class GitWorktreeManager : IImplementationWorkspaceManager
             maximumOutputCharacters: Math.Max(1_000_000, limits.MaximumActiveCheckoutFingerprintFiles * 400),
             cancellationToken: cancellationToken);
         EnsureCompleteSuccess(result, "implementation_repository_state", "The complete Git index could not be inspected safely.");
+        if (result.Output.Length > 0 && result.Output[^1] != '\0')
+            throw new ImplementationException("implementation_repository_state", "Git returned truncated index metadata.");
         using var composite = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
         var count = 0;
         long totalBytes = 0;
@@ -924,19 +971,32 @@ public sealed class GitWorktreeManager : IImplementationWorkspaceManager
             file.Path, file.Action, file.OriginalContentSha256, null, "Persisted review operation.")).ToArray();
         await VerifyExpectedStatusAsync(workspacePath, operations, cancellationToken);
         var status = await StatusAsync(workspacePath, operations.Select(operation => operation.Path), cancellationToken);
-        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
-        hash.AppendData(Encoding.UTF8.GetBytes($"{workspace.Token}\0{workspace.Branch}\0{workspace.BaseCommitSha}\0{workspace.RepositoryIdentity}\0{workspace.GitCommonDirectoryIdentity}\0{workspace.OwnershipReference}\0{status}\0"));
+        var manifest = new List<object?>
+        {
+            "forge-implementation-worktree-v2",
+            workspace.Token, workspace.Branch, workspace.BaseCommitSha, workspace.RepositoryIdentity,
+            workspace.GitCommonDirectoryIdentity, workspace.OwnershipReference, status,
+            result.Source, result.Model, result.Summary, result.Warnings.Count
+        };
+        foreach (var warning in result.Warnings) manifest.Add(warning);
+        manifest.AddRange([
+            result.FullDiffCharacters, result.DisplayedDiffCharacters, result.FullDiffUtf8Bytes,
+            result.DisplayedDiffUtf8Bytes, result.DiffTruncated, result.CompletedAt, result.ActiveCheckoutVerified
+        ]);
         long bytes = 0;
         foreach (var file in result.ChangedFiles.OrderBy(value => value.Path, RepositoryPathRules.Comparer))
         {
             var fullPath = fileSafety.ResolveContainedPath(workspacePath, file.Path);
             string actualHash;
             long actualBytes;
+            int actualLines;
             if (file.Action == ImplementationOperationAction.Delete)
             {
                 if (files.FileExists(fullPath) || files.DirectoryExists(fullPath)) throw Recovery("A deleted implementation path reappeared.");
                 actualHash = "deleted";
                 actualBytes = 0;
+                actualLines = 0;
+                if (file.NewBytes != 0 || file.NewLines != 0) throw Recovery("Deleted-file review metadata is inconsistent.");
             }
             else
             {
@@ -944,13 +1004,27 @@ public sealed class GitWorktreeManager : IImplementationWorkspaceManager
                 var content = await ReadStrictUtf8NoBomAsync(fullPath, file.Path, cancellationToken);
                 actualHash = ImplementationOutputValidator.Hash(content);
                 actualBytes = Encoding.UTF8.GetByteCount(content);
+                actualLines = CountLines(content);
                 if (!string.Equals(actualHash, file.NewContentSha256, StringComparison.OrdinalIgnoreCase))
                     throw Recovery("Generated implementation content no longer matches its persisted review.");
+                if (actualBytes != file.NewBytes || actualLines != file.NewLines)
+                    throw Recovery("Generated implementation metadata no longer matches its persisted review.");
             }
             bytes = checked(bytes + actualBytes);
-            hash.AppendData(Encoding.UTF8.GetBytes($"{file.Path}\0{file.Action}\0{file.OriginalContentSha256}\0{file.NewContentSha256}\0{actualHash}\0{actualBytes}\0"));
+            manifest.AddRange([
+                file.Path, file.Action, file.OriginalContentSha256, file.NewContentSha256,
+                file.OriginalBytes, file.NewBytes, file.OriginalLines, file.NewLines,
+                file.Additions, file.Deletions, file.FullDiffCharacters, file.DisplayedDiffCharacters,
+                file.FullDiffUtf8Bytes, file.DisplayedDiffUtf8Bytes, file.DiffTruncated,
+                HashText(file.DiffPreview), actualHash, actualBytes, actualLines
+            ]);
         }
-        return (Convert.ToHexString(hash.GetHashAndReset()).ToLowerInvariant(), result.ChangedFiles.Count, bytes);
+        manifest.Add(result.ChangedFiles.Count);
+        manifest.Add(bytes);
+        if (bytes != result.WorktreeBytes && result.WorktreeFingerprint.Length > 0)
+            throw Recovery("The implementation worktree byte total no longer matches its persisted review.");
+        var fingerprint = SHA256.HashData(JsonSerializer.SerializeToUtf8Bytes(manifest));
+        return (Convert.ToHexString(fingerprint).ToLowerInvariant(), result.ChangedFiles.Count, bytes);
     }
 
     private async Task EnsureNoGitOperationInProgressAsync(string root, CancellationToken cancellationToken)

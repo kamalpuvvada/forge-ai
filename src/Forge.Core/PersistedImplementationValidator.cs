@@ -16,11 +16,22 @@ public static class PersistedImplementationValidator
         ImplementationLimits limits,
         DateTimeOffset? implementationStartedAt = null,
         DateTimeOffset? implementationCompletedAt = null,
-        DateTimeOffset? now = null)
+        DateTimeOffset? now = null,
+        DateTimeOffset? taskUpdatedAt = null)
     {
         ArgumentNullException.ThrowIfNull(limits);
         if (workspace is not null) ValidateWorkspace(workspace);
-        if (result is not null) ValidateResult(result, workspace, plan, limits);
+        if (result is not null)
+        {
+            try
+            {
+                ValidateResult(result, workspace, plan, limits);
+            }
+            catch (OverflowException)
+            {
+                Corrupt();
+            }
+        }
         if (failure is not null) ValidateFailure(failure);
         if (lease is not null) ValidateLease(lease, limits, now);
 
@@ -29,48 +40,126 @@ public static class PersistedImplementationValidator
         if (result is not null && workspace is null) Corrupt();
         if (lease is not null && workspace is null) Corrupt();
 
-        var implementationArtifactsPresent = workspace is not null || result is not null || failure is not null ||
-                                             lease is not null || implementationStartedAt is not null || implementationCompletedAt is not null;
-        if (status is WorkflowStatus.Draft or WorkflowStatus.Clarifying or WorkflowStatus.RequirementSummaryReady or
-            WorkflowStatus.AwaitingRequirementApproval or WorkflowStatus.ReadyForPlanning or WorkflowStatus.Planning or
-            WorkflowStatus.AwaitingPlanApproval && implementationArtifactsPresent) Corrupt();
-        if (status == WorkflowStatus.PlanApproved && implementationArtifactsPresent) Corrupt();
-
-        if (implementationCompletedAt is not null && implementationStartedAt is null ||
-            implementationStartedAt > implementationCompletedAt ||
-            result is not null && implementationCompletedAt != result.CompletedAt) Corrupt();
-
-        if (status == WorkflowStatus.Implementing)
+        var artifacts = workspace is not null || result is not null || failure is not null || lease is not null ||
+                        implementationStartedAt is not null || implementationCompletedAt is not null;
+        switch (status)
         {
-            if (workspace is null || result is not null || implementationStartedAt is null ||
-                implementationCompletedAt is not null || lease is null && failure is null) Corrupt();
-            if (lease is not null && workspace.Phase is ImplementationWorkspacePhase.ResultPersisted or
-                    ImplementationWorkspacePhase.Completed or ImplementationWorkspacePhase.RecoveryRequired)
+            case WorkflowStatus.Draft:
+            case WorkflowStatus.Clarifying:
+            case WorkflowStatus.RequirementSummaryReady:
+            case WorkflowStatus.AwaitingRequirementApproval:
+            case WorkflowStatus.ReadyForPlanning:
+            case WorkflowStatus.Planning:
+            case WorkflowStatus.AwaitingPlanApproval:
+            case WorkflowStatus.PlanApproved:
+                if (artifacts) Corrupt();
+                break;
+            case WorkflowStatus.Implementing:
+                ValidateImplementing(workspace, result, failure, lease, implementationStartedAt, implementationCompletedAt);
+                break;
+            case WorkflowStatus.AwaitingImplementationReview:
+                ValidateCompletedArtifacts(workspace, result, failure, lease, implementationStartedAt,
+                    implementationCompletedAt, allowLegacyEmpty: false);
+                break;
+            case WorkflowStatus.Validating:
+            case WorkflowStatus.Reviewing:
+            case WorkflowStatus.Completed:
+            case WorkflowStatus.Failed:
+                ValidateCompletedArtifacts(workspace, result, failure, lease, implementationStartedAt,
+                    implementationCompletedAt, allowLegacyEmpty: true);
+                break;
+            default:
                 Corrupt();
-            if (failure?.RecoveryRequired == true && workspace.Phase != ImplementationWorkspacePhase.RecoveryRequired)
-                Corrupt();
-        }
-        else if (lease is not null)
-        {
-            Corrupt();
+                break;
         }
 
-        if (status == WorkflowStatus.AwaitingImplementationReview)
-        {
-            if (workspace is null || result is null || implementationStartedAt is null || implementationCompletedAt is null) Corrupt();
-            if (failure is null && workspace.Phase is not (ImplementationWorkspacePhase.ResultPersisted or
-                    ImplementationWorkspacePhase.Completed)) Corrupt();
-            if (failure is not null && (!failure.RecoveryRequired ||
-                failure.ActiveCheckoutVerified != result.ActiveCheckoutVerified ||
-                workspace.Phase != ImplementationWorkspacePhase.RecoveryRequired)) Corrupt();
-        }
+        ValidateTimestamps(workspace, result, failure, implementationStartedAt, implementationCompletedAt,
+            taskUpdatedAt, now);
+    }
 
-        if (status is WorkflowStatus.Validating or WorkflowStatus.Reviewing or WorkflowStatus.Completed or WorkflowStatus.Failed)
+    private static void ValidateImplementing(
+        ImplementationWorkspace? workspace,
+        ImplementationResult? result,
+        ImplementationFailure? failure,
+        ImplementationLease? lease,
+        DateTimeOffset? started,
+        DateTimeOffset? completed)
+    {
+        if (workspace is null || result is not null || started is null || completed is not null) Corrupt();
+        if (lease is not null)
         {
-            var completeArtifacts = workspace is not null && result is not null && implementationStartedAt is not null &&
-                                    implementationCompletedAt is not null;
-            if (implementationArtifactsPresent && !completeArtifacts) Corrupt();
+            if (failure is not null || workspace.Phase is not (ImplementationWorkspacePhase.Reserved or
+                ImplementationWorkspacePhase.Ready or ImplementationWorkspacePhase.WorkspacePreparing or
+                ImplementationWorkspacePhase.WorkspacePrepared or ImplementationWorkspacePhase.MutationStarted or
+                ImplementationWorkspacePhase.ApplyCompleted)) Corrupt();
+            return;
         }
+        if (failure is null) Corrupt();
+        if (failure.RecoveryRequired)
+        {
+            if (workspace.Phase != ImplementationWorkspacePhase.RecoveryRequired || failure.SafeToResume) Corrupt();
+            return;
+        }
+        if (failure.SafeToResume)
+        {
+            if (workspace.Phase is not (ImplementationWorkspacePhase.Reserved or ImplementationWorkspacePhase.Ready or
+                ImplementationWorkspacePhase.WorkspacePrepared)) Corrupt();
+            return;
+        }
+        if (string.Equals(failure.Category, "implementation_terminal_incompatibility", StringComparison.Ordinal))
+        {
+            if (workspace.Phase is not (ImplementationWorkspacePhase.Reserved or ImplementationWorkspacePhase.Ready or
+                ImplementationWorkspacePhase.WorkspacePrepared or ImplementationWorkspacePhase.Interrupted)) Corrupt();
+            return;
+        }
+        if (workspace.Phase != ImplementationWorkspacePhase.Interrupted) Corrupt();
+    }
+
+    private static void ValidateCompletedArtifacts(
+        ImplementationWorkspace? workspace,
+        ImplementationResult? result,
+        ImplementationFailure? failure,
+        ImplementationLease? lease,
+        DateTimeOffset? started,
+        DateTimeOffset? completed,
+        bool allowLegacyEmpty)
+    {
+        var empty = workspace is null && result is null && failure is null && lease is null && started is null && completed is null;
+        if (empty && allowLegacyEmpty) return;
+        if (workspace is null || result is null || started is null || completed is null || lease is not null) Corrupt();
+        if (failure is null)
+        {
+            if (workspace.Phase is not (ImplementationWorkspacePhase.ResultPersisted or ImplementationWorkspacePhase.Completed)) Corrupt();
+            return;
+        }
+        if (!failure.RecoveryRequired || failure.SafeToResume ||
+            failure.ActiveCheckoutVerified != result.ActiveCheckoutVerified ||
+            workspace.Phase != ImplementationWorkspacePhase.RecoveryRequired) Corrupt();
+    }
+
+    private static void ValidateTimestamps(
+        ImplementationWorkspace? workspace,
+        ImplementationResult? result,
+        ImplementationFailure? failure,
+        DateTimeOffset? started,
+        DateTimeOffset? completed,
+        DateTimeOffset? taskUpdated,
+        DateTimeOffset? now)
+    {
+        if (workspace is not null && started is not null &&
+            (workspace.CreatedAt > started || started > workspace.UpdatedAt)) Corrupt();
+        if (result is not null && completed is not null &&
+            (started > result.CompletedAt || result.CompletedAt > completed)) Corrupt();
+        if (workspace is not null && completed is not null && workspace.Phase != ImplementationWorkspacePhase.RecoveryRequired &&
+            workspace.UpdatedAt > completed) Corrupt();
+        if (failure is not null && taskUpdated is not null && failure.OccurredAt > taskUpdated) Corrupt();
+        if (completed is not null && taskUpdated is not null && completed > taskUpdated) Corrupt();
+        if (workspace is not null && taskUpdated is not null && workspace.UpdatedAt > taskUpdated) Corrupt();
+        if (now is { } current && new[]
+            {
+                workspace?.CreatedAt, workspace?.UpdatedAt, result?.CompletedAt, failure?.OccurredAt,
+                started, completed, taskUpdated
+            }.Any(value => value > current.AddMinutes(5))) Corrupt();
     }
 
     private static void ValidateWorkspace(ImplementationWorkspace value)
@@ -104,6 +193,8 @@ public static class PersistedImplementationValidator
     {
         Required(value.Category, 80);
         Required(value.Message, 500);
+        if (SensitiveContentDetector.ContainsSensitiveValue(value.Category) ||
+            SensitiveContentDetector.ContainsSensitiveValue(value.Message)) Corrupt();
         if (value.SafeToResume && value.RecoveryRequired) Corrupt();
     }
 
@@ -117,9 +208,14 @@ public static class PersistedImplementationValidator
             value.Source == ImplementationSource.OpenAI && string.IsNullOrWhiteSpace(value.Model)) Corrupt();
         if (value.Model?.Length > 160) Corrupt();
         Required(value.Summary, limits.MaximumSummaryCharacters);
+        if (SensitiveContentDetector.ContainsSensitiveValue(value.Summary)) Corrupt();
         if (value.Warnings is null || value.ChangedFiles is null || value.Warnings.Count > limits.MaximumWarnings ||
             value.ChangedFiles.Count is < 1 || value.ChangedFiles.Count > limits.MaximumApprovedOperations) Corrupt();
-        foreach (var warning in value.Warnings) Required(warning, limits.MaximumItemSummaryCharacters);
+        foreach (var warning in value.Warnings)
+        {
+            Required(warning, limits.MaximumItemSummaryCharacters);
+            if (SensitiveContentDetector.ContainsSensitiveValue(warning)) Corrupt();
+        }
         if (workspace is null || !string.Equals(value.BaseCommitSha, workspace.BaseCommitSha, StringComparison.Ordinal) ||
             !string.Equals(value.Branch, workspace.Branch, StringComparison.Ordinal)) Corrupt();
 
@@ -130,6 +226,7 @@ public static class PersistedImplementationValidator
         var displayedCharacters = 0;
         var fullBytes = 0;
         var displayedBytes = 0;
+        long worktreeBytes = 0;
         foreach (var file in value.ChangedFiles)
         {
             if (!Enum.IsDefined(file.Action) || file.Path is null || !RepositoryPathRules.IsSafeRelativePath(file.Path, limits.MaximumRelativePathCharacters) ||
@@ -140,6 +237,8 @@ public static class PersistedImplementationValidator
                 file.Action == ImplementationOperationAction.Delete && file.NewContentSha256 is not null ||
                 file.Action == ImplementationOperationAction.Modify &&
                     (file.OriginalContentSha256 is null || file.NewContentSha256 is null)) Corrupt();
+            if (file.Action == ImplementationOperationAction.Create && (file.OriginalBytes != 0 || file.OriginalLines != 0) ||
+                file.Action == ImplementationOperationAction.Delete && (file.NewBytes != 0 || file.NewLines != 0)) Corrupt();
             if (file.OriginalBytes < 0 || file.NewBytes < 0 || file.OriginalLines < 0 || file.NewLines < 0 ||
                 file.Additions < 0 || file.Deletions < 0 || file.FullDiffCharacters < 0 ||
                 file.DisplayedDiffCharacters < 0 || file.FullDiffUtf8Bytes < 0 || file.DisplayedDiffUtf8Bytes < 0 ||
@@ -154,6 +253,8 @@ public static class PersistedImplementationValidator
             displayedCharacters = checked(displayedCharacters + file.DisplayedDiffCharacters);
             fullBytes = checked(fullBytes + file.FullDiffUtf8Bytes);
             displayedBytes = checked(displayedBytes + file.DisplayedDiffUtf8Bytes);
+            if (file.Action != ImplementationOperationAction.Delete)
+                worktreeBytes = checked(worktreeBytes + file.NewBytes);
         }
         if (expectedPaths is not null && !expectedPaths.SetEquals(seen) ||
             displayedCharacters > limits.MaximumDiffPreviewCharactersTotal ||
@@ -161,7 +262,7 @@ public static class PersistedImplementationValidator
             value.FullDiffUtf8Bytes != fullBytes || value.DisplayedDiffUtf8Bytes != displayedBytes ||
             value.DiffTruncated != (displayedCharacters < fullCharacters)) Corrupt();
         if (value.WorktreeFingerprint.Length > 0 && (!IsSha256(value.WorktreeFingerprint) ||
-            value.WorktreeFileCount != value.ChangedFiles.Count || value.WorktreeBytes < 0) ||
+            value.WorktreeFileCount != value.ChangedFiles.Count || value.WorktreeBytes != worktreeBytes) ||
             value.WorktreeFingerprint.Length == 0 && (value.WorktreeFileCount != 0 || value.WorktreeBytes != 0)) Corrupt();
     }
 

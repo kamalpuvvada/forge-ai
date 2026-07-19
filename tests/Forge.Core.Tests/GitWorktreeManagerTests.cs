@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Security.Cryptography;
 using Forge.Core;
 using Forge.Infrastructure;
+using Microsoft.Data.Sqlite;
 
 namespace Forge.Core.Tests;
 
@@ -61,6 +62,56 @@ public sealed class GitWorktreeManagerTests : IDisposable
         Git("worktree", "remove", "--force", Path.Combine(_worktrees, prepared.Workspace.Token));
         Assert.False(await manager.IsAvailableAsync(_root, prepared.Workspace, plan, result));
         Assert.NotEmpty(result.ChangedFiles);
+    }
+
+    [Theory]
+    [InlineData(PlannedFileAction.Create)]
+    [InlineData(PlannedFileAction.Modify)]
+    [InlineData(PlannedFileAction.Delete)]
+    public async Task Representative_every_content_style_and_action_completes_the_full_git_flow(
+        PlannedFileAction action)
+    {
+        InitializeRepository();
+        var fixtures = new Dictionary<string, string>
+        {
+            ["src/style.cs"] = "public class Style { }\n",
+            ["src/style.ps1"] = "Write-Output 'style'\n",
+            ["src/style.sql"] = "select 1;\n",
+            ["src/style.cmd"] = "echo style\n",
+            ["src/style.css"] = "body { color: black; }\n",
+            ["src/style.xml"] = "<root />\n",
+            ["src/style.md"] = "# Style\n",
+            ["src/style.json"] = "{\"style\":true}\n"
+        };
+        if (action != PlannedFileAction.Create)
+        {
+            foreach (var (path, content) in fixtures)
+                File.WriteAllText(Path.Combine(_root, path.Replace('/', Path.DirectorySeparatorChar)), content);
+            Git("add", "--", "src");
+            Git("commit", "-m", "content styles");
+        }
+        var snapshot = Snapshot();
+        var affected = fixtures.Keys.Select((path, index) => new PlannedFileChange(path, action,
+            "Exercise a supported deterministic content style.", action == PlannedFileAction.Create ? [] : [$"E{index + 1}"], .9m)).ToArray();
+        var plan = new ImplementationPlan("Content style matrix", "Exercise full Git application.", "Fixtures are tracked.",
+            affected, [new ImplementationStep(1, "Apply every representative style.", fixtures.Keys.ToArray(),
+                affected.SelectMany(file => file.EvidenceIds).ToArray(), "Each isolated file changes.")],
+            [], [], [], [], [new RequirementCoverageItem("Exercise supported styles.", fixtures.Keys.ToArray(), [1])],
+            "Representative content-style integration.", PlanningSource.DeterministicFake, null,
+            DateTimeOffset.UtcNow, snapshot.Fingerprint);
+        var manager = Manager();
+        var reservation = await manager.ReserveAsync(Guid.NewGuid(), _root, snapshot, plan);
+        var output = (await new FakeImplementationEngine().GenerateAsync(new ImplementationContext(
+            "Approved", plan, reservation.Files!, DateTimeOffset.UtcNow))).Output;
+        ImplementationOutputValidator.Validate(plan, reservation.Files!, output, new ImplementationLimits());
+        var prepared = await manager.PrepareAsync(_root, reservation.Workspace, plan,
+            new ImplementationLimits(), reservation.ActiveCheckout, reservation.Files!);
+        var result = await manager.ApplyAsync(_root, prepared, output, new ImplementationLimits(), DateTimeOffset.UtcNow);
+        await prepared.WorkspaceLock.DisposeAsync();
+
+        Assert.Equal(fixtures.Count, result.ChangedFiles.Count);
+        Assert.All(result.ChangedFiles, file => Assert.Equal(action.ToString(), file.Action.ToString()));
+        Assert.True(await manager.IsAvailableAsync(_root, prepared.Workspace, plan, result));
     }
 
     [Fact]
@@ -188,6 +239,127 @@ public sealed class GitWorktreeManagerTests : IDisposable
     }
 
     [Fact]
+    public async Task Every_persisted_review_field_is_bound_to_runtime_worktree_verification()
+    {
+        InitializeRepository();
+        var snapshot = Snapshot();
+        var plan = Plan(snapshot);
+        var manager = Manager();
+        var reservation = await manager.ReserveAsync(Guid.NewGuid(), _root, snapshot, plan);
+        var prepared = await manager.PrepareAsync(_root, reservation.Workspace, plan,
+            new ImplementationLimits(), reservation.ActiveCheckout, reservation.Files!);
+        var output = (await new FakeImplementationEngine().GenerateAsync(new ImplementationContext(
+            "Approved", plan, reservation.Files!, DateTimeOffset.UtcNow))).Output;
+        var result = await manager.ApplyAsync(_root, prepared, output, new ImplementationLimits(), DateTimeOffset.UtcNow);
+        await prepared.WorkspaceLock.DisposeAsync();
+        var index = result.ChangedFiles.ToList().FindIndex(file => file.Action == ImplementationOperationAction.Modify);
+        var file = result.ChangedFiles[index];
+        ImplementationResult WithFile(ChangedFileReview replacement)
+        {
+            var changed = result.ChangedFiles.ToArray();
+            changed[index] = replacement;
+            return result with { ChangedFiles = changed };
+        }
+        var changedPreview = (file.DiffPreview[0] == 'x' ? "y" : "x") + file.DiffPreview[1..];
+        var variants = new[]
+        {
+            WithFile(file with { OriginalContentSha256 = new string('0', 64) }),
+            WithFile(file with { NewContentSha256 = new string('0', 64) }),
+            WithFile(file with { OriginalBytes = file.OriginalBytes + 1 }),
+            WithFile(file with { NewBytes = file.NewBytes + 1 }),
+            WithFile(file with { OriginalLines = file.OriginalLines + 1 }),
+            WithFile(file with { NewLines = file.NewLines + 1 }),
+            WithFile(file with { Additions = file.Additions + 1 }),
+            WithFile(file with { Deletions = file.Deletions + 1 }),
+            WithFile(file with { FullDiffCharacters = file.FullDiffCharacters + 1 }),
+            WithFile(file with { DisplayedDiffCharacters = file.DisplayedDiffCharacters + 1 }),
+            WithFile(file with { FullDiffUtf8Bytes = file.FullDiffUtf8Bytes + 1 }),
+            WithFile(file with { DisplayedDiffUtf8Bytes = file.DisplayedDiffUtf8Bytes + 1 }),
+            WithFile(file with { DiffTruncated = !file.DiffTruncated }),
+            WithFile(file with { DiffPreview = changedPreview }),
+            result with { Summary = result.Summary + " changed" },
+            result with { Warnings = [.. result.Warnings, "Additional bounded warning."] },
+            result with { FullDiffCharacters = result.FullDiffCharacters + 1 },
+            result with { DisplayedDiffCharacters = result.DisplayedDiffCharacters + 1 },
+            result with { FullDiffUtf8Bytes = result.FullDiffUtf8Bytes + 1 },
+            result with { DisplayedDiffUtf8Bytes = result.DisplayedDiffUtf8Bytes + 1 },
+            result with { DiffTruncated = !result.DiffTruncated },
+            result with { CompletedAt = result.CompletedAt.AddTicks(1) },
+            result with { ActiveCheckoutVerified = false },
+            result with { WorktreeFileCount = result.WorktreeFileCount + 1 },
+            result with { WorktreeBytes = result.WorktreeBytes + 1 }
+        };
+
+        foreach (var corrupted in variants)
+        {
+            Assert.NotEmpty(corrupted.ChangedFiles[index].DiffPreview);
+            Assert.False(await manager.IsAvailableAsync(_root, prepared.Workspace, plan, corrupted));
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Physical_worktree_change_immediately_around_result_save_retains_review_and_requires_recovery(
+        bool mutateAfterSave)
+    {
+        InitializeRepository();
+        var snapshot = Snapshot();
+        var plan = Plan(snapshot);
+        var task = ApprovedRepositoryTask(snapshot, plan);
+        var databaseDirectory = Path.Combine(Path.GetTempPath(), $"forge-physical-race-{Guid.NewGuid():N}");
+        var databasePath = Path.Combine(databaseDirectory, "forge.db");
+        var connectionString = $"Data Source={databasePath}";
+        Directory.CreateDirectory(databaseDirectory);
+        try
+        {
+            await new SqliteDatabaseInitializer(connectionString).InitializeAsync();
+            var inner = new SqliteEngineeringTaskRepository(connectionString);
+            await inner.SaveAsync(task);
+            var reached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var repository = new SaveBarrierRepository(inner, 6, mutateAfterSave, reached, release);
+            var manager = Manager();
+            var service = new EngineeringTaskService(repository, new NullClarificationEngine(), TimeProvider.System,
+                implementationEngine: new FakeImplementationEngine(), implementationWorkspaceManager: manager,
+                implementationLimits: new ImplementationLimits(),
+                implementationCoordinator: new ImplementationOperationCoordinator(),
+                implementationProcessIdentity: new ImplementationProcessIdentity(Guid.NewGuid()));
+            var activeBefore = File.ReadAllBytes(Path.Combine(_root, "src", "App.cs"));
+
+            var generation = service.GenerateImplementationAsync(task.Id);
+            try
+            {
+                await reached.Task.WaitAsync(TimeSpan.FromSeconds(30));
+                await File.AppendAllTextAsync(Path.Combine(_worktrees, task.Id.ToString("N"), "src", "App.cs"),
+                    "physical race change\n");
+            }
+            finally
+            {
+                release.TrySetResult();
+            }
+            var failure = await Assert.ThrowsAsync<ImplementationException>(() => generation);
+            var persisted = await inner.GetAsync(task.Id);
+            var runtime = await new EngineeringTaskService(inner, new NullClarificationEngine(), TimeProvider.System,
+                    implementationWorkspaceManager: manager)
+                .GetImplementationRuntimeStatusAsync(persisted!);
+
+            Assert.Equal("implementation_workspace_drift", failure.Category);
+            Assert.Equal(WorkflowStatus.AwaitingImplementationReview, persisted?.Status);
+            Assert.NotNull(persisted?.ImplementationResult);
+            Assert.True(persisted?.LastImplementationFailure?.RecoveryRequired);
+            Assert.Equal(ImplementationAttemptDisposition.RecoveryRequired, runtime?.Disposition);
+            Assert.False(runtime?.WorkspaceAvailable);
+            Assert.Equal(activeBefore, File.ReadAllBytes(Path.Combine(_root, "src", "App.cs")));
+        }
+        finally
+        {
+            SqliteConnection.ClearAllPools();
+            if (Directory.Exists(databaseDirectory)) Directory.Delete(databaseDirectory, true);
+        }
+    }
+
+    [Fact]
     public void Diff_preview_truncation_never_splits_a_unicode_rune()
     {
         const string value = "abc😀def";
@@ -218,6 +390,28 @@ public sealed class GitWorktreeManagerTests : IDisposable
             _root, resumed.Workspace, plan, new ImplementationLimits(), reservation.ActiveCheckout));
         Assert.Equal("implementation_recovery_required", exception.Category);
         Assert.True(exception.RecoveryRequired);
+    }
+
+    [Fact]
+    public async Task Prepare_rejects_any_preflight_context_drift_before_creating_owned_git_artifacts()
+    {
+        InitializeRepository();
+        var snapshot = Snapshot();
+        var plan = Plan(snapshot);
+        var taskId = Guid.NewGuid();
+        var manager = Manager();
+        var reservation = await manager.ReserveAsync(taskId, _root, snapshot, plan);
+        var tampered = reservation.Files!.Select((file, index) => index == 0
+            ? file with { OriginalContent = file.OriginalContent + "unexpected" }
+            : file).ToArray();
+
+        var failure = await Assert.ThrowsAsync<ImplementationException>(() => manager.PrepareAsync(
+            _root, reservation.Workspace, plan, new ImplementationLimits(), reservation.ActiveCheckout, tampered));
+
+        Assert.True(failure.RecoveryRequired);
+        Assert.Equal(string.Empty, Git("branch", "--list", $"forge/task-{taskId:N}").Trim());
+        Assert.Equal(string.Empty, Git("for-each-ref", $"refs/forge/tasks/{taskId:N}").Trim());
+        Assert.False(Directory.Exists(Path.Combine(_worktrees, taskId.ToString("N"))));
     }
 
     [Fact]
@@ -326,10 +520,15 @@ public sealed class GitWorktreeManagerTests : IDisposable
         Git("add", "src/App.cs");
         Git("commit", "-m", "sensitive file");
         var snapshot = Snapshot();
+        var taskId = Guid.NewGuid();
 
-        var exception = await Assert.ThrowsAsync<ImplementationException>(() => PrepareDefaultAsync(snapshot));
+        var exception = await Assert.ThrowsAsync<ImplementationException>(() =>
+            Manager().ReserveAsync(taskId, _root, snapshot, Plan(snapshot)));
 
         Assert.Equal("implementation_sensitive_content", exception.Category);
+        Assert.Equal(string.Empty, Git("branch", "--list", $"forge/task-{taskId:N}").Trim());
+        Assert.Equal(string.Empty, Git("for-each-ref", $"refs/forge/tasks/{taskId:N}").Trim());
+        Assert.False(Directory.Exists(Path.Combine(_worktrees, taskId.ToString("N"))));
     }
 
     [Fact]
@@ -361,8 +560,14 @@ public sealed class GitWorktreeManagerTests : IDisposable
         var plan = ModifyOnlyPlan(snapshot, "config/settings.json");
         var taskId = Guid.NewGuid();
 
-        var exception = await Assert.ThrowsAsync<ImplementationException>(() =>
-            Manager().ReserveAsync(taskId, _root, snapshot, plan));
+        var reservation = await Manager().ReserveAsync(taskId, _root, snapshot, plan);
+        var exception = await Assert.ThrowsAsync<ImplementationException>(async () =>
+        {
+            var evaluation = await new FakeImplementationEngine().GenerateAsync(new ImplementationContext(
+                "Approved", plan, reservation.Files!, DateTimeOffset.UtcNow));
+            ImplementationOutputValidator.Validate(plan, reservation.Files!, evaluation.Output,
+                new ImplementationLimits());
+        });
 
         Assert.Equal("implementation_terminal_incompatibility", exception.Category);
         Assert.Equal(string.Empty, Git("branch", "--list", $"forge/task-{taskId:N}").Trim());
@@ -385,6 +590,23 @@ public sealed class GitWorktreeManagerTests : IDisposable
 
         Assert.Equal("implementation_repository_state", exception.Category);
         Assert.False(Directory.Exists(Path.Combine(_worktrees, taskId.ToString("N"))));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Malformed_or_truncated_stage_metadata_fails_closed_before_reservation(bool truncate)
+    {
+        InitializeRepository();
+        var snapshot = Snapshot();
+        var runner = new StageMetadataFaultGitRunner(CreateRunner(), truncate);
+
+        var exception = await Assert.ThrowsAsync<ImplementationException>(() =>
+            Manager(runner).ReserveAsync(Guid.NewGuid(), _root, snapshot, Plan(snapshot)));
+
+        Assert.Equal("implementation_repository_state", exception.Category);
+        Assert.False(Directory.Exists(_worktrees) && Directory.EnumerateDirectories(_worktrees)
+            .Any(path => Path.GetFileName(path).Length == 32));
     }
 
     [Fact]
@@ -759,10 +981,11 @@ public sealed class GitWorktreeManagerTests : IDisposable
     {
         var head = Git("rev-parse", "HEAD").Trim();
         return new RepositorySnapshot(_root, true, Git("branch", "--show-current").Trim(), head[..8], head, "clean",
-            2, 2, 0, ["C#/.NET"], [".cs", ".txt"], [], [], [], DateTimeOffset.UtcNow, "fingerprint",
+            3, 3, 0, ["C#/.NET"], [".cs", ".txt", ".props"], [], [], [], DateTimeOffset.UtcNow, "fingerprint",
             [
                 new RepositoryFileMetadata("src/App.cs", ".cs", 21, 1, "source", false, "App", ["App"]),
-                new RepositoryFileMetadata("docs/Delete.txt", ".txt", 10, 1, "source", false, "docs", [])
+                new RepositoryFileMetadata("docs/Delete.txt", ".txt", 10, 1, "source", false, "docs", []),
+                new RepositoryFileMetadata("Repository.props", ".props", 24, 1, "configuration", false, null, [])
             ], "status");
     }
 
@@ -774,9 +997,9 @@ public sealed class GitWorktreeManagerTests : IDisposable
             new PlannedFileChange("src/App.cs", PlannedFileAction.Modify, "Modify.", ["E1"], .9m),
             new PlannedFileChange("docs/New.md", PlannedFileAction.Create, "Create.", [], .8m),
             new PlannedFileChange("docs/Delete.txt", PlannedFileAction.Delete, "Delete.", ["E2"], .8m),
-            new PlannedFileChange("Repository.props", PlannedFileAction.Inspect, "Inspect.", [], .4m)
+            new PlannedFileChange("Repository.props", PlannedFileAction.Inspect, "Inspect.", ["E3"], .4m)
         ],
-        [new ImplementationStep(1, "Change files.", ["src/App.cs", "docs/New.md", "docs/Delete.txt", "Repository.props"], ["E1", "E2"], "Diff exists.")],
+        [new ImplementationStep(1, "Change files.", ["src/App.cs", "docs/New.md", "docs/Delete.txt", "Repository.props"], ["E1", "E2", "E3"], "Diff exists.")],
         [], [], [], [], [new RequirementCoverageItem("Change files.", ["src/App.cs", "docs/New.md", "docs/Delete.txt", "Repository.props"], [1])],
         "Summary", PlanningSource.DeterministicFake, null, DateTimeOffset.UtcNow, snapshot.Fingerprint);
 
@@ -793,6 +1016,27 @@ public sealed class GitWorktreeManagerTests : IDisposable
         [new ImplementationStep(1, "Modify file.", [path], ["E1"], "File changes.")], [], [], [], [],
         [new RequirementCoverageItem("Modify file.", [path], [1])], "Summary",
         PlanningSource.DeterministicFake, null, DateTimeOffset.UtcNow, snapshot.Fingerprint);
+
+    private EngineeringTask ApprovedRepositoryTask(RepositorySnapshot snapshot, ImplementationPlan plan)
+    {
+        var now = DateTimeOffset.UtcNow;
+        var task = EngineeringTask.Create(_root,
+            "Apply deterministic changes. Acceptance criteria: a review is available. Validation: inspect the diff.", now);
+        task.ApplyClarificationEvaluation(ClarificationEvaluation.Summarize("Approved deterministic implementation."), now);
+        task.ApproveRequirementSummary(now);
+        task.BeginRepositoryAnalysis(now);
+        task.StoreRepositorySnapshot(snapshot, now);
+        var evidence = new[]
+        {
+            new EvidenceItem("E1", "src/App.cs", 1, 1, "public class App", "Direct source evidence.", 20, "hash1"),
+            new EvidenceItem("E2", "docs/Delete.txt", 1, 1, "delete me", "Direct delete evidence.", 20, "hash2"),
+            new EvidenceItem("E3", "Repository.props", 1, 1, "root-level tracked file", "Direct inspect evidence.", 20, "hash3")
+        };
+        task.StoreEvidence(new EvidenceSelection(evidence, 3, 3, evidence.Sum(item => item.Excerpt.Length)), now);
+        task.StoreImplementationPlan(plan, now, TimeSpan.FromMinutes(30));
+        task.ApproveImplementationPlan(now);
+        return task;
+    }
 
     private string Git(params string[] arguments)
         => GitAt(_root, arguments);
@@ -855,6 +1099,66 @@ public sealed class GitWorktreeManagerTests : IDisposable
                 ? result with { OutputTruncated = true }
                 : result;
         }
+    }
+
+    private sealed class StageMetadataFaultGitRunner(IGitProcessRunner inner, bool truncate) : IGitProcessRunner
+    {
+        public async Task<GitProcessResult> RunAsync(
+            string workingDirectory,
+            IReadOnlyList<string> arguments,
+            string? standardInput = null,
+            int? maximumOutputCharacters = null,
+            CancellationToken cancellationToken = default,
+            GitCommandKind commandKind = GitCommandKind.ReadOnly)
+        {
+            var result = await inner.RunAsync(workingDirectory, arguments, standardInput,
+                maximumOutputCharacters, cancellationToken, commandKind);
+            if (arguments.Count >= 4 && arguments[0] == "ls-files" && arguments[1] == "--stage" &&
+                arguments[2] == "-v" && arguments[3] == "-z")
+                return result with
+                {
+                    Output = truncate
+                        ? result.Output.TrimEnd('\0')
+                        : "malformed-index-entry\0"
+                };
+            return result;
+        }
+    }
+
+    private sealed class SaveBarrierRepository(
+        IEngineeringTaskRepository inner,
+        int targetSave,
+        bool afterSave,
+        TaskCompletionSource reached,
+        TaskCompletionSource release) : IEngineeringTaskRepository
+    {
+        private int saves;
+
+        public Task<IReadOnlyList<EngineeringTaskSummary>> ListRecentAsync(int maximumCount,
+            CancellationToken cancellationToken = default) => inner.ListRecentAsync(maximumCount, cancellationToken);
+
+        public Task<EngineeringTask?> GetAsync(Guid id, CancellationToken cancellationToken = default) =>
+            inner.GetAsync(id, cancellationToken);
+
+        public async Task SaveAsync(EngineeringTask task, CancellationToken cancellationToken = default)
+        {
+            var current = Interlocked.Increment(ref saves);
+            if (current == targetSave && !afterSave) await WaitAsync(cancellationToken);
+            await inner.SaveAsync(task, cancellationToken);
+            if (current == targetSave && afterSave) await WaitAsync(cancellationToken);
+        }
+
+        private async Task WaitAsync(CancellationToken cancellationToken)
+        {
+            reached.TrySetResult();
+            await release.Task.WaitAsync(cancellationToken);
+        }
+    }
+
+    private sealed class NullClarificationEngine : IClarificationEngine
+    {
+        public Task<ClarificationEvaluation> EvaluateAsync(EngineeringTask task,
+            CancellationToken cancellationToken = default) => throw new NotSupportedException();
     }
 
     private sealed class FaultingFileSystem : IImplementationFileSystem

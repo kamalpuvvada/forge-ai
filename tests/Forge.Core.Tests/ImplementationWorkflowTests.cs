@@ -109,6 +109,32 @@ public sealed class ImplementationWorkflowTests
     }
 
     [Fact]
+    public void Validator_rejects_every_sensitive_implementation_output_text_surface_without_echoing_the_value()
+    {
+        var (plan, files, output) = ValidOutput();
+        var value = Convert.ToBase64String(Guid.NewGuid().ToByteArray()) +
+                    Convert.ToBase64String(Guid.NewGuid().ToByteArray()) + "Aa1-";
+        var labelled = $"deployment credential: {value}";
+        var variants = new[]
+        {
+            output with { Summary = labelled },
+            output with { Warnings = [labelled] },
+            output with { Operations = output.Operations.Select((operation, index) =>
+                index == 0 ? operation with { Summary = labelled } : operation).ToArray() },
+            output with { Operations = output.Operations.Select((operation, index) =>
+                index == 0 ? operation with { Content = $"// deployment credential: {value}\n" } : operation).ToArray() }
+        };
+
+        foreach (var variant in variants)
+        {
+            var failure = Assert.Throws<ImplementationException>(() =>
+                ImplementationOutputValidator.Validate(plan, files, variant, new ImplementationLimits()));
+            Assert.Equal("implementation_sensitive_content", failure.Category);
+            Assert.DoesNotContain(value, failure.Message, StringComparison.Ordinal);
+        }
+    }
+
+    [Fact]
     public async Task Fake_engine_rejects_unsupported_modify_format_without_returning_telemetry()
     {
         const string original = "value\n";

@@ -1,6 +1,7 @@
 using System.Net;
 using System.Net.Http.Json;
 using System.Diagnostics;
+using System.Collections.Concurrent;
 using System.Text;
 using System.Text.Json;
 using Forge.Api.Contracts;
@@ -12,6 +13,7 @@ using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Logging;
 using Microsoft.Data.Sqlite;
 using UglyToad.PdfPig;
 
@@ -57,6 +59,35 @@ public sealed class EngineeringTaskApiTests : IClassFixture<FakeModeFactory>
         Assert.DoesNotContain("telemetry", summary.ToString());
         Assert.Equal(before, await client.GetStringAsync($"/api/tasks/{id}"));
         Assert.Equal(before, await client.GetStringAsync($"/api/tasks/{id}"));
+    }
+
+    [Fact]
+    public async Task Fake_task_detail_and_history_use_one_safe_repository_identifier_without_path_components()
+    {
+        await using var factory = new FakeModeFactory();
+        using var client = factory.CreateClient();
+        const string repository = @"C:\Users\RecognizableUser\SecretClient\ForgeRepo";
+        var response = await client.PostAsJsonAsync("/api/tasks", new
+        {
+            repository,
+            requirement = "Add a report. Acceptance criteria: the report exists. Validation: inspect it."
+        });
+        response.EnsureSuccessStatusCode();
+
+        var detail = await response.Content.ReadFromJsonAsync<JsonElement>();
+        var history = Assert.Single((await client.GetFromJsonAsync<JsonElement[]>("/api/tasks"))!);
+        var detailRepository = detail.GetProperty("repository").GetString()!;
+        var historyRepository = history.GetProperty("repository").GetString()!;
+        var requirementSummary = detail.GetProperty("requirementSummary").GetString()!;
+
+        Assert.Equal(detailRepository, historyRepository);
+        Assert.Matches("^Repository [0-9a-f]{16}$", detailRepository);
+        foreach (var value in new[] { detailRepository, requirementSummary })
+        {
+            Assert.DoesNotContain("RecognizableUser", value, StringComparison.OrdinalIgnoreCase);
+            Assert.DoesNotContain("SecretClient", value, StringComparison.OrdinalIgnoreCase);
+            Assert.DoesNotContain("C:", value, StringComparison.OrdinalIgnoreCase);
+        }
     }
 
     [Fact]
@@ -312,6 +343,41 @@ public sealed class EngineeringTaskApiTests : IClassFixture<FakeModeFactory>
         (await _client.GetAsync($"/api/tasks/{id}/export/pdf")).EnsureSuccessStatusCode();
         var afterReadOnlyRoutes = await ReadPersistedStateAsync(_factory.DatabasePath, id);
         Assert.Equal(beforeReadOnlyRoutes, afterReadOnlyRoutes);
+    }
+
+    [Fact]
+    public async Task Sensitive_implementation_failure_is_absent_from_problem_dto_database_logs_and_pdfs()
+    {
+        await using var factory = new SensitiveImplementationFailureFactory();
+        using var client = factory.CreateClient();
+        var createdResponse = await client.PostAsJsonAsync("/api/tasks", new
+        {
+            repository = factory.TargetRepositoryPath,
+            requirement = "Add report export. Acceptance criteria: export is available. Validation: inspect the diff."
+        });
+        createdResponse.EnsureSuccessStatusCode();
+        var created = await createdResponse.Content.ReadFromJsonAsync<JsonElement>();
+        var id = created.GetProperty("id").GetGuid();
+        (await client.PostAsync($"/api/tasks/{id}/requirement-approval", null)).EnsureSuccessStatusCode();
+        (await client.PostAsync($"/api/tasks/{id}/repository-analysis", null)).EnsureSuccessStatusCode();
+        (await client.PostAsync($"/api/tasks/{id}/plan", null)).EnsureSuccessStatusCode();
+        (await client.PostAsync($"/api/tasks/{id}/plan-approval", null)).EnsureSuccessStatusCode();
+
+        var failure = await client.PostAsync($"/api/tasks/{id}/implementation", null);
+        var problem = await failure.Content.ReadAsStringAsync();
+        var detail = await client.GetStringAsync($"/api/tasks/{id}");
+        var taskPdf = ExtractPdf(await client.GetByteArrayAsync($"/api/tasks/{id}/export/pdf"));
+        var planPdf = ExtractPdf(await client.GetByteArrayAsync($"/api/tasks/{id}/export/plan-pdf"));
+        await using var connection = new SqliteConnection($"Data Source={factory.DatabasePath}");
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT coalesce(ImplementationResult, '') || coalesce(LastImplementationFailure, '') FROM EngineeringTasks WHERE Id = $id";
+        command.Parameters.AddWithValue("$id", id.ToString());
+        var persisted = (string)(await command.ExecuteScalarAsync())!;
+
+        Assert.Equal(HttpStatusCode.UnprocessableEntity, failure.StatusCode);
+        foreach (var surface in new[] { problem, detail, persisted, taskPdf, planPdf, factory.LogText })
+            Assert.DoesNotContain(factory.SensitiveValue, surface, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -873,6 +939,110 @@ public sealed class ProviderFailureFactory : FakeModeFactory
                 "provider_error",
                 failed,
                 new Exception("sensitive-test-value")));
+        }
+    }
+}
+
+public sealed class SensitiveImplementationFailureFactory : FakeModeFactory
+{
+    private readonly CapturingLoggerProvider loggerProvider = new();
+    public string SensitiveValue { get; } = Convert.ToBase64String(Guid.NewGuid().ToByteArray()) +
+                                             Convert.ToBase64String(Guid.NewGuid().ToByteArray()) + "Aa1-";
+    public string LogText => loggerProvider.Text;
+
+    protected override void ConfigureWebHost(IWebHostBuilder builder)
+    {
+        base.ConfigureWebHost(builder);
+        builder.ConfigureServices(services =>
+        {
+            services.RemoveAll<IImplementationWorkspaceManager>();
+            services.AddSingleton<IImplementationWorkspaceManager>(new SensitiveFailureWorkspaceManager(this));
+            services.AddSingleton<ILoggerProvider>(loggerProvider);
+        });
+    }
+
+    private sealed class SensitiveFailureWorkspaceManager(SensitiveImplementationFailureFactory owner)
+        : IImplementationWorkspaceManager
+    {
+        private static readonly string Token = new('a', 32);
+
+        public Task<ImplementationReservation> ReserveAsync(Guid taskId, string repositoryPath,
+            RepositorySnapshot snapshot, ImplementationPlan plan, CancellationToken cancellationToken = default)
+        {
+            var files = plan.AffectedFiles.Select(file => file.Action switch
+            {
+                PlannedFileAction.Create => new ImplementationFileContext(file.Path, file.Action, null, null),
+                _ => Context(file.Path, file.Action)
+            }).ToArray();
+            var now = DateTimeOffset.UtcNow;
+            var workspace = new ImplementationWorkspace(Token, $"forge/task-{Token}", snapshot.FullHeadSha!,
+                ImplementationWorkspacePhase.Reserved, now, now, false, new string('1', 64),
+                new string('2', 64), $"refs/forge/tasks/{Token}");
+            return Task.FromResult(new ImplementationReservation(workspace,
+                new ActiveCheckoutSignature("main", snapshot.FullHeadSha!, "status", "index"), files));
+        }
+
+        public Task<PreparedImplementationWorkspace> PrepareAsync(string repositoryPath,
+            ImplementationWorkspace workspace, ImplementationPlan plan, ImplementationLimits limits,
+            ActiveCheckoutSignature activeCheckout, CancellationToken cancellationToken = default)
+        {
+            var files = plan.AffectedFiles.Select(file => file.Action switch
+            {
+                PlannedFileAction.Create => new ImplementationFileContext(file.Path, file.Action, null, null),
+                _ => Context(file.Path, file.Action)
+            }).ToArray();
+            return Task.FromResult(new PreparedImplementationWorkspace(
+                workspace with { Phase = ImplementationWorkspacePhase.Ready, IsAvailable = true },
+                activeCheckout, files, new HeldWorkspaceLock()));
+        }
+
+        public Task<ImplementationResult> ApplyAsync(string repositoryPath, PreparedImplementationWorkspace prepared,
+            ImplementationOutput output, ImplementationLimits limits, DateTimeOffset completedAt,
+            CancellationToken cancellationToken = default) =>
+            Task.FromException<ImplementationResult>(new ImplementationException("implementation_failure",
+                $"deployment credential: {owner.SensitiveValue}", true));
+
+        public Task<bool> IsAvailableAsync(string repositoryPath, ImplementationWorkspace workspace,
+            ImplementationPlan plan, ImplementationResult? result, CancellationToken cancellationToken = default) =>
+            Task.FromResult(true);
+
+        public Task VerifyActiveCheckoutAsync(string repositoryPath, ImplementationPlan plan,
+            ActiveCheckoutSignature expected, CancellationToken cancellationToken = default) => Task.CompletedTask;
+
+        private static ImplementationFileContext Context(string path, PlannedFileAction action)
+        {
+            const string content = "existing fixture content\n";
+            return new ImplementationFileContext(path, action, content, ImplementationOutputValidator.Hash(content));
+        }
+    }
+
+    private sealed class HeldWorkspaceLock : IImplementationWorkspaceLock
+    {
+        public bool IsHeld { get; private set; } = true;
+        public ValueTask DisposeAsync()
+        {
+            IsHeld = false;
+            return ValueTask.CompletedTask;
+        }
+    }
+
+    private sealed class CapturingLoggerProvider : ILoggerProvider
+    {
+        private readonly ConcurrentQueue<string> messages = new();
+        public string Text => string.Join('\n', messages);
+        public ILogger CreateLogger(string categoryName) => new CapturingLogger(messages);
+        public void Dispose() { }
+
+        private sealed class CapturingLogger(ConcurrentQueue<string> messages) : ILogger
+        {
+            public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+            public bool IsEnabled(LogLevel logLevel) => true;
+            public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception,
+                Func<TState, Exception?, string> formatter)
+            {
+                messages.Enqueue(formatter(state, exception));
+                if (exception is not null) messages.Enqueue(exception.ToString());
+            }
         }
     }
 }

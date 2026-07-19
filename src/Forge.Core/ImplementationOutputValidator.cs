@@ -25,9 +25,14 @@ public static class ImplementationOutputValidator
             throw Invalid("The implementation output is incomplete.");
 
         Required(output.Summary, limits.MaximumSummaryCharacters, "The implementation summary");
+        RejectSensitive(output.Summary, "The implementation summary contains sensitive content.");
         if (output.Warnings.Count > limits.MaximumWarnings)
             throw Invalid("The implementation output contains too many warnings.");
-        foreach (var warning in output.Warnings) Required(warning, limits.MaximumItemSummaryCharacters, "An implementation warning");
+        foreach (var warning in output.Warnings)
+        {
+            Required(warning, limits.MaximumItemSummaryCharacters, "An implementation warning");
+            RejectSensitive(warning, "An implementation warning contains sensitive content.");
+        }
 
         var approved = plan.AffectedFiles
             .Where(file => file.Action is PlannedFileAction.Create or PlannedFileAction.Modify or PlannedFileAction.Delete)
@@ -45,6 +50,7 @@ public static class ImplementationOutputValidator
         {
             Required(operation.Path, limits.MaximumRelativePathCharacters, "An implementation path");
             Required(operation.Summary, limits.MaximumItemSummaryCharacters, "An implementation-operation summary");
+            RejectSensitive(operation.Summary, "An implementation-operation summary contains sensitive content.");
             var path = RepositoryPathRules.Normalize(operation.Path);
             _ = FakeImplementationCapabilityMatrix.GetStyle(path, operation.Action);
             if (!RepositoryPathRules.IsSafeRelativePath(operation.Path, limits.MaximumRelativePathCharacters))
@@ -121,4 +127,10 @@ public static class ImplementationOutputValidator
     }
 
     private static ImplementationException Invalid(string message) => new("invalid_implementation", message);
+
+    private static void RejectSensitive(string value, string message)
+    {
+        if (SensitiveContentDetector.ContainsSensitiveValue(value))
+            throw new ImplementationException("implementation_sensitive_content", message);
+    }
 }

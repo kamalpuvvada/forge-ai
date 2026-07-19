@@ -1,7 +1,5 @@
 using Forge.Core;
 using Forge.Infrastructure;
-using System.Security.Cryptography;
-using System.Text;
 
 namespace Forge.Api.Contracts;
 
@@ -18,14 +16,8 @@ public sealed record EngineeringTaskSummaryResponse(
         summary.Status,
         summary.CreatedAt,
         summary.UpdatedAt,
-        SafeRepositoryDisplayName(summary.Repository),
+        RepositoryDisplayIdentifier.Create(summary.Repository),
         summary.OriginalRequirementPreview);
-
-    internal static string SafeRepositoryDisplayName(string repository)
-    {
-        var bytes = SHA256.HashData(Encoding.UTF8.GetBytes(repository.Trim()));
-        return $"Repository {Convert.ToHexString(bytes.AsSpan(0, 4)).ToLowerInvariant()}";
-    }
 }
 
 public sealed record ClarificationAnswerResponse(string Question, string Answer, DateTimeOffset AnsweredAt);
@@ -275,23 +267,24 @@ public sealed record EngineeringTaskResponse(
             task.ImplementationWorkspace.UpdatedAt,
             runtimeStatus?.WorkspaceAvailable ?? false);
         var implementationFailure = task.LastImplementationFailure is null ? null : new ImplementationFailureResponse(
-            task.LastImplementationFailure.Category,
-            task.LastImplementationFailure.Message,
+            SafeImplementationText(task.LastImplementationFailure.Category, "implementation_failure"),
+            SafeImplementationText(task.LastImplementationFailure.Message, "Implementation generation failed safely."),
             task.LastImplementationFailure.RecoveryRequired,
             task.LastImplementationFailure.OccurredAt,
             task.LastImplementationFailure.SafeToResume,
             task.LastImplementationFailure.ActiveCheckoutVerified);
         var implementationResult = task.ImplementationResult is null ? null : new ImplementationResultResponse(
             task.ImplementationResult.Source,
-            task.ImplementationResult.Model,
+            task.ImplementationResult.Model is null ? null : SafeImplementationText(task.ImplementationResult.Model, "unavailable"),
             task.ImplementationResult.BaseCommitSha,
             task.ImplementationResult.Branch,
-            task.ImplementationResult.Summary,
-            task.ImplementationResult.Warnings,
+            SafeImplementationText(task.ImplementationResult.Summary, "Implementation summary unavailable."),
+            task.ImplementationResult.Warnings.Select(warning =>
+                SafeImplementationText(warning, "Implementation warning removed.")).ToArray(),
             task.ImplementationResult.ChangedFiles.Select(file => new ChangedFileReviewResponse(
                 file.Path, file.Action, file.OriginalContentSha256, file.NewContentSha256,
                 file.OriginalBytes, file.NewBytes, file.OriginalLines, file.NewLines,
-                file.Additions, file.Deletions, file.DiffPreview, file.FullDiffCharacters,
+                file.Additions, file.Deletions, SafeImplementationText(file.DiffPreview, string.Empty), file.FullDiffCharacters,
                 file.DisplayedDiffCharacters, file.DiffTruncated,
                 file.FullDiffUtf8Bytes, file.DisplayedDiffUtf8Bytes)).ToArray(),
             task.ImplementationResult.FullDiffCharacters,
@@ -306,11 +299,12 @@ public sealed record EngineeringTaskResponse(
             runtimeStatus.WorkspaceAvailable,
             runtimeStatus.ActiveCheckoutVerified,
             runtimeStatus.Disposition,
-            runtimeStatus.SafeMessage);
+            runtimeStatus.SafeMessage is null ? null : SafeImplementationText(runtimeStatus.SafeMessage,
+                "Implementation runtime details are unavailable."));
 
         return new EngineeringTaskResponse(
             task.Id,
-            EngineeringTaskSummaryResponse.SafeRepositoryDisplayName(task.Repository),
+            RepositoryDisplayIdentifier.Create(task.Repository),
             task.OriginalRequirement,
             task.CurrentClarifiedRequirement,
             task.ClarificationAnswers.Select(answer => new ClarificationAnswerResponse(
@@ -350,4 +344,7 @@ public sealed record EngineeringTaskResponse(
             implementationRuntime,
             telemetry);
     }
+
+    private static string SafeImplementationText(string value, string fallback) =>
+        SensitiveContentDetector.ContainsSensitiveValue(value) ? fallback : value;
 }

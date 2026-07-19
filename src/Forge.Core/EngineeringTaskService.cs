@@ -271,7 +271,16 @@ public sealed class EngineeringTaskService(
             throw new ImplementationException("implementation_configuration", "Isolated implementation generation is not configured.");
         var coordinator = implementationCoordinator ?? new ImplementationOperationCoordinator();
         using var operationLock = await coordinator.EnterAsync(id, cancellationToken);
-        var task = await GetRequiredAsync(id, cancellationToken);
+        EngineeringTask task;
+        try
+        {
+            task = await GetRequiredAsync(id, cancellationToken);
+        }
+        catch (TaskPersistenceException)
+        {
+            throw new ImplementationException("implementation_persistence_failure",
+                "Implementation state could not be loaded safely. Reload the task before retrying.", false);
+        }
         if (task.Status is not (WorkflowStatus.PlanApproved or WorkflowStatus.Implementing))
             throw new WorkflowException($"Implementation generation requires PlanApproved status; current status is {task.Status}.");
         if (task.ImplementationPlan is null || task.PlanApprovedAt is null || task.RepositorySnapshot is null)
@@ -279,8 +288,24 @@ public sealed class EngineeringTaskService(
 
         var limits = implementationLimits ?? new ImplementationLimits();
         FakeImplementationCapabilityMatrix.ValidatePlan(task.ImplementationPlan);
-        var reservation = await implementationWorkspaceManager.ReserveAsync(
-            task.Id, task.Repository, task.RepositorySnapshot, task.ImplementationPlan, limits, cancellationToken);
+        ImplementationReservation reservation;
+        IReadOnlyList<ImplementationFileContext> preflightFiles;
+        ImplementationEvaluation evaluation;
+        try
+        {
+            reservation = await implementationWorkspaceManager.ReserveAsync(
+                task.Id, task.Repository, task.RepositorySnapshot, task.ImplementationPlan, limits, cancellationToken);
+            preflightFiles = reservation.Files ?? throw new ImplementationException(
+                "implementation_preflight_failure", "The implementation workspace did not return a complete read-only preflight.");
+            evaluation = await implementationEngine.GenerateAsync(new ImplementationContext(
+                task.RequirementSummary ?? throw new WorkflowException("An approved requirement summary is required."),
+                task.ImplementationPlan, preflightFiles, timeProvider.GetUtcNow()), cancellationToken);
+            ImplementationOutputValidator.Validate(task.ImplementationPlan, preflightFiles, evaluation.Output, limits);
+        }
+        catch (ImplementationException exception)
+        {
+            throw SafeBoundaryFailure(exception);
+        }
         var now = timeProvider.GetUtcNow();
         var ownerId = implementationProcessIdentity?.OwnerId ?? Guid.NewGuid();
         var attemptId = Guid.NewGuid();
@@ -291,7 +316,7 @@ public sealed class EngineeringTaskService(
         if (task.Status == WorkflowStatus.PlanApproved)
         {
             task.BeginImplementation(reservation.Workspace, lease, now);
-            await repository.SaveAsync(task, cancellationToken);
+            await SaveImplementationStateAsync(task, cancellationToken);
         }
         else
         {
@@ -306,7 +331,7 @@ public sealed class EngineeringTaskService(
                 task.ImplementationWorkspace.ActiveCheckoutTrackedFileCount != reservation.Workspace.ActiveCheckoutTrackedFileCount ||
                 task.ImplementationWorkspace.ActiveCheckoutTrackedBytes != reservation.Workspace.ActiveCheckoutTrackedBytes)
                 throw new ImplementationException("implementation_workspace_conflict", "The reserved implementation workspace does not match the current task.", true);
-            await repository.SaveAsync(task, cancellationToken);
+            await SaveImplementationStateAsync(task, cancellationToken);
         }
 
         PreparedImplementationWorkspace? prepared = null;
@@ -319,11 +344,11 @@ public sealed class EngineeringTaskService(
                 Phase = ImplementationWorkspacePhase.WorkspacePreparing,
                 UpdatedAt = timeProvider.GetUtcNow()
             }, attemptId, ownerId, timeProvider.GetUtcNow());
-            await repository.SaveAsync(task, cancellationToken);
+            await SaveImplementationStateAsync(task, cancellationToken);
             workspaceMutationMayHaveStarted = true;
             prepared = await implementationWorkspaceManager.PrepareAsync(
                 task.Repository, task.ImplementationWorkspace!, task.ImplementationPlan, limits,
-                reservation.ActiveCheckout, cancellationToken);
+                reservation.ActiveCheckout, preflightFiles, cancellationToken);
             await using var workspaceLock = prepared.WorkspaceLock;
             if (!workspaceLock.IsHeld)
                 throw new ImplementationException("implementation_workspace_lock", "The isolated workspace lock was lost.", true);
@@ -332,21 +357,15 @@ public sealed class EngineeringTaskService(
                 Phase = ImplementationWorkspacePhase.WorkspacePrepared,
                 UpdatedAt = timeProvider.GetUtcNow()
             }, attemptId, ownerId, timeProvider.GetUtcNow());
-            await repository.SaveAsync(task, cancellationToken);
-            var evaluation = await implementationEngine.GenerateAsync(new ImplementationContext(
-                task.RequirementSummary ?? throw new WorkflowException("An approved requirement summary is required."),
-                task.ImplementationPlan,
-                prepared.Files,
-                timeProvider.GetUtcNow()), cancellationToken);
+            await SaveImplementationStateAsync(task, cancellationToken);
             if (evaluation.ModelCall is not null) task.RecordModelCall(evaluation.ModelCall, timeProvider.GetUtcNow());
-            ImplementationOutputValidator.Validate(task.ImplementationPlan, prepared.Files, evaluation.Output, limits);
 
             task.UpdateImplementationWorkspace(task.ImplementationWorkspace! with
             {
                 Phase = ImplementationWorkspacePhase.MutationStarted,
                 UpdatedAt = timeProvider.GetUtcNow()
             }, attemptId, ownerId, timeProvider.GetUtcNow());
-            await repository.SaveAsync(task, CancellationToken.None);
+            await SaveImplementationStateAsync(task, CancellationToken.None);
             var result = await implementationWorkspaceManager.ApplyAsync(
                 task.Repository, prepared, evaluation.Output, limits, timeProvider.GetUtcNow(), cancellationToken);
             await implementationWorkspaceManager.VerifyActiveCheckoutAsync(
@@ -356,10 +375,10 @@ public sealed class EngineeringTaskService(
                 Phase = ImplementationWorkspacePhase.ApplyCompleted,
                 UpdatedAt = timeProvider.GetUtcNow()
             }, attemptId, ownerId, timeProvider.GetUtcNow());
-            await repository.SaveAsync(task, CancellationToken.None);
+            await SaveImplementationStateAsync(task, CancellationToken.None);
             await implementationWorkspaceManager.VerifyResultAsync(task.Repository, prepared, result, CancellationToken.None);
             task.StoreImplementationResult(result with { ActiveCheckoutVerified = true }, attemptId, ownerId, timeProvider.GetUtcNow());
-            await repository.SaveAsync(task, CancellationToken.None);
+            await SaveImplementationStateAsync(task, CancellationToken.None);
             try
             {
                 await implementationWorkspaceManager.VerifyResultAsync(task.Repository, prepared, task.ImplementationResult!, CancellationToken.None);
@@ -370,9 +389,9 @@ public sealed class EngineeringTaskService(
                     "implementation_workspace_drift",
                     "The isolated implementation workspace changed while its review was being persisted.",
                     true, timeProvider.GetUtcNow(), false, true), timeProvider.GetUtcNow());
-                await repository.SaveAsync(task, CancellationToken.None);
+                await SaveImplementationStateAsync(task, CancellationToken.None);
                 throw new ImplementationException("implementation_workspace_drift",
-                    "The isolated implementation workspace changed while its review was being persisted.", true, exception);
+                    "The isolated implementation workspace changed while its review was being persisted.", true);
             }
             return task;
         }
@@ -383,8 +402,8 @@ public sealed class EngineeringTaskService(
             var phase = task.ImplementationWorkspace?.Phase;
             await PersistImplementationFailureBestEffortAsync(task, attemptId, ownerId,
                 "implementation_cancelled", "Implementation generation was cancelled safely.",
-                !activeCheckoutVerified || phase is ImplementationWorkspacePhase.WorkspacePreparing or
-                    ImplementationWorkspacePhase.MutationStarted or ImplementationWorkspacePhase.ApplyCompleted,
+                !activeCheckoutVerified || workspaceMutationMayHaveStarted ||
+                phase is ImplementationWorkspacePhase.MutationStarted or ImplementationWorkspacePhase.ApplyCompleted,
                 activeCheckoutVerified);
             throw;
         }
@@ -392,15 +411,17 @@ public sealed class EngineeringTaskService(
         {
             activeCheckoutVerified = await VerifyActiveCheckoutBestEffortAsync(
                 implementationWorkspaceManager, task.Repository, task.ImplementationPlan, reservation.ActiveCheckout);
+            var safeCategory = BoundedFailureValue(exception.Category, 80, "implementation_failure");
+            var safeMessage = BoundedFailureValue(exception.Message, 500, "Implementation generation failed safely.");
             await PersistImplementationFailureBestEffortAsync(task, attemptId, ownerId,
-                exception.Category, exception.Message,
-                exception.RecoveryRequired || !activeCheckoutVerified ||
-                task.ImplementationWorkspace?.Phase is ImplementationWorkspacePhase.WorkspacePreparing or
+                safeCategory, safeMessage,
+                exception.RecoveryRequired || !activeCheckoutVerified || workspaceMutationMayHaveStarted ||
+                task.ImplementationWorkspace?.Phase is
                     ImplementationWorkspacePhase.MutationStarted or ImplementationWorkspacePhase.ApplyCompleted,
                 activeCheckoutVerified);
-            throw;
+            throw new ImplementationException(safeCategory, safeMessage, exception.RecoveryRequired);
         }
-        catch (Exception exception)
+        catch (Exception)
         {
             activeCheckoutVerified = await VerifyActiveCheckoutBestEffortAsync(
                 implementationWorkspaceManager, task.Repository, task.ImplementationPlan, reservation.ActiveCheckout);
@@ -410,7 +431,7 @@ public sealed class EngineeringTaskService(
                 workspaceMutationMayHaveStarted || !activeCheckoutVerified, activeCheckoutVerified);
             throw new ImplementationException("implementation_persistence_failure",
                 "Implementation state could not be finalized safely. Reload the task before taking further action.",
-                workspaceMutationMayHaveStarted || !activeCheckoutVerified, exception);
+                workspaceMutationMayHaveStarted || !activeCheckoutVerified);
         }
         finally
         {
@@ -432,7 +453,7 @@ public sealed class EngineeringTaskService(
                                 "implementation_active_checkout_uncertain",
                                 "Forge could not verify that the active checkout remained unchanged.",
                                 true, timeProvider.GetUtcNow(), false, false), timeProvider.GetUtcNow());
-                            await repository.SaveAsync(task, CancellationToken.None);
+                            await SaveImplementationStateAsync(task, CancellationToken.None);
                         }
                         catch (Exception exception) when (exception is TaskConcurrencyException or ImplementationException or WorkflowException)
                         {
@@ -477,7 +498,7 @@ public sealed class EngineeringTaskService(
             await repository.SaveAsync(writableTask, timeout.Token);
         }
         catch (Exception exception) when (exception is TaskConcurrencyException or ImplementationException or
-                                          TaskDataCorruptException or IOException or OperationCanceledException)
+                                          TaskDataCorruptException or TaskPersistenceException or IOException or OperationCanceledException)
         {
             // A newer durable state is authoritative; never overwrite it with a stale failure.
         }
@@ -501,7 +522,27 @@ public sealed class EngineeringTaskService(
     }
 
     private static string BoundedFailureValue(string? value, int maximum, string fallback) =>
-        string.IsNullOrWhiteSpace(value) || value.Length > maximum ? fallback : value;
+        string.IsNullOrWhiteSpace(value) || value.Length > maximum || SensitiveContentDetector.ContainsSensitiveValue(value)
+            ? fallback
+            : value;
+
+    private static ImplementationException SafeBoundaryFailure(ImplementationException exception) => new(
+        BoundedFailureValue(exception.Category, 80, "implementation_failure"),
+        BoundedFailureValue(exception.Message, 500, "Implementation generation failed safely."),
+        exception.RecoveryRequired);
+
+    private async Task SaveImplementationStateAsync(EngineeringTask task, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await repository.SaveAsync(task, cancellationToken);
+        }
+        catch (TaskPersistenceException)
+        {
+            throw new ImplementationException("implementation_persistence_failure",
+                "Implementation state could not be finalized safely. Reload the task before taking further action.", false);
+        }
+    }
 
     private async Task EvaluateAndApplyAsync(EngineeringTask task, CancellationToken cancellationToken)
     {

@@ -115,6 +115,110 @@ public sealed class PersistedImplementationValidatorTests
             null, null, nonUtc, Limits, Now, null, Now));
     }
 
+    [Theory]
+    [InlineData(ImplementationWorkspacePhase.RecoveryRequired)]
+    [InlineData(ImplementationWorkspacePhase.ResultPersisted)]
+    [InlineData(ImplementationWorkspacePhase.Completed)]
+    [InlineData(ImplementationWorkspacePhase.Interrupted)]
+    public void Implementing_rejects_phases_that_do_not_match_an_active_lease(
+        ImplementationWorkspacePhase phase)
+    {
+        Assert.Throws<TaskDataCorruptException>(() => PersistedImplementationValidator.Validate(
+            WorkflowStatus.Implementing, Now, Plan(), Workspace(phase), null, null, Lease(), Limits,
+            Now, null, Now));
+    }
+
+    [Theory]
+    [InlineData(WorkflowStatus.AwaitingImplementationReview, ImplementationWorkspacePhase.Reserved)]
+    [InlineData(WorkflowStatus.AwaitingImplementationReview, ImplementationWorkspacePhase.MutationStarted)]
+    [InlineData(WorkflowStatus.Validating, ImplementationWorkspacePhase.Reserved)]
+    [InlineData(WorkflowStatus.Reviewing, ImplementationWorkspacePhase.MutationStarted)]
+    [InlineData(WorkflowStatus.Completed, ImplementationWorkspacePhase.ApplyCompleted)]
+    [InlineData(WorkflowStatus.Failed, ImplementationWorkspacePhase.WorkspacePrepared)]
+    public void Completed_workflow_states_reject_incomplete_workspace_phases(
+        WorkflowStatus status,
+        ImplementationWorkspacePhase phase)
+    {
+        var workspace = Workspace(phase);
+        Assert.Throws<TaskDataCorruptException>(() => PersistedImplementationValidator.Validate(
+            status, Now, Plan(), workspace, Result(workspace), null, null, Limits,
+            Now, Now.AddMinutes(1), Now.AddMinutes(1)));
+    }
+
+    [Fact]
+    public void Impossible_failure_and_timestamp_combinations_are_rejected()
+    {
+        var recoveryWorkspace = Workspace(ImplementationWorkspacePhase.RecoveryRequired);
+        var recovery = new ImplementationFailure("implementation_recovery_required", "Recovery is required.",
+            true, Now, SafeToResume: false);
+        Assert.Throws<TaskDataCorruptException>(() => PersistedImplementationValidator.Validate(
+            WorkflowStatus.Implementing, Now, Plan(), recoveryWorkspace, null, recovery, Lease(), Limits,
+            Now, null, Now));
+
+        var workspace = Workspace(ImplementationWorkspacePhase.ResultPersisted);
+        var result = Result(workspace);
+        Assert.Throws<TaskDataCorruptException>(() => PersistedImplementationValidator.Validate(
+            WorkflowStatus.AwaitingImplementationReview, Now, Plan(), workspace, result, null, null, Limits,
+            Now.AddMinutes(2), Now.AddMinutes(1), Now.AddMinutes(2)));
+        Assert.Throws<TaskDataCorruptException>(() => PersistedImplementationValidator.Validate(
+            WorkflowStatus.AwaitingImplementationReview, Now, Plan(), workspace with
+            {
+                CreatedAt = Now.AddMinutes(10), UpdatedAt = Now.AddMinutes(10)
+            }, result with { CompletedAt = Now.AddMinutes(10) }, null, null, Limits,
+            Now.AddMinutes(10), Now.AddMinutes(10), Now));
+    }
+
+    [Fact]
+    public void Persisted_sensitive_result_and_failure_text_is_rejected_without_disclosure()
+    {
+        var value = Convert.ToBase64String(Guid.NewGuid().ToByteArray()) +
+                    Convert.ToBase64String(Guid.NewGuid().ToByteArray()) + "Aa1-";
+        var labelled = $"deployment credential: {value}";
+        var workspace = Workspace(ImplementationWorkspacePhase.ResultPersisted);
+        var result = Result(workspace);
+        var file = Assert.Single(result.ChangedFiles);
+        var sensitiveFile = file with
+        {
+            DiffPreview = labelled,
+            FullDiffCharacters = labelled.Length,
+            DisplayedDiffCharacters = labelled.Length,
+            FullDiffUtf8Bytes = System.Text.Encoding.UTF8.GetByteCount(labelled),
+            DisplayedDiffUtf8Bytes = System.Text.Encoding.UTF8.GetByteCount(labelled)
+        };
+        var variants = new[]
+        {
+            result with { Summary = labelled },
+            result with { Warnings = [labelled] },
+            result with
+            {
+                ChangedFiles = [sensitiveFile],
+                FullDiffCharacters = sensitiveFile.FullDiffCharacters,
+                DisplayedDiffCharacters = sensitiveFile.DisplayedDiffCharacters,
+                FullDiffUtf8Bytes = sensitiveFile.FullDiffUtf8Bytes,
+                DisplayedDiffUtf8Bytes = sensitiveFile.DisplayedDiffUtf8Bytes
+            }
+        };
+        foreach (var variant in variants)
+        {
+            var failure = Assert.Throws<TaskDataCorruptException>(() => PersistedImplementationValidator.Validate(
+                WorkflowStatus.AwaitingImplementationReview, Now, Plan(), workspace, variant, null, null,
+                Limits, Now, variant.CompletedAt, variant.CompletedAt));
+            Assert.DoesNotContain(value, failure.Message, StringComparison.Ordinal);
+        }
+
+        foreach (var persistedFailure in new[]
+                 {
+                     new ImplementationFailure(labelled, "Safe failure.", false, Now),
+                     new ImplementationFailure("implementation_failure", labelled, false, Now)
+                 })
+        {
+            var failure = Assert.Throws<TaskDataCorruptException>(() => PersistedImplementationValidator.Validate(
+                WorkflowStatus.Implementing, Now, Plan(), Workspace(ImplementationWorkspacePhase.Interrupted),
+                null, persistedFailure, null, Limits, Now, null, Now));
+            Assert.DoesNotContain(value, failure.Message, StringComparison.Ordinal);
+        }
+    }
+
     private static ImplementationPlan Plan() => new(
         "Implement", "Objective", "Understanding",
         [new PlannedFileChange("src/App.cs", PlannedFileAction.Modify, "Modify.", ["E1"], .9m)],

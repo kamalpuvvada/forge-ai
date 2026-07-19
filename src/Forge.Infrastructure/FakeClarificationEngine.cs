@@ -38,7 +38,7 @@ public sealed class FakeClarificationEngine : IClarificationEngine
             .AppendLine("Requested outcome")
             .AppendLine(task.OriginalRequirement)
             .AppendLine()
-            .AppendLine($"Repository identifier: {task.Repository}");
+            .AppendLine($"Repository identifier: {RepositoryDisplayIdentifier.Create(task.Repository)}");
 
         if (task.ClarificationAnswers.Count > 0)
         {

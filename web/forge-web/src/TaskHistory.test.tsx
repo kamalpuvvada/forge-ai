@@ -6,7 +6,7 @@ import type { EngineeringTaskSummary } from './types'
 const task: EngineeringTaskSummary = {
   id: '328cbf18-00ca-4fa8-a64e-3a651fb99079', status: 'AwaitingPlanApproval',
   createdAt: '2026-07-18T10:00:00Z', updatedAt: '2026-07-18T11:00:00Z',
-  repository: 'C:/repo', originalRequirementPreview: 'Add a plan PDF.',
+  repository: 'Repository 0123456789abcdef', originalRequirementPreview: 'Add a plan PDF.',
 }
 
 describe('recent task history presentation', () => {
@@ -27,7 +27,8 @@ describe('recent task history presentation', () => {
     expect(html).toContain('aria-current="page"')
     expect(html).toContain('Awaiting Plan Approval')
     expect(html).toContain('dateTime="2026-07-18T11:00:00Z"')
-    expect(html).toContain('C:/repo')
+    expect(html).toContain('Repository 0123456789abcdef')
+    expect(html).not.toContain('C:/repo')
     expect(html).toContain('Add a plan PDF.')
   })
 })

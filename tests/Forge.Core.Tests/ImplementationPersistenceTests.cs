@@ -155,8 +155,7 @@ public sealed class ImplementationPersistenceTests : IDisposable
                      ImplementationWorkspacePhase.WorkspacePreparing,
                      ImplementationWorkspacePhase.WorkspacePrepared,
                      ImplementationWorkspacePhase.MutationStarted,
-                     ImplementationWorkspacePhase.ApplyCompleted,
-                     ImplementationWorkspacePhase.Interrupted
+                     ImplementationWorkspacePhase.ApplyCompleted
                  })
         {
             task.UpdateImplementationWorkspace(task.ImplementationWorkspace! with { Phase = phase },
@@ -171,6 +170,34 @@ public sealed class ImplementationPersistenceTests : IDisposable
         Assert.Equal(WorkflowStatus.AwaitingImplementationReview, task.Status);
         Assert.Equal(ImplementationWorkspacePhase.ResultPersisted, task.ImplementationWorkspace?.Phase);
         Assert.NotNull(task.ImplementationResult);
+    }
+
+    [Theory]
+    [InlineData(false, ImplementationWorkspacePhase.Interrupted)]
+    [InlineData(true, ImplementationWorkspacePhase.RecoveryRequired)]
+    public async Task Durable_failure_phases_survive_a_real_sqlite_close_and_reopen(
+        bool recoveryRequired,
+        ImplementationWorkspacePhase expectedPhase)
+    {
+        Directory.CreateDirectory(_directory);
+        await new SqliteDatabaseInitializer(ConnectionString).InitializeAsync();
+        var task = ApprovedTask();
+        var lease = Lease(Now);
+        task.BeginImplementation(Workspace(), lease, Now);
+        task.RecordImplementationFailure(new ImplementationFailure(
+                recoveryRequired ? "implementation_recovery_required" : "implementation_interrupted",
+                recoveryRequired ? "Recovery is required." : "Implementation was interrupted.",
+                recoveryRequired,
+                Now,
+                SafeToResume: false),
+            lease.AttemptId, lease.OwnerId, Now);
+
+        task = await SaveAndReopenAsync(task);
+
+        Assert.Equal(WorkflowStatus.Implementing, task.Status);
+        Assert.Equal(expectedPhase, task.ImplementationWorkspace?.Phase);
+        Assert.Null(task.ImplementationLease);
+        Assert.Equal(recoveryRequired, task.LastImplementationFailure?.RecoveryRequired);
     }
 
     [Theory]
@@ -296,6 +323,118 @@ public sealed class ImplementationPersistenceTests : IDisposable
         Assert.Null(loaded?.ImplementationLease);
     }
 
+    [Fact]
+    public async Task Real_sqlite_provider_errors_are_normalized_without_storage_details()
+    {
+        Directory.CreateDirectory(_directory);
+        var invalidDataSource = _directory;
+        var repository = new SqliteEngineeringTaskRepository($"Data Source={invalidDataSource};Default Timeout=1;Pooling=False");
+
+        var read = await Assert.ThrowsAsync<TaskPersistenceException>(() => repository.GetAsync(Guid.NewGuid()));
+        var list = await Assert.ThrowsAsync<TaskPersistenceException>(() => repository.ListRecentAsync(1));
+        var write = await Assert.ThrowsAsync<TaskPersistenceException>(() => repository.SaveAsync(ApprovedTask()));
+
+        foreach (var exception in new[] { read, list, write })
+        {
+            Assert.Equal("Task persistence is temporarily unavailable. Retry the request after storage access is restored.",
+                exception.Message);
+            Assert.DoesNotContain(invalidDataSource, exception.Message, StringComparison.OrdinalIgnoreCase);
+            Assert.Null(exception.InnerException);
+        }
+    }
+
+    [Fact]
+    public async Task Implementation_bounds_and_values_are_read_from_one_sqlite_statement_snapshot()
+    {
+        await SeedReviewAsync();
+        await using (var setup = new SqliteConnection(ConnectionString))
+        {
+            await setup.OpenAsync();
+            await using var command = setup.CreateCommand();
+            command.CommandText = "PRAGMA journal_mode=WAL;";
+            await command.ExecuteScalarAsync();
+        }
+        var boundsRead = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var continueRead = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var repository = new SqliteEngineeringTaskRepository(ConnectionString, new ImplementationLimits(), null,
+            async cancellationToken =>
+            {
+                boundsRead.TrySetResult();
+                await continueRead.Task.WaitAsync(cancellationToken);
+            });
+
+        var read = repository.GetAsync(_seedId);
+        await boundsRead.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        try
+        {
+            await using var writer = new SqliteConnection(ConnectionString);
+            await writer.OpenAsync();
+            await using var update = writer.CreateCommand();
+            update.CommandText = "UPDATE EngineeringTasks SET ImplementationResult = '{' WHERE Id = $id;";
+            update.Parameters.AddWithValue("$id", _seedId.ToString());
+            Assert.Equal(1, await update.ExecuteNonQueryAsync());
+        }
+        finally
+        {
+            continueRead.TrySetResult();
+        }
+
+        var snapshot = await read;
+
+        Assert.NotNull(snapshot?.ImplementationResult);
+        await Assert.ThrowsAsync<TaskDataCorruptException>(() =>
+            new SqliteEngineeringTaskRepository(ConnectionString).GetAsync(_seedId));
+    }
+
+    [Fact]
+    public async Task Concurrent_get_is_read_only_and_cannot_overwrite_implementation_completion()
+    {
+        await new SqliteDatabaseInitializer(ConnectionString).InitializeAsync();
+        await using (var setup = new SqliteConnection(ConnectionString))
+        {
+            await setup.OpenAsync();
+            await using var command = setup.CreateCommand();
+            command.CommandText = "PRAGMA journal_mode=WAL;";
+            await command.ExecuteScalarAsync();
+        }
+        var repository = new SqliteEngineeringTaskRepository(ConnectionString);
+        var task = ApprovedTask();
+        var workspace = Workspace();
+        var lease = Lease(Now);
+        task.BeginImplementation(workspace, lease, Now);
+        await repository.SaveAsync(task);
+        var winner = (await new SqliteEngineeringTaskRepository(ConnectionString).GetAsync(task.Id))!;
+        var readStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var continueRead = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var readerRepository = new SqliteEngineeringTaskRepository(ConnectionString, new ImplementationLimits(), null,
+            async cancellationToken =>
+            {
+                readStarted.TrySetResult();
+                await continueRead.Task.WaitAsync(cancellationToken);
+            });
+
+        var concurrentRead = readerRepository.GetAsync(task.Id);
+        await readStarted.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        try
+        {
+            var result = Result(workspace);
+            winner.StoreImplementationResult(result, lease.AttemptId, lease.OwnerId, result.CompletedAt);
+            await new SqliteEngineeringTaskRepository(ConnectionString).SaveAsync(winner);
+        }
+        finally
+        {
+            continueRead.TrySetResult();
+        }
+        var staleProjection = await concurrentRead;
+        var completed = await repository.GetAsync(task.Id);
+
+        Assert.Equal(WorkflowStatus.Implementing, staleProjection?.Status);
+        Assert.Null(staleProjection?.ImplementationResult);
+        Assert.Equal(WorkflowStatus.AwaitingImplementationReview, completed?.Status);
+        Assert.NotNull(completed?.ImplementationResult);
+        Assert.Equal(2, completed?.RowVersion);
+    }
+
     private Guid _seedId;
 
     private async Task SeedApprovedAsync()
@@ -317,7 +456,7 @@ public sealed class ImplementationPersistenceTests : IDisposable
         task.BeginImplementation(workspace, lease, Now);
         await repository.SaveAsync(task);
         var result = Result(workspace);
-        task.StoreImplementationResult(result, lease.AttemptId, lease.OwnerId, Now.AddMinutes(1));
+        task.StoreImplementationResult(result, lease.AttemptId, lease.OwnerId, result.CompletedAt);
         await repository.SaveAsync(task);
         return (workspace, result);
     }
