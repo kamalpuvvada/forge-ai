@@ -582,6 +582,77 @@ public sealed class EngineeringTaskApiTests : IClassFixture<FakeModeFactory>
     }
 
     [Fact]
+    public async Task Fake_plan_correction_enforces_three_file_scope_in_dto_and_proposed_plan_pdf()
+    {
+        await using var factory = new FakeModeFactory();
+        using var client = factory.CreateClient();
+        var repository = Path.Combine(Path.GetDirectoryName(factory.DatabasePath)!, "plan-constraint-target");
+        Directory.CreateDirectory(Path.Combine(repository, "src"));
+        Directory.CreateDirectory(Path.Combine(repository, "config"));
+        await File.WriteAllTextAsync(Path.Combine(repository, "src", "GreetingService.cs"),
+            "public sealed class GreetingService { public string Greet() => \"Hello\"; }\n");
+        await File.WriteAllTextAsync(Path.Combine(repository, "config", "settings.json"), "{\"greeting\":\"Hello\"}\n");
+        await File.WriteAllTextAsync(Path.Combine(repository, "README.md"), "# Greeting service\n");
+        await File.WriteAllTextAsync(Path.Combine(repository, "ManualTarget.csproj"),
+            "<Project Sdk=\"Microsoft.NET.Sdk\"><!-- GreetingService config settings README --></Project>\n");
+        FakeModeFactory.RunGit(repository, "init", "--initial-branch=main");
+        FakeModeFactory.RunGit(repository, "add", "--", ".");
+        FakeModeFactory.RunGit(repository, "-c", "user.name=Forge API Tests",
+            "-c", "user.email=forge-tests@example.invalid", "commit", "-m", "constraint fixture");
+        var requirement = """
+            Modify the greeting behavior in these named files:
+            - src/GreetingService.cs
+            - config/settings.json
+            - README.md
+            Acceptance criteria: only the named greeting behavior changes are represented.
+            Validation: the initial proposed plan is available for human correction.
+            """;
+        var createdResponse = await client.PostAsJsonAsync("/api/tasks", new { repository, requirement });
+        createdResponse.EnsureSuccessStatusCode();
+        var id = (await createdResponse.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("id").GetGuid();
+        (await client.PostAsync($"/api/tasks/{id}/requirement-approval", null)).EnsureSuccessStatusCode();
+        (await client.PostAsync($"/api/tasks/{id}/repository-analysis", null)).EnsureSuccessStatusCode();
+        var initialResponse = await client.PostAsync($"/api/tasks/{id}/plan", null);
+        Assert.True(initialResponse.IsSuccessStatusCode, await initialResponse.Content.ReadAsStringAsync());
+        var initial = await initialResponse.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Contains(initial.GetProperty("implementationPlan").GetProperty("affectedFiles").EnumerateArray(),
+            file => file.GetProperty("path").GetString() == "ManualTarget.csproj");
+
+        var correctionResponse = await client.PostAsJsonAsync($"/api/tasks/{id}/plan-revision", new
+        {
+            correction = """
+                Only the three named files may be affected.
+                Remove ManualTarget.csproj everywhere.
+                Do not add or update tests.
+                Do not propose or run repository validation commands.
+                Exactly three Modify actions.
+                """
+        });
+        Assert.True(correctionResponse.IsSuccessStatusCode, await correctionResponse.Content.ReadAsStringAsync());
+        var revised = await correctionResponse.Content.ReadFromJsonAsync<JsonElement>();
+        var plan = revised.GetProperty("implementationPlan");
+        var files = plan.GetProperty("affectedFiles").EnumerateArray().ToArray();
+
+        Assert.Equal("AwaitingPlanApproval", revised.GetProperty("status").GetString());
+        Assert.Equal(3, files.Length);
+        Assert.Equal(new[] { "src/GreetingService.cs", "config/settings.json", "README.md" },
+            files.Select(file => file.GetProperty("path").GetString()));
+        Assert.All(files, file => Assert.Equal("Modify", file.GetProperty("action").GetString()));
+        Assert.DoesNotContain("ManualTarget.csproj", plan.GetRawText(), StringComparison.OrdinalIgnoreCase);
+        Assert.Empty(plan.GetProperty("proposedValidationCommands").EnumerateArray());
+        Assert.DoesNotContain(plan.GetProperty("orderedSteps").EnumerateArray(), step =>
+            step.GetProperty("description").GetString()!.Contains("tests", StringComparison.OrdinalIgnoreCase));
+
+        var pdfText = ExtractPdf(await client.GetByteArrayAsync($"/api/tasks/{id}/export/plan-pdf"));
+        Assert.DoesNotContain("ManualTarget.csproj", pdfText, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("src/GreetingService.cs", pdfText, StringComparison.Ordinal);
+        Assert.Contains("config/settings.json", pdfText, StringComparison.Ordinal);
+        Assert.Contains("README.md", pdfText, StringComparison.Ordinal);
+        Assert.Equal("AwaitingPlanApproval",
+            (await client.GetFromJsonAsync<JsonElement>($"/api/tasks/{id}")).GetProperty("status").GetString());
+    }
+
+    [Fact]
     public async Task Plan_correction_endpoint_rejects_invalid_state_and_empty_input_safely()
     {
         var created = await CreateAsync("Add report export.", _factory.TargetRepositoryPath);

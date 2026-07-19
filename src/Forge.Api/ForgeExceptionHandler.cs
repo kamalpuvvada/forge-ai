@@ -45,6 +45,10 @@ public sealed class ForgeExceptionHandler(
                 "stale_snapshot" => (409, "Repository snapshot is stale", planning.Message, "stale_snapshot"),
                 "insufficient_evidence" => (422, "Insufficient repository evidence", planning.Message, "insufficient_evidence"),
                 "planning_configuration" => (503, "Planning unavailable", planning.Message, "planning_configuration"),
+                "plan_constraint_violation" => (422, "Implementation plan conflicts with approved scope",
+                    planning.Message, "plan_constraint_violation"),
+                "plan_revision_no_change" => (422, "Plan correction made no structural change",
+                    planning.Message, "plan_revision_no_change"),
                 _ => (422, "Invalid implementation plan", planning.Message, "invalid_plan")
             },
             ClarificationConfigurationException => (503, "AI configuration error", exception.Message, "ai_configuration"),

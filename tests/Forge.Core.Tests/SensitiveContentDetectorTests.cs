@@ -37,7 +37,7 @@ public sealed class SensitiveContentDetectorTests
             $"Authorization: Bearer {random}",
             $"Authorization: Basic {random}",
             $"-----BEGIN PRIVATE KEY-----\n{random}",
-            $"https://account:{random}@example.invalid/path",
+            $"https://account:{Uri.EscapeDataString(random)}@example.invalid/path",
             accessKey,
             $"Server=example.invalid;Password={random};Database=forge",
             $"deployment credential: {random}"

@@ -222,6 +222,19 @@ public sealed class EngineeringTask
             throw new PlanningException("stale_snapshot", "The plan does not match the current repository snapshot.");
 
         ImplementationPlanValidator.Validate(plan, RepositorySnapshot, EvidenceItems);
+        var latestRevision = _planRevisionNotes.LastOrDefault();
+        var context = new PlanningContext(
+            OriginalRequirement,
+            RequirementSummary!,
+            _clarificationAnswers,
+            _requirementRevisionNotes,
+            RepositorySnapshot,
+            EvidenceItems,
+            plan.CreatedAt,
+            latestRevision,
+            latestRevision?.PreviousPlan.AffectedFiles.Select(file => file.Path)
+                .Distinct(RepositoryPathRules.Comparer).ToArray());
+        PlanConstraintPolicy.ValidateCandidate(plan, context);
         ImplementationPlan = plan;
         PlanCreatedAt = plan.CreatedAt;
         Status = WorkflowStatus.AwaitingPlanApproval;

@@ -213,7 +213,7 @@ public sealed class EngineeringTaskService(
         try
         {
             var latestRevision = task.PlanRevisionNotes.LastOrDefault();
-            var evaluation = await engine.CreatePlanAsync(new PlanningContext(
+            var context = new PlanningContext(
                 task.OriginalRequirement,
                 summary,
                 task.ClarificationAnswers,
@@ -223,8 +223,20 @@ public sealed class EngineeringTaskService(
                 now,
                 latestRevision,
                 latestRevision?.PreviousPlan.AffectedFiles.Select(file => file.Path)
-                    .Distinct(StringComparer.OrdinalIgnoreCase).ToArray()), cancellationToken);
+                    .Distinct(RepositoryPathRules.Comparer).ToArray());
+            var constraints = PlanConstraintPolicy.Derive(context);
+            var evaluation = await engine.CreatePlanAsync(context, cancellationToken);
             if (evaluation.ModelCall is not null) task.RecordModelCall(evaluation.ModelCall, timeProvider.GetUtcNow());
+            try
+            {
+                PlanConstraintPolicy.ValidateCandidate(evaluation.Plan, context, constraints);
+            }
+            catch (PlanningException exception) when (exception.Category is "plan_constraint_violation" or "plan_revision_no_change")
+            {
+                if (evaluation.ModelCall is not null)
+                    await repository.SaveAsync(task, CancellationToken.None);
+                throw;
+            }
             var maximumAge = TimeSpan.FromMinutes((analysisLimits ?? new RepositoryAnalysisLimits()).SnapshotMaximumAgeMinutes);
             task.StoreImplementationPlan(evaluation.Plan, timeProvider.GetUtcNow(), maximumAge);
             await repository.SaveAsync(task, cancellationToken);

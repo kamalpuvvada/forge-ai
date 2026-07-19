@@ -188,6 +188,51 @@ public sealed class EngineeringTaskServiceTests
     }
 
     [Fact]
+    public async Task Post_engine_constraint_gate_rejects_contradictory_candidate_and_persists_telemetry_without_retry()
+    {
+        var repository = new InMemoryRepository();
+        var now = DateTimeOffset.UtcNow;
+        const string requirement = """
+            Modify only:
+            - src/App.cs
+            - src/Settings.cs
+            """;
+        var app = new RepositoryFileMetadata("src/App.cs", ".cs", 20, 1, "source", false, null, ["App"]);
+        var settings = new RepositoryFileMetadata("src/Settings.cs", ".cs", 20, 1, "source", false, null, ["Settings"]);
+        var unrelated = new RepositoryFileMetadata("src/Unrelated.cs", ".cs", 20, 1, "source", false, null, ["Unrelated"]);
+        var snapshot = PlanningWorkflowTests.Snapshot(now) with
+        {
+            Files = [app, settings, unrelated],
+            TotalDiscoveredFiles = 3,
+            EligibleTextFileCount = 3
+        };
+        var evidence = snapshot.Files.Select((file, index) => new EvidenceItem(
+            $"E{index + 1}", file.RelativePath, 1, 1, $"class {file.DeclaredSymbols[0]}",
+            "fixture", 50, $"hash-{index + 1}")).ToArray();
+        var task = EngineeringTask.Create("C:/repo", requirement, now);
+        task.ApplyClarificationEvaluation(ClarificationEvaluation.Summarize(requirement), now);
+        task.ApproveRequirementSummary(now);
+        task.BeginRepositoryAnalysis(now);
+        task.StoreRepositorySnapshot(snapshot, now);
+        task.StoreEvidence(new EvidenceSelection(evidence, 3, 3, 30), now);
+        await repository.SaveAsync(task);
+        var planner = new ConstraintViolatingPlanningEngine();
+        var service = new EngineeringTaskService(repository,
+            new ScriptedEngine(ClarificationEvaluation.Summarize("unused")), TimeProvider.System,
+            new FixedDiscovery(snapshot), null, planner, new RepositoryAnalysisLimits());
+
+        var exception = await Assert.ThrowsAsync<PlanningException>(() => service.CreatePlanAsync(task.Id));
+        var persisted = await repository.GetAsync(task.Id);
+
+        Assert.Equal("plan_constraint_violation", exception.Category);
+        Assert.Equal(PlanConstraintPolicy.ConstraintViolationMessage, exception.Message);
+        Assert.Equal(1, planner.CallCount);
+        Assert.Equal(WorkflowStatus.Planning, persisted!.Status);
+        Assert.Null(persisted.ImplementationPlan);
+        Assert.Single(persisted.ModelCalls);
+    }
+
+    [Fact]
     public async Task Missing_direct_evidence_refresh_reuses_snapshot_makes_zero_model_calls_then_plans_on_user_action()
     {
         var repository = new InMemoryRepository();
@@ -362,6 +407,34 @@ public sealed class EngineeringTaskServiceTests
             CallCount++;
             Contexts.Add(context);
             return await new FakePlanningEngine().CreatePlanAsync(context, cancellationToken);
+        }
+    }
+
+    private sealed class ConstraintViolatingPlanningEngine : IPlanningEngine
+    {
+        public int CallCount { get; private set; }
+
+        public async Task<PlanningEvaluation> CreatePlanAsync(
+            PlanningContext context,
+            CancellationToken cancellationToken = default)
+        {
+            CallCount++;
+            var unconstrained = context with
+            {
+                OriginalRequirement = "Update selected files.",
+                ApprovedRequirementSummary = "Update selected files.",
+                LatestPlanRevision = null,
+                PreviousPlanAffectedPaths = null
+            };
+            var candidate = (await new FakePlanningEngine().CreatePlanAsync(unconstrained, cancellationToken)).Plan with
+            {
+                Source = PlanningSource.OpenAI,
+                PlanningModel = "test-planning-model"
+            };
+            var now = DateTimeOffset.UtcNow;
+            var call = new ModelCallRecord(Guid.NewGuid(), ModelCallStage.Planning, "OpenAI", "test-planning-model", "medium",
+                now, now, true, "test-response", 10, 0, 10, 0, 0m, null);
+            return new PlanningEvaluation(candidate, call);
         }
     }
 
