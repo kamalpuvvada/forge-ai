@@ -30,6 +30,7 @@ const apiModule = vi.hoisted(() => {
       createPlan: vi.fn(),
       requestPlanRevision: vi.fn(),
       approvePlan: vi.fn(),
+      generateImplementation: vi.fn(),
       exportTaskPdf: vi.fn(),
       exportPlanPdf: vi.fn(),
       getCapabilities: vi.fn(),
@@ -68,12 +69,16 @@ const capabilities: SystemCapabilities = {
   planningModel: 'demo',
   planningReasoningEffort: 'medium',
   planningConfigured: true,
+  implementationProvider: 'Deterministic Fake',
+  implementationModel: null,
+  implementationReasoningEffort: null,
+  implementationConfigured: true,
   aiConfigured: true,
   repositoryInspectionAvailable: true,
   planningAvailable: true,
-  targetModificationAvailable: false,
+  targetModificationAvailable: true,
   validationAvailable: false,
-  reviewAvailable: false,
+  reviewAvailable: true,
   pullRequestCreationAvailable: false,
 }
 
@@ -95,6 +100,7 @@ describe('App task navigation hardening', () => {
     forgeApi.createPlan.mockRejectedValue(new Error('createPlan was not configured for this test.'))
     forgeApi.requestPlanRevision.mockRejectedValue(new Error('requestPlanRevision was not configured for this test.'))
     forgeApi.approvePlan.mockRejectedValue(new Error('approvePlan was not configured for this test.'))
+    forgeApi.generateImplementation.mockRejectedValue(new Error('generateImplementation was not configured for this test.'))
     taskPdfDownloader.run.mockResolvedValue(undefined)
     planPdfDownloader.run.mockResolvedValue(undefined)
     requirementCopier.run.mockResolvedValue(undefined)
@@ -141,6 +147,7 @@ describe('App task navigation hardening', () => {
     expect(findButton(rendered.container, 'Task history')).toBeTruthy()
     expect(findButton(rendered.container, 'New task')).toBeTruthy()
     expect(rendered.container.textContent).toContain('Save & reevaluate')
+    expect(Array.from(rendered.container.querySelectorAll('button')).some(button => button.textContent?.includes('Generate implementation'))).toBe(false)
   })
 
   it('shows task history and new task navigation for AwaitingRequirementApproval and keeps approval controls intact', async () => {
@@ -186,6 +193,216 @@ describe('App task navigation hardening', () => {
     expect(findButton(rendered.container, 'New task')).toBeTruthy()
     expect(findButton(rendered.container, 'Download approved plan')).toBeTruthy()
     expect(findButton(rendered.container, 'Download task report PDF')).toBeTruthy()
+    expect(findButton(rendered.container, 'Generate implementation')).toBeTruthy()
+  })
+
+  it('explains the Fake-only boundary without an implementation action in OpenAI mode', async () => {
+    forgeApi.getCapabilities.mockResolvedValue({
+      ...capabilities,
+      aiMode: 'OpenAI',
+      implementationProvider: null,
+      implementationConfigured: false,
+    })
+    forgeApi.getTask.mockResolvedValue(buildTask(firstId, 'PlanApproved', {
+      implementationPlan: buildPlan(),
+      planApprovedAt: '2026-07-18T12:05:00.000Z',
+    }))
+
+    await navigate(taskUrl(firstId))
+    const rendered = await renderApp()
+
+    expect(Array.from(rendered.container.querySelectorAll('button')).some(button =>
+      button.textContent?.includes('Generate implementation'))).toBe(false)
+    expect(rendered.container.textContent).toContain('available only when Forge is configured in deterministic Fake mode')
+    expect(findButton(rendered.container, 'Download approved plan')).toBeTruthy()
+    expect(findButton(rendered.container, 'Download task report PDF')).toBeTruthy()
+  })
+
+  it('generates Fake implementation review and renders truthful bounded diff metadata', async () => {
+    const approved = buildTask(firstId, 'PlanApproved', {
+      implementationPlan: buildPlan(),
+      planApprovedAt: '2026-07-18T12:05:00.000Z',
+    })
+    const reviewed = buildImplementationReviewTask(firstId)
+    forgeApi.getTask.mockResolvedValue(approved)
+    forgeApi.generateImplementation.mockResolvedValue(reviewed)
+
+    await navigate(taskUrl(firstId))
+    const rendered = await renderApp()
+    await click(findButton(rendered.container, 'Generate implementation'))
+    await expectText(rendered.container, 'Review the isolated generated changes')
+
+    expect(forgeApi.generateImplementation).toHaveBeenCalledWith(firstId)
+    expect(rendered.container.textContent).toContain('MECHANICAL WORKFLOW DEMONSTRATION')
+    expect(rendered.container.textContent).toContain('Validation commands were not run.')
+    expect(rendered.container.textContent).toContain('The active checkout was verified unchanged.')
+    expect(rendered.container.textContent).toContain('Displayed diff is incomplete.')
+    expect(rendered.container.textContent).toContain('src/ReportExportService.cs')
+    expect(rendered.container.querySelector('pre[aria-label="Unified diff for src/ReportExportService.cs"]')?.textContent)
+      .toContain('diff --git')
+    expect(findButton(rendered.container, 'Download approved plan')).toBeTruthy()
+    expect(findButton(rendered.container, 'Download task report PDF')).toBeTruthy()
+  })
+
+  it('renders recoverable implementation failure without claiming changes or validation', async () => {
+    forgeApi.getTask.mockResolvedValue(buildTask(firstId, 'Implementing', {
+      implementationPlan: buildPlan(),
+      lastImplementationFailure: {
+        category: 'implementation_recovery_required',
+        message: 'The isolated workspace requires explicit recovery.',
+        recoveryRequired: true,
+        occurredAt: '2026-07-18T12:06:00.000Z',
+        safeToResume: false,
+        activeCheckoutVerified: true,
+      },
+      implementationRuntime: { workspaceAvailable: true, activeCheckoutVerified: true, disposition: 'RecoveryRequired', safeMessage: 'The isolated workspace requires explicit recovery.' },
+    }))
+
+    await navigate(taskUrl(firstId))
+    const rendered = await renderApp()
+
+    await expectText(rendered.container, 'Workspace recovery is required')
+    expect(rendered.container.textContent).toContain('will not reset, delete, or overwrite')
+    expect(rendered.container.textContent).not.toContain('Validation succeeded')
+    expect(findButton(rendered.container, 'Task history')).toBeTruthy()
+    expect(findButton(rendered.container, 'New task')).toBeTruthy()
+  })
+
+  it('renders truthful Implementing progress without completing validation or offering downstream actions', async () => {
+    forgeApi.getTask.mockResolvedValue(buildTask(firstId, 'Implementing', {
+      implementationPlan: buildPlan(),
+      implementationWorkspace: {
+        token: firstId.replaceAll('-', ''),
+        branch: `forge/task-${firstId.replaceAll('-', '')}`,
+        baseCommitSha: '0123456789abcdef0123456789abcdef01234567',
+        phase: 'Ready',
+        createdAt: '2026-07-18T12:06:00.000Z',
+        updatedAt: '2026-07-18T12:06:00.000Z',
+        isAvailable: true,
+      },
+      implementationRuntime: { workspaceAvailable: true, activeCheckoutVerified: true, disposition: 'Active', safeMessage: null },
+    }))
+
+    await navigate(taskUrl(firstId))
+    const rendered = await renderApp()
+
+    await expectText(rendered.container, 'Preparing generated changes for diff review')
+    expect(rendered.container.textContent).toContain('valid implementation lease')
+    expect(rendered.container.textContent).not.toContain('Validation succeeded')
+    expect(Array.from(rendered.container.querySelectorAll('button')).some(button =>
+      /validate|commit|push|pull request/i.test(button.textContent ?? ''))).toBe(false)
+  })
+
+  it('offers Resume only for a proven safe-resume disposition', async () => {
+    forgeApi.getTask.mockResolvedValue(buildTask(firstId, 'Implementing', {
+      implementationPlan: buildPlan(),
+      planApprovedAt: '2026-07-18T12:05:00.000Z',
+      implementationRuntime: {
+        workspaceAvailable: true,
+        activeCheckoutVerified: true,
+        disposition: 'SafeResume',
+        safeMessage: 'The untouched reserved workspace was verified.',
+      },
+    }))
+
+    await navigate(taskUrl(firstId))
+    const rendered = await renderApp()
+
+    await expectText(rendered.container, 'The isolated workspace can be safely resumed')
+    expect(findButton(rendered.container, 'Resume implementation')).toBeTruthy()
+    expect(rendered.container.querySelector('[role="status"] .spinner')).toBeNull()
+  })
+
+  it('renders expired interrupted and terminal attempts without an active spinner or Resume', async () => {
+    const interrupted = buildTask(firstId, 'Implementing', {
+      implementationPlan: buildPlan(),
+      planApprovedAt: '2026-07-18T12:05:00.000Z',
+      implementationRuntime: {
+        workspaceAvailable: true,
+        activeCheckoutVerified: true,
+        disposition: 'RecoveryRequired',
+        safeMessage: 'The implementation lease expired during workspace preparation.',
+      },
+    })
+    forgeApi.getTask.mockResolvedValueOnce(interrupted)
+    await navigate(taskUrl(firstId))
+    const rendered = await renderApp()
+    await expectText(rendered.container, 'Workspace recovery is required')
+    expect(Array.from(rendered.container.querySelectorAll('button')).some(button => button.textContent?.includes('Resume implementation'))).toBe(false)
+    await rendered.unmount()
+
+    forgeApi.getTask.mockResolvedValue(buildTask(secondId, 'Implementing', {
+      implementationPlan: buildPlan(),
+      planApprovedAt: '2026-07-18T12:05:00.000Z',
+      implementationRuntime: {
+        workspaceAvailable: false,
+        activeCheckoutVerified: true,
+        disposition: 'TerminalIncompatible',
+        safeMessage: 'The approved file action is not supported by deterministic Fake mode.',
+      },
+    }))
+    await navigate(taskUrl(secondId))
+    const terminal = await renderApp()
+    await expectText(terminal.container, 'not compatible with Fake implementation')
+    expect(Array.from(terminal.container.querySelectorAll('button')).some(button => button.textContent?.includes('Resume implementation'))).toBe(false)
+  })
+
+  it('does not claim an unchanged active checkout when the postcondition is uncertain', async () => {
+    const review = buildImplementationReviewTask(firstId)
+    review.implementationResult!.activeCheckoutVerified = false
+    review.implementationRuntime = {
+      workspaceAvailable: true,
+      activeCheckoutVerified: false,
+      disposition: 'RecoveryRequired',
+      safeMessage: 'The active checkout postcondition is uncertain.',
+    }
+    review.lastImplementationFailure = {
+      category: 'implementation_active_checkout_uncertain',
+      message: 'The active checkout postcondition is uncertain.',
+      recoveryRequired: true,
+      occurredAt: review.updatedAt,
+      safeToResume: false,
+      activeCheckoutVerified: false,
+    }
+    forgeApi.getTask.mockResolvedValue(review)
+
+    await navigate(taskUrl(firstId))
+    const rendered = await renderApp()
+
+    await expectText(rendered.container, 'Active-checkout postcondition is uncertain.')
+    expect(rendered.container.textContent).toContain('could not be verified unchanged')
+    expect(rendered.container.textContent).not.toContain('The active checkout was verified unchanged.')
+  })
+
+  it.each(['Validating', 'Reviewing', 'Completed'] as const)('keeps semantic approved-plan downloads in %s', async status => {
+    forgeApi.getTask.mockResolvedValue(buildTask(firstId, status, {
+      implementationPlan: buildPlan(),
+      planApprovedAt: '2026-07-18T12:05:00.000Z',
+    }))
+    await navigate(taskUrl(firstId))
+    const rendered = await renderApp()
+
+    expect(findButton(rendered.container, 'Download approved plan')).toBeTruthy()
+    expect(findButton(rendered.container, 'Download task report PDF')).toBeTruthy()
+  })
+
+  it('does not let a stale implementation response restore a task after New task navigation', async () => {
+    const approved = buildTask(firstId, 'PlanApproved', { implementationPlan: buildPlan() })
+    const pending = deferred<EngineeringTask>()
+    forgeApi.getTask.mockResolvedValue(approved)
+    forgeApi.generateImplementation.mockReturnValue(pending.promise)
+
+    await navigate(taskUrl(firstId))
+    const rendered = await renderApp()
+    await click(findButton(rendered.container, 'Generate implementation'))
+    await click(findButton(rendered.container, 'New task'))
+    pending.resolve(buildImplementationReviewTask(firstId))
+    await settle()
+
+    expect(window.location.pathname).toBe('/')
+    expect(window.location.search).toBe('')
+    expect(rendered.container.textContent).toContain('What are we building?')
+    expect(rendered.container.textContent).not.toContain('Review the isolated generated changes')
   })
 
   it('keeps task B selected when task A resolves after the user navigates to another task', async () => {
@@ -514,6 +731,12 @@ function buildTask(id: string, status: WorkflowStatus, overrides: Partial<Engine
     repositoryAnalyzedAt: null,
     repositoryFingerprint: null,
     planCreatedAt: null,
+    implementationWorkspace: null,
+    implementationResult: null,
+    lastImplementationFailure: null,
+    implementationStartedAt: null,
+    implementationCompletedAt: null,
+    implementationRuntime: null,
     telemetry: {
       totalCalls: 0,
       totalInputTokens: 0,
@@ -526,6 +749,60 @@ function buildTask(id: string, status: WorkflowStatus, overrides: Partial<Engine
     },
     ...overrides,
   }
+}
+
+function buildImplementationReviewTask(id: string): EngineeringTask {
+  const completedAt = '2026-07-18T12:07:00.000Z'
+  return buildTask(id, 'AwaitingImplementationReview', {
+    planApprovedAt: completedAt,
+    implementationPlan: buildPlan(),
+    implementationWorkspace: {
+      token: id.replaceAll('-', ''),
+      branch: `forge/task-${id.replaceAll('-', '')}`,
+      baseCommitSha: '0123456789abcdef0123456789abcdef01234567',
+      phase: 'Completed',
+      createdAt: completedAt,
+      updatedAt: completedAt,
+      isAvailable: true,
+    },
+    implementationResult: {
+      source: 'DeterministicFake',
+      model: null,
+      baseCommitSha: '0123456789abcdef0123456789abcdef01234567',
+      branch: `forge/task-${id.replaceAll('-', '')}`,
+      summary: 'Mechanical Fake changes are ready for human diff review.',
+      warnings: ['This is a mechanical workflow demonstration, not AI-authored implementation.', 'Validation commands were not run.'],
+      changedFiles: [{
+        path: 'src/ReportExportService.cs',
+        action: 'Modify',
+        originalContentSha256: 'old',
+        newContentSha256: 'new',
+        originalBytes: 20,
+        newBytes: 80,
+        originalLines: 1,
+        newLines: 2,
+        additions: 1,
+        deletions: 0,
+        diffPreview: 'diff --git a/src/ReportExportService.cs b/src/ReportExportService.cs',
+        fullDiffCharacters: 120,
+        displayedDiffCharacters: 70,
+        diffTruncated: true,
+        fullDiffUtf8Bytes: 120,
+        displayedDiffUtf8Bytes: 70,
+      }],
+      fullDiffCharacters: 120,
+      displayedDiffCharacters: 70,
+      diffTruncated: true,
+      completedAt,
+      isDeterministicFake: true,
+      fullDiffUtf8Bytes: 120,
+      displayedDiffUtf8Bytes: 70,
+      activeCheckoutVerified: true,
+    },
+    implementationRuntime: { workspaceAvailable: true, activeCheckoutVerified: true, disposition: 'Completed', safeMessage: null },
+    implementationStartedAt: completedAt,
+    implementationCompletedAt: completedAt,
+  })
 }
 
 function buildSummary(task: EngineeringTask, preview: string): EngineeringTaskSummary {

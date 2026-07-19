@@ -14,12 +14,11 @@ public sealed class ImplementationPlanPdfExporter(ModelCostResolver costResolver
         ArgumentNullException.ThrowIfNull(task);
         var plan = task.ImplementationPlan
             ?? throw new WorkflowException("A complete persisted implementation plan is required for plan PDF export.");
-        var approvalLabel = task.Status switch
-        {
-            WorkflowStatus.AwaitingPlanApproval => "PROPOSED PLAN \u2014 NOT APPROVED",
-            WorkflowStatus.PlanApproved => "APPROVED PLAN",
-            _ => throw new WorkflowException("Plan PDF export is available only while awaiting plan approval or after plan approval.")
-        };
+        var approvalLabel = task.PlanApprovedAt is not null
+            ? "APPROVED PLAN"
+            : task.Status == WorkflowStatus.AwaitingPlanApproval
+                ? "PROPOSED PLAN \u2014 NOT APPROVED"
+                : throw new WorkflowException("Plan PDF export requires a proposed plan awaiting approval or a persisted plan-approval timestamp.");
 
         var builder = new PdfDocumentBuilder();
         var regular = builder.AddStandard14Font(Standard14Font.Helvetica);

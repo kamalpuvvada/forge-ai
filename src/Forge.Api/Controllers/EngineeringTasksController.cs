@@ -41,7 +41,8 @@ public sealed class EngineeringTasksController(
     {
         var task = await service.GetAsync(id, cancellationToken)
             ?? throw new KeyNotFoundException($"Engineering task '{id}' was not found.");
-        return Ok(EngineeringTaskResponse.FromDomain(task, costResolver));
+        var runtime = await service.GetImplementationRuntimeStatusAsync(task, cancellationToken);
+        return Ok(EngineeringTaskResponse.FromDomain(task, costResolver, runtime));
     }
 
     [HttpGet("{id:guid}/export/pdf")]
@@ -158,5 +159,18 @@ public sealed class EngineeringTasksController(
     {
         var task = await service.ApprovePlanAsync(id, cancellationToken);
         return Ok(EngineeringTaskResponse.FromDomain(task, costResolver));
+    }
+
+    [HttpPost("{id:guid}/implementation")]
+    [ProducesResponseType<EngineeringTaskResponse>(StatusCodes.Status200OK)]
+    [ProducesResponseType<ProblemDetails>(StatusCodes.Status409Conflict)]
+    [ProducesResponseType<ProblemDetails>(StatusCodes.Status422UnprocessableEntity)]
+    public async Task<ActionResult<EngineeringTaskResponse>> GenerateImplementation(
+        Guid id,
+        CancellationToken cancellationToken)
+    {
+        var task = await service.GenerateImplementationAsync(id, cancellationToken);
+        var runtime = await service.GetImplementationRuntimeStatusAsync(task, cancellationToken);
+        return Ok(EngineeringTaskResponse.FromDomain(task, costResolver, runtime));
     }
 }

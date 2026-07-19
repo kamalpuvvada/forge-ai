@@ -3,9 +3,9 @@
 ## Components and dependency direction
 
 - **Forge.Core** owns the aggregate, approval gates, repository/evidence/plan contracts, workflow invariants, and application service. It has no project dependencies.
-- **Forge.Infrastructure** implements SQLite, clarification adapters, safe repository discovery, deterministic evidence ranking, and Fake planning.
-- **Forge.Api** composes modes and read-only planning services, exposes REST DTOs and safe capabilities, and maps exceptions to Problem Details.
-- **forge-web** renders clarification, repository snapshots, evidence, plans, approvals, capabilities, and telemetry through REST.
+- **Forge.Infrastructure** implements SQLite, clarification/planning adapters, safe repository discovery, and isolated Git worktree/Fake implementation adapters.
+- **Forge.Api** composes modes and workflow services, exposes REST DTOs and safe capabilities, and maps exceptions to Problem Details.
+- **forge-web** renders clarification, evidence, plans, approvals, bounded implementation diffs, capabilities, and telemetry through REST.
 
 ```mermaid
 flowchart LR
@@ -28,6 +28,10 @@ flowchart LR
     OpenAIPlanner[OpenAIPlanningEngine] --> Planner
     OpenAIPlanner --> Gateway
     Discovery --> Git[read-only Git commands]
+    Service --> Implementer[IImplementationEngine]
+    Service --> Workspace[IImplementationWorkspaceManager]
+    FakeImplementer[FakeImplementationEngine] --> Implementer
+    Workspace --> GitRunner[bounded fixed Git process runner]
 ```
 
 Dependencies point inward: API and Infrastructure depend on Core; Core knows neither. Official SDK types remain inside `SdkOpenAIResponsesGateway`. The `IOpenAIResponsesGateway` normalization boundary permits non-billable adapter tests.
@@ -49,8 +53,9 @@ stateDiagram-v2
     ReadyForPlanning --> Planning
     Planning --> AwaitingPlanApproval
     AwaitingPlanApproval --> PlanApproved: explicit approval
-    PlanApproved --> Implementing: future milestone
-    Implementing --> Validating
+    PlanApproved --> Implementing: reserve isolated workspace
+    Implementing --> AwaitingImplementationReview: validated changes + local diff
+    AwaitingImplementationReview --> Validating: future milestone
     Validating --> Reviewing
     Reviewing --> Completed
 ```
@@ -65,7 +70,19 @@ Discovery normalizes the root, contains every inspected path, skips reparse poin
 
 Evidence selection deterministically scores strong phrases, paths, lightweight C#/TypeScript symbols, content, roles, related tests/contracts, and module diversity. Generic documentation and unrelated clarification code receive penalties. Excerpts retain line numbers, are de-duplicated, hashed, and redact obvious sensitive key/value lines before persistence. Redaction is not a comprehensive secret scanner.
 
-`FakePlanningEngine` creates a labelled plan without a model call. `OpenAIPlanningEngine` makes exactly one Responses request using `gpt-5.6-sol`, medium reasoning, a 6,000-token allowance, and strict schema. Plans are capped at ten affected files, eight steps, and eight validation commands, plus four risks, assumptions, and unresolved questions. Both planners produce structured affected files, sequential steps, and up to twelve compact requirement-coverage mappings. Existing paths must cite evidence from that path, creates must be absent from the snapshot, validation commands remain proposals, and absolute/traversal paths are rejected. Plan approval moves the workflow to `PlanApproved`; implementation is a future milestone.
+`FakePlanningEngine` creates a labelled plan without a model call. `OpenAIPlanningEngine` makes exactly one Responses request using `gpt-5.6-sol`, medium reasoning, a 6,000-token allowance, and strict schema. Plans are capped at ten affected files, eight steps, and eight validation commands, plus four risks, assumptions, and unresolved questions. Both planners produce structured affected files, sequential steps, and up to twelve compact requirement-coverage mappings. Existing paths must cite evidence from that path, creates must be absent from the snapshot, validation commands remain proposals, and absolute/traversal paths are rejected. Plan approval moves the workflow to `PlanApproved` and is the only initial implementation gate.
+
+## Isolated implementation boundary
+
+The initial implementation boundary is deterministic Fake mode only. `IImplementationEngine` returns bounded structured create/modify/delete operations, never commands or patches. The domain validator requires exact one-to-one coverage of every approved mutating path, matching actions and original hashes, no undeclared or duplicate paths, valid create/modify/delete content, non-no-op modifications, and per-file/total output limits. Inspect-only plan paths may be context but cannot become operations.
+
+`IImplementationWorkspaceManager` revalidates a clean exact Git root and approved HEAD, captures active HEAD/branch/index/status plus bounded hashes of all tracked regular working-tree bytes, creates a deterministic task branch and linked sparse worktree outside the repository, disables hooks/submodules/fsmonitor/external diff/LFS smudge, rejects executable filters, symlinks/gitlinks/reparse points, abnormal/sparse index states, and materializes only approved paths. All source content dependencies and filesystem targets are contained, size-bounded, and secret-scanned before reservation or the first atomic write. Local fixed-argument Git diff supplies complete hashes/counts and bounded previews with explicit truncation; generated content and diffs use the same high-confidence sensitive-content detector. No repository command, build, test, lint, stage, commit, push, or provider request occurs.
+
+Workspace identity is persisted without exposing its absolute path through DTOs. A reserved untouched workspace may be reconstructed and resumed after restart. Completed results include a deterministic worktree fingerprint that is verified under the operating-system lock immediately before and after persistence and during later availability checks. A missing or changed workspace leaves the historical bounded diff readable but changes runtime disposition to `RecoveryRequired`; it is never automatically reset or deleted. Concurrent implementation commands are serialized in-process and protected across processes by row-version compare-and-swap updates, a fixed-duration persisted owner/attempt lease, and an exclusive operating-system workspace lock. Each irreversible boundary has a durable phase so restart projection can distinguish active, safely resumable, interrupted, and recovery-required work. SQLite checks both text-character and blob-byte lengths before materializing implementation JSON.
+
+All Git invocations share a startup-resolved absolute executable and one hardened execution envelope. The child environment is rebuilt from a small allowlist; Git directory/worktree/index/object/config/attribute overrides are not inherited; prompts, credentials, pagers, external diff, textconv, fsmonitor, hooks, submodule recursion, optional locks, LFS smudging, and automatic maintenance are disabled or contained. Correctness-bearing truncated output is rejected rather than interpreted as complete.
+
+Writable files are currently limited to strict UTF-8 without a BOM. Snapshot metadata carries BOM/strict-UTF-8 eligibility and plan validation rejects an ineligible mutating path before approval. This slice does not claim general encoding preservation.
 
 ## OpenAI structured-output boundaries
 
@@ -109,7 +126,7 @@ sequenceDiagram
 
 ## Telemetry and estimated cost
 
-Each real provider attempt records call ID, clarification or planning stage, provider, model, reasoning effort, timestamps, success, response ID, input/cached/output/reasoning tokens, estimated cost, and a non-sensitive failure category. Failed planning attempts are persisted before their safe error is returned. Fake mode produces no model-call record.
+Each real provider attempt records call ID, clarification, planning, or future implementation stage, provider, model, reasoning effort, timestamps, success, response ID, input/cached/output/reasoning tokens, estimated cost, and a non-sensitive failure category. Failed planning attempts are persisted before their safe error is returned. Fake mode produces no model-call record.
 
 The estimate subtracts cached tokens from total input, prices uncached and cached input separately, then adds output pricing. Output already contains reasoning tokens, so reasoning usage is not double-counted. Rates are bound from `Forge:AI:Pricing`.
 
@@ -120,6 +137,7 @@ The estimate subtracts cached tokens from total input, prices uncached and cache
 - `RequirementRevisionNotes TEXT NOT NULL DEFAULT '[]'`
 - `ModelCalls TEXT NOT NULL DEFAULT '[]'`
 - bounded snapshot, evidence, and implementation-plan JSON columns;
+- bounded implementation workspace, result, safe failure, and lease JSON columns plus start/completion timestamps and an optimistic row version;
 - evidence counters, repository analysis/fingerprint fields, and plan creation/approval timestamps.
 
 Development startup uses `PRAGMA table_info(EngineeringTasks)` and adds only missing known columns. Existing databases do not need to be deleted.
@@ -128,8 +146,8 @@ Development startup uses `PRAGMA table_info(EngineeringTasks)` and adds only mis
 
 Central exception handling maps missing tasks, invalid workflow operations, configuration faults, provider faults, and unexpected failures to safe Problem Details. Provider exception bodies and logs never include credentials or raw responses.
 
-`GET /api/system/capabilities` reports clarification and planning provider/model/readiness independently, while target modification, validation, review, and pull-request creation remain false. OpenAI mode starts without a key and reports both AI stages unavailable. It exposes no key or secret-derived data.
+`GET /api/system/capabilities` reports clarification, planning, and implementation readiness independently. Fake mode reports isolated target modification and human diff review available; validation and pull-request creation remain false. OpenAI implementation remains unavailable even when clarification/planning are configured. No capability exposes a key, absolute workspace, or secret-derived data.
 
 ## Current boundaries
 
-Target-repository changes/tests, review, repair, pull-request creation, authentication, production migrations, and provider retry policy are not part of this slice.
+Semantic AI implementation, implementation correction/rejection, worktree cleanup or quota management, validation execution, commit/push, pull-request creation, authentication, production migrations, and provider retry policy are not part of this slice.

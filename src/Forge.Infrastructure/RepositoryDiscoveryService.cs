@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -6,29 +5,22 @@ using Forge.Core;
 
 namespace Forge.Infrastructure;
 
-public sealed class RepositoryDiscoveryService(
-    RepositoryAnalysisLimits limits,
-    TimeProvider timeProvider) : IRepositoryDiscoveryService
+public sealed class RepositoryDiscoveryService : IRepositoryDiscoveryService
 {
-    private static readonly HashSet<string> ExcludedDirectories = new(StringComparer.OrdinalIgnoreCase)
-    {
-        ".git", ".vs", ".idea", "node_modules", "bin", "obj", "dist", "build",
-        "coverage", "TestResults", "packages"
-    };
+    private static readonly RepositoryFileSafetyPolicy FileSafety = new();
+    private readonly RepositoryAnalysisLimits limits;
+    private readonly TimeProvider timeProvider;
+    private readonly IGitProcessRunner git;
 
-    private static readonly HashSet<string> TextExtensions = new(StringComparer.OrdinalIgnoreCase)
+    public RepositoryDiscoveryService(
+        RepositoryAnalysisLimits limits,
+        TimeProvider timeProvider,
+        IGitProcessRunner? git = null)
     {
-        ".cs", ".csproj", ".sln", ".slnx", ".json", ".jsonc", ".ts", ".tsx", ".js", ".jsx",
-        ".md", ".txt", ".xml", ".yml", ".yaml", ".toml", ".props", ".targets", ".config",
-        ".css", ".scss", ".html", ".htm", ".sql", ".ps1", ".sh", ".cmd", ".bat"
-    };
-
-    private static readonly HashSet<string> BinaryExtensions = new(StringComparer.OrdinalIgnoreCase)
-    {
-        ".dll", ".exe", ".pdb", ".zip", ".7z", ".rar", ".png", ".jpg", ".jpeg", ".gif",
-        ".webp", ".ico", ".pdf", ".woff", ".woff2", ".ttf", ".eot", ".mp3", ".mp4",
-        ".mov", ".avi", ".db", ".sqlite", ".sqlite3"
-    };
+        this.limits = limits;
+        this.timeProvider = timeProvider;
+        this.git = git ?? new GitProcessRunner(new GitProcessOptions());
+    }
 
     public async Task<RepositorySnapshotReadResult> ReadSnapshotAsync(
         RepositorySnapshot snapshot,
@@ -42,8 +34,9 @@ public sealed class RepositoryDiscoveryService(
 
         if (snapshot.IsGitRepository)
         {
+            await EnsureNoActiveFiltersAsync(root, cancellationToken);
             var head = (await RunGitAsync(root, ["rev-parse", "HEAD"], cancellationToken))?.Output.Trim();
-            var status = (await RunGitAsync(root, ["status", "--short"], cancellationToken))?.Output.TrimEnd() ?? string.Empty;
+            var status = (await RunGitAsync(root, ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames"], cancellationToken))?.Output ?? string.Empty;
             var state = string.IsNullOrWhiteSpace(status) ? "clean" : "dirty";
             if (!string.Equals(head, snapshot.FullHeadSha, StringComparison.Ordinal) ||
                 !string.Equals(state, snapshot.WorkingTreeStatus, StringComparison.Ordinal) ||
@@ -68,12 +61,14 @@ public sealed class RepositoryDiscoveryService(
                 return new RepositorySnapshotReadResult(false, []);
 
             string content;
-            try { content = await File.ReadAllTextAsync(fullPath, cancellationToken); }
+            bool hasUtf8Bom;
+            try { (content, hasUtf8Bom) = await ReadStrictUtf8Async(fullPath, cancellationToken); }
             catch (Exception exception) when (exception is UnauthorizedAccessException or IOException or DecoderFallbackException)
             {
                 return new RepositorySnapshotReadResult(false, []);
             }
-            if (content.IndexOf('\0') >= 0) return new RepositorySnapshotReadResult(false, []);
+            if (content.IndexOf('\0') >= 0 || hasUtf8Bom != metadata.HasUtf8Bom || !metadata.IsStrictUtf8)
+                return new RepositorySnapshotReadResult(false, []);
             textFiles.Add(new RepositoryTextFile(metadata, content));
         }
 
@@ -120,14 +115,15 @@ public sealed class RepositoryDiscoveryService(
 
         if (isGit)
         {
+            await EnsureNoActiveFiltersAsync(root, cancellationToken);
             branch = (await RunGitAsync(root, ["rev-parse", "--abbrev-ref", "HEAD"], cancellationToken))?.Output.Trim();
             head = (await RunGitAsync(root, ["rev-parse", "HEAD"], cancellationToken))?.Output.Trim();
-            gitStatus = (await RunGitAsync(root, ["status", "--short"], cancellationToken))?.Output.TrimEnd() ?? string.Empty;
+            gitStatus = (await RunGitAsync(root, ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames"], cancellationToken))?.Output ?? string.Empty;
             workingTreeStatus = string.IsNullOrWhiteSpace(gitStatus) ? "clean" : "dirty";
-            var listed = await RunGitAsync(root, ["ls-files"], cancellationToken);
+            var listed = await RunGitAsync(root, ["ls-files", "-z"], cancellationToken);
             if (listed is null || listed.ExitCode != 0)
                 throw new RepositoryDiscoveryException("inaccessible_path", "Git could not list repository files safely.");
-            candidates = listed.Output.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries)
+            candidates = listed.Output.Split('\0', StringSplitOptions.RemoveEmptyEntries)
                 .Select(path => path.Replace('/', Path.DirectorySeparatorChar))
                 .Order(StringComparer.OrdinalIgnoreCase)
                 .ToArray();
@@ -155,11 +151,16 @@ public sealed class RepositoryDiscoveryService(
         {
             cancellationToken.ThrowIfCancellationRequested();
             var relative = NormalizeRelativePath(candidate);
+            if (!RepositoryPathRules.IsSafeRelativePath(relative))
+            {
+                excludedCount++;
+                continue;
+            }
             string fullPath;
             try { fullPath = ResolveContainedPath(root, relative); }
             catch (RepositoryDiscoveryException) { throw; }
 
-            if (IsExcludedPath(relative) || IsSecretFile(relative) || IsGeneratedFile(relative))
+            if (FileSafety.IsExcludedPath(relative) || FileSafety.IsSecretFile(relative) || FileSafety.IsGeneratedFile(relative))
             {
                 excludedCount++;
                 continue;
@@ -181,7 +182,7 @@ public sealed class RepositoryDiscoveryService(
 
             fingerprintEntries.Add($"{relative}|{info.Length}");
             var extension = Path.GetExtension(relative);
-            if (BinaryExtensions.Contains(extension) || !TextExtensions.Contains(extension) && !IsSpecialTextFile(relative))
+            if (FileSafety.IsBinaryOrUnsupported(relative))
             {
                 excludedCount++;
                 continue;
@@ -208,7 +209,8 @@ public sealed class RepositoryDiscoveryService(
             }
 
             string content;
-            try { content = await File.ReadAllTextAsync(fullPath, cancellationToken); }
+            bool hasUtf8Bom;
+            try { (content, hasUtf8Bom) = await ReadStrictUtf8Async(fullPath, cancellationToken); }
             catch (DecoderFallbackException) { excludedCount++; continue; }
             catch (UnauthorizedAccessException)
             {
@@ -227,10 +229,12 @@ public sealed class RepositoryDiscoveryService(
                 DetectRole(relative),
                 IsTestPath(relative),
                 DetectAssociation(relative),
-                ExtractSymbols(extension, content));
+                ExtractSymbols(extension, content),
+                hasUtf8Bom,
+                true);
             metadata.Add(fileMetadata);
             textFiles.Add(new RepositoryTextFile(fileMetadata, content));
-            fingerprintEntries.Add($"{relative}|{Hash(content)}");
+            fingerprintEntries.Add($"{relative}|{(hasUtf8Bom ? "bom|" : string.Empty)}{Hash(content)}");
         }
 
         var projects = metadata.Where(file => IsProjectFile(file.RelativePath)).Select(file => file.RelativePath).ToArray();
@@ -263,6 +267,16 @@ public sealed class RepositoryDiscoveryService(
         return new RepositoryDiscoveryResult(snapshot, textFiles);
     }
 
+    private static async Task<(string Content, bool HasUtf8Bom)> ReadStrictUtf8Async(
+        string path,
+        CancellationToken cancellationToken)
+    {
+        var bytes = await File.ReadAllBytesAsync(path, cancellationToken);
+        var hasBom = bytes.AsSpan().StartsWith(Encoding.UTF8.Preamble);
+        var offset = hasBom ? Encoding.UTF8.Preamble.Length : 0;
+        return (new UTF8Encoding(false, true).GetString(bytes, offset, bytes.Length - offset), hasBom);
+    }
+
     private IReadOnlyList<string> EnumerateFilesSafely(string root, List<string> warnings, CancellationToken cancellationToken, out int skippedDirectoryCount)
     {
         skippedDirectoryCount = 0;
@@ -278,7 +292,7 @@ public sealed class RepositoryDiscoveryService(
                 foreach (var child in Directory.EnumerateDirectories(directory).OrderDescending())
                 {
                     var info = new DirectoryInfo(child);
-                    if (ExcludedDirectories.Contains(info.Name) || (info.Attributes & FileAttributes.ReparsePoint) != 0)
+                    if (FileSafety.IsExcludedPath(info.Name) || (info.Attributes & FileAttributes.ReparsePoint) != 0)
                     {
                         skippedDirectoryCount++;
                         continue;
@@ -301,44 +315,45 @@ public sealed class RepositoryDiscoveryService(
         return results;
     }
 
-    private static async Task<GitResult?> RunGitAsync(string root, IReadOnlyList<string> arguments, CancellationToken cancellationToken)
+    private async Task<GitProcessResult?> RunGitAsync(string root, IReadOnlyList<string> arguments, CancellationToken cancellationToken)
     {
-        var startInfo = new ProcessStartInfo("git")
-        {
-            WorkingDirectory = root,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-            CreateNoWindow = true
-        };
-        foreach (var argument in arguments) startInfo.ArgumentList.Add(argument);
         try
         {
-            using var process = Process.Start(startInfo);
-            if (process is null) return null;
-            var outputTask = process.StandardOutput.ReadToEndAsync(cancellationToken);
-            var errorTask = process.StandardError.ReadToEndAsync(cancellationToken);
-            try
-            {
-                await process.WaitForExitAsync(cancellationToken);
-            }
-            catch (OperationCanceledException)
-            {
-                if (!process.HasExited) process.Kill(entireProcessTree: true);
-                throw;
-            }
-            return new GitResult(process.ExitCode, await outputTask, await errorTask);
+            var result = await git.RunAsync(root, arguments, cancellationToken: cancellationToken);
+            return result.OutputTruncated ? null : result;
         }
         catch (OperationCanceledException) { throw; }
-        catch (Exception exception) when (exception is System.ComponentModel.Win32Exception or InvalidOperationException)
+        catch (ImplementationException)
         {
             return null;
         }
     }
 
+    private async Task EnsureNoActiveFiltersAsync(string root, CancellationToken cancellationToken)
+    {
+        var listed = await git.RunAsync(root, ["ls-files", "-z"], cancellationToken: cancellationToken);
+        if (listed.ExitCode != 0 || listed.OutputTruncated)
+            throw new RepositoryDiscoveryException("inaccessible_path", "Git could not inspect repository attributes safely.");
+        if (listed.Output.Length == 0) return;
+        var attributes = await git.RunAsync(root, ["check-attr", "-z", "--stdin", "filter"], listed.Output,
+            cancellationToken: cancellationToken);
+        if (attributes.ExitCode != 0 || attributes.OutputTruncated)
+            throw new RepositoryDiscoveryException("inaccessible_path", "Git could not inspect repository attributes safely.");
+        var values = attributes.Output.Split('\0');
+        if ((values.Length - 1) % 3 != 0)
+            throw new RepositoryDiscoveryException("unsafe_path", "Git returned malformed repository attribute data.");
+        for (var index = 0; index + 2 < values.Length; index += 3)
+        {
+            if (!string.Equals(values[index + 2], "unspecified", StringComparison.Ordinal) &&
+                !string.Equals(values[index + 2], "unset", StringComparison.Ordinal))
+                throw new RepositoryDiscoveryException("unsafe_path",
+                    "Repositories with active Git content filters are not eligible for analysis.");
+        }
+    }
+
     internal static string ResolveContainedPath(string root, string relativePath)
     {
-        if (Path.IsPathRooted(relativePath))
+        if (!RepositoryPathRules.IsSafeRelativePath(relativePath))
             throw new RepositoryDiscoveryException("unsafe_path", "An inspected path escaped the repository root.");
         var fullPath = Path.GetFullPath(relativePath, root);
         var rootPrefix = root.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
@@ -348,26 +363,7 @@ public sealed class RepositoryDiscoveryService(
     }
 
     internal static bool IsSecretFile(string relativePath)
-    {
-        var name = Path.GetFileName(relativePath);
-        return name.Equals(".env", StringComparison.OrdinalIgnoreCase) ||
-               name.StartsWith(".env.", StringComparison.OrdinalIgnoreCase) ||
-               name.Equals("secrets.json", StringComparison.OrdinalIgnoreCase) ||
-               Regex.IsMatch(name, @"(?i)(credential|private[-_. ]?key)") ||
-               new[] { ".pem", ".key", ".pfx", ".p12" }.Contains(Path.GetExtension(name), StringComparer.OrdinalIgnoreCase);
-    }
-
-    private static bool IsExcludedPath(string relativePath) =>
-        relativePath.Split('/', '\\').Any(ExcludedDirectories.Contains);
-
-    private static bool IsGeneratedFile(string relativePath)
-    {
-        var name = Path.GetFileName(relativePath);
-        return name.Contains(".min.", StringComparison.OrdinalIgnoreCase) ||
-               name.EndsWith(".g.cs", StringComparison.OrdinalIgnoreCase) ||
-               name.EndsWith(".designer.cs", StringComparison.OrdinalIgnoreCase) ||
-               name.EndsWith(".generated.cs", StringComparison.OrdinalIgnoreCase);
-    }
+        => FileSafety.IsSecretFile(relativePath);
 
     private static bool IsSpecialTextFile(string relativePath) =>
         Path.GetFileName(relativePath).Equals("Dockerfile", StringComparison.OrdinalIgnoreCase) ||
@@ -432,8 +428,7 @@ public sealed class RepositoryDiscoveryService(
 
     private static int CountLines(string content) => content.Length == 0 ? 0 : content.Count(character => character == '\n') + 1;
     private static string Hash(string value) => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(value))).ToLowerInvariant();
-    private static string NormalizeRelativePath(string path) => path.Replace('\\', '/').TrimStart('/');
+    private static string NormalizeRelativePath(string path) => RepositoryPathRules.Normalize(path);
     private static bool PathsEqual(string left, string right) => string.Equals(Path.GetFullPath(left).TrimEnd('\\', '/'), Path.GetFullPath(right).TrimEnd('\\', '/'), StringComparison.OrdinalIgnoreCase);
     private static string? NullIfWhiteSpace(string? value) => string.IsNullOrWhiteSpace(value) ? null : value;
-    private sealed record GitResult(int ExitCode, string Output, string Error);
 }

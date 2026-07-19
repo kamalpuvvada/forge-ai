@@ -101,6 +101,51 @@ public sealed class ImplementationPlanValidatorTests
     }
 
     [Fact]
+    public void Utf8_bom_or_non_strict_utf8_file_is_rejected_before_plan_approval()
+    {
+        var snapshot = Snapshot() with
+        {
+            Files = [Snapshot().Files[0] with { HasUtf8Bom = true }]
+        };
+
+        var exception = Assert.Throws<PlanningException>(() =>
+            ImplementationPlanValidator.Validate(ValidPlan(), snapshot, Evidence()));
+
+        Assert.Equal("invalid_plan", exception.Category);
+        Assert.Contains("strict UTF-8", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Unicode_normalization_aliases_are_not_silently_repaired_in_plans()
+    {
+        var plan = ValidPlan();
+        var decomposed = "src/cafe\u0301.cs";
+        var invalid = plan with
+        {
+            AffectedFiles = [plan.AffectedFiles[0] with { Path = decomposed }],
+            Steps = [plan.Steps[0] with { AffectedPaths = [decomposed] }],
+            RequirementCoverage = [plan.RequirementCoverage[0] with { AffectedPaths = [decomposed] }]
+        };
+
+        Assert.Throws<PlanningException>(() => ImplementationPlanValidator.Validate(invalid, Snapshot(), Evidence()));
+    }
+
+    [Fact]
+    public void Windows_case_equivalent_affected_paths_are_rejected_as_duplicates()
+    {
+        var plan = ValidPlan();
+        var duplicate = plan.AffectedFiles[0] with { Path = plan.AffectedFiles[0].Path.ToUpperInvariant() };
+
+        var exception = Assert.Throws<PlanningException>(() => Validate(plan with
+        {
+            AffectedFiles = [plan.AffectedFiles[0], duplicate]
+        }));
+
+        Assert.Equal("invalid_plan", exception.Category);
+        Assert.Contains("duplicate", exception.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public void Repository_understanding_and_summary_use_strict_completed_run_detection()
     {
         var plan = ValidPlan();

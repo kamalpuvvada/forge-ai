@@ -17,12 +17,27 @@ public sealed class ForgeExceptionHandler(
         {
             KeyNotFoundException => (404, "Engineering task not found", exception.Message, "task_not_found"),
             WorkflowException => (409, "Invalid workflow action", exception.Message, "workflow_conflict"),
+            TaskConcurrencyException => (409, "Task changed concurrently", exception.Message, "task_concurrency_conflict"),
+            TaskDataCorruptException => (409, "Stored task data is invalid", exception.Message, "task_data_corrupt"),
             RepositoryDiscoveryException discovery => discovery.Category switch
             {
                 "inaccessible_path" => (403, "Repository path inaccessible", discovery.Message, "repository_inaccessible"),
                 "unsafe_path" => (400, "Unsafe repository path", discovery.Message, "repository_unsafe_path"),
                 "analysis_limits" => (422, "Repository analysis limit", discovery.Message, "repository_analysis_limit"),
                 _ => (400, "Repository path invalid", discovery.Message, "repository_missing_path")
+            },
+            ImplementationException implementation => implementation.Category switch
+            {
+                "implementation_configuration" or "implementation_workspace_configuration" =>
+                    (503, "Implementation unavailable", implementation.Message, implementation.Category),
+                "implementation_repository_not_git" or "implementation_repository_dirty" or
+                "implementation_base_changed" or "implementation_repository_state" or
+                "implementation_workspace_conflict" or "implementation_active_checkout_changed" or
+                "implementation_recovery_required" =>
+                    (409, "Implementation workspace conflict", implementation.Message, implementation.Category),
+                "implementation_unsafe_path" =>
+                    (400, "Unsafe implementation path", implementation.Message, implementation.Category),
+                _ => (422, "Implementation generation rejected", implementation.Message, implementation.Category)
             },
             PlanningProviderException { Category: "missing_direct_evidence" } provider => (
                 422,

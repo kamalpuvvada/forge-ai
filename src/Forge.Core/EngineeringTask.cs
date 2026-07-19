@@ -33,6 +33,14 @@ public sealed class EngineeringTask
     public DateTimeOffset? RepositoryAnalyzedAt { get; private set; }
     public string? RepositoryFingerprint { get; private set; }
     public DateTimeOffset? PlanCreatedAt { get; private set; }
+    public ImplementationWorkspace? ImplementationWorkspace { get; private set; }
+    public ImplementationResult? ImplementationResult { get; private set; }
+    public ImplementationFailure? LastImplementationFailure { get; private set; }
+    public DateTimeOffset? ImplementationStartedAt { get; private set; }
+    public DateTimeOffset? ImplementationCompletedAt { get; private set; }
+    public ImplementationLease? ImplementationLease { get; private set; }
+    public long RowVersion { get; private set; }
+    public Guid? ExpectedImplementationLeaseIdForSave { get; private set; }
 
     public static EngineeringTask Create(string repository, string requirement, DateTimeOffset now)
     {
@@ -225,8 +233,138 @@ public sealed class EngineeringTask
         EnsureStatus(WorkflowStatus.AwaitingPlanApproval);
         if (ImplementationPlan is null)
             throw new WorkflowException("An implementation plan is required before approval.");
+        FakeImplementationCapabilityMatrix.ValidatePlan(ImplementationPlan);
         PlanApprovedAt = now;
         Status = WorkflowStatus.PlanApproved;
+        UpdatedAt = now;
+    }
+
+    public void BeginImplementation(ImplementationWorkspace workspace, ImplementationLease lease, DateTimeOffset now)
+    {
+        EnsureStatus(WorkflowStatus.PlanApproved);
+        ArgumentNullException.ThrowIfNull(workspace);
+        ArgumentNullException.ThrowIfNull(lease);
+        EnsureValidLease(lease);
+        if (ImplementationPlan is null || PlanApprovedAt is null)
+            throw new WorkflowException("A complete approved implementation plan is required before implementation generation.");
+        ImplementationWorkspace = workspace;
+        ImplementationResult = null;
+        LastImplementationFailure = null;
+        ImplementationStartedAt = now;
+        ImplementationCompletedAt = null;
+        ImplementationLease = lease;
+        Status = WorkflowStatus.Implementing;
+        UpdatedAt = now;
+    }
+
+    public void ResumeImplementation(ImplementationLease replacementLease, DateTimeOffset now)
+    {
+        EnsureStatus(WorkflowStatus.Implementing);
+        if (ImplementationWorkspace is null || ImplementationResult is not null)
+            throw new WorkflowException("A recoverable implementation workspace is required before resuming generation.");
+        if (LastImplementationFailure?.RecoveryRequired == true)
+            throw new ImplementationException("implementation_recovery_required",
+                "The isolated implementation workspace requires explicit recovery before generation can continue.", true);
+        if (ImplementationWorkspace.Phase is ImplementationWorkspacePhase.MutationStarted or
+            ImplementationWorkspacePhase.ApplyCompleted or ImplementationWorkspacePhase.RecoveryRequired)
+            throw new ImplementationException("implementation_recovery_required",
+                "The interrupted implementation phase cannot be resumed automatically.", true);
+        ArgumentNullException.ThrowIfNull(replacementLease);
+        EnsureValidLease(replacementLease);
+        if (ImplementationLease?.IsActive(now) == true)
+            throw new ImplementationException("implementation_lease_conflict",
+                "Another Forge process currently owns this implementation attempt.");
+        ExpectedImplementationLeaseIdForSave = ImplementationLease?.LeaseId;
+        ImplementationLease = replacementLease;
+        LastImplementationFailure = null;
+        UpdatedAt = now;
+    }
+
+    public void UpdateImplementationWorkspace(ImplementationWorkspace workspace, Guid attemptId, Guid ownerId, DateTimeOffset now)
+    {
+        EnsureStatus(WorkflowStatus.Implementing);
+        ArgumentNullException.ThrowIfNull(workspace);
+        if (ImplementationWorkspace is null || !string.Equals(ImplementationWorkspace.Token, workspace.Token, StringComparison.Ordinal))
+            throw new WorkflowException("The implementation workspace identity cannot be changed.");
+        EnsureImplementationLease(attemptId, ownerId, now);
+        ExpectedImplementationLeaseIdForSave = ImplementationLease!.LeaseId;
+        ImplementationWorkspace = workspace;
+        var leaseDuration = TimeSpan.FromSeconds(ImplementationLease!.EffectiveDurationSeconds);
+        if (leaseDuration <= TimeSpan.Zero) leaseDuration = TimeSpan.FromMinutes(5);
+        ImplementationLease = ImplementationLease with { HeartbeatAt = now, ExpiresAt = now.Add(leaseDuration) };
+        UpdatedAt = now;
+    }
+
+    public void RecordImplementationFailure(
+        ImplementationFailure failure,
+        Guid attemptId,
+        Guid ownerId,
+        DateTimeOffset now)
+    {
+        EnsureStatus(WorkflowStatus.Implementing);
+        ArgumentNullException.ThrowIfNull(failure);
+        EnsureImplementationLease(attemptId, ownerId, now, allowExpired: true);
+        ExpectedImplementationLeaseIdForSave = ImplementationLease!.LeaseId;
+        LastImplementationFailure = failure;
+        if (ImplementationWorkspace is not null && failure.RecoveryRequired)
+            ImplementationWorkspace = ImplementationWorkspace with
+            {
+                Phase = ImplementationWorkspacePhase.RecoveryRequired,
+                UpdatedAt = now,
+                IsAvailable = true
+            };
+        else if (ImplementationWorkspace is not null)
+            ImplementationWorkspace = ImplementationWorkspace with
+            {
+                Phase = ImplementationWorkspace.Phase == ImplementationWorkspacePhase.WorkspacePreparing
+                    ? ImplementationWorkspacePhase.RecoveryRequired
+                    : ImplementationWorkspace.Phase,
+                UpdatedAt = now
+            };
+        ImplementationLease = null;
+        UpdatedAt = now;
+    }
+
+    public void StoreImplementationResult(ImplementationResult result, Guid attemptId, Guid ownerId, DateTimeOffset now)
+    {
+        EnsureStatus(WorkflowStatus.Implementing);
+        ArgumentNullException.ThrowIfNull(result);
+        if (ImplementationWorkspace is null)
+            throw new WorkflowException("An isolated implementation workspace is required before storing generated changes.");
+        EnsureImplementationLease(attemptId, ownerId, now, allowExpired: true);
+        ExpectedImplementationLeaseIdForSave = ImplementationLease!.LeaseId;
+        if (!string.Equals(result.BaseCommitSha, ImplementationWorkspace.BaseCommitSha, StringComparison.Ordinal) ||
+            !string.Equals(result.Branch, ImplementationWorkspace.Branch, StringComparison.Ordinal))
+            throw new WorkflowException("The implementation result does not match its reserved workspace.");
+        ImplementationResult = result;
+        LastImplementationFailure = null;
+        ImplementationWorkspace = ImplementationWorkspace with
+        {
+            Phase = ImplementationWorkspacePhase.ResultPersisted,
+            UpdatedAt = now,
+            IsAvailable = true
+        };
+        ImplementationCompletedAt = result.CompletedAt;
+        ImplementationLease = null;
+        Status = WorkflowStatus.AwaitingImplementationReview;
+        UpdatedAt = now;
+    }
+
+    public void RecordImplementationPostconditionFailure(ImplementationFailure failure, DateTimeOffset now)
+    {
+        EnsureStatus(WorkflowStatus.AwaitingImplementationReview);
+        ArgumentNullException.ThrowIfNull(failure);
+        if (!failure.RecoveryRequired ||
+            ImplementationWorkspace is null || ImplementationResult is null)
+            throw new WorkflowException("A persisted implementation result is required before recording postcondition uncertainty.");
+        LastImplementationFailure = failure;
+        if (!failure.ActiveCheckoutVerified)
+            ImplementationResult = ImplementationResult with { ActiveCheckoutVerified = false };
+        ImplementationWorkspace = ImplementationWorkspace with
+        {
+            Phase = ImplementationWorkspacePhase.RecoveryRequired,
+            UpdatedAt = now
+        };
         UpdatedAt = now;
     }
 
@@ -290,7 +428,14 @@ public sealed class EngineeringTask
         DateTimeOffset? repositoryAnalyzedAt = null,
         string? repositoryFingerprint = null,
         DateTimeOffset? planCreatedAt = null,
-        IEnumerable<PlanRevisionNote>? planRevisionNotes = null)
+        IEnumerable<PlanRevisionNote>? planRevisionNotes = null,
+        ImplementationWorkspace? implementationWorkspace = null,
+        ImplementationResult? implementationResult = null,
+        ImplementationFailure? lastImplementationFailure = null,
+        DateTimeOffset? implementationStartedAt = null,
+        DateTimeOffset? implementationCompletedAt = null,
+        ImplementationLease? implementationLease = null,
+        long rowVersion = 0)
     {
         var task = new EngineeringTask
         {
@@ -300,7 +445,7 @@ public sealed class EngineeringTask
             CurrentClarifiedRequirement = currentClarifiedRequirement,
             CurrentPendingQuestion = currentPendingQuestion,
             RequirementSummary = requirementSummary,
-            Status = status == WorkflowStatus.Implementing && planApprovedAt is not null && implementationPlan is not null
+            Status = status == WorkflowStatus.Implementing && planApprovedAt is not null && implementationPlan is not null && implementationWorkspace is null
                 ? WorkflowStatus.PlanApproved
                 : status,
             CreatedAt = createdAt,
@@ -315,13 +460,48 @@ public sealed class EngineeringTask
             ImplementationPlan = implementationPlan,
             RepositoryAnalyzedAt = repositoryAnalyzedAt,
             RepositoryFingerprint = repositoryFingerprint,
-            PlanCreatedAt = planCreatedAt
+            PlanCreatedAt = planCreatedAt,
+            ImplementationWorkspace = implementationWorkspace,
+            ImplementationResult = implementationResult,
+            LastImplementationFailure = lastImplementationFailure,
+            ImplementationStartedAt = implementationStartedAt,
+            ImplementationCompletedAt = implementationCompletedAt,
+            ImplementationLease = implementationLease,
+            RowVersion = rowVersion
         };
         task._clarificationAnswers.AddRange(answers);
         task._requirementRevisionNotes.AddRange(revisionNotes);
         task._planRevisionNotes.AddRange(planRevisionNotes ?? []);
         task._modelCalls.AddRange(modelCalls);
         return task;
+    }
+
+    public void AcceptPersistenceVersion(long expectedVersion, long newVersion)
+    {
+        if (RowVersion != expectedVersion || newVersion != expectedVersion + 1)
+            throw new InvalidOperationException("The persisted row version transition is invalid.");
+        RowVersion = newVersion;
+        ExpectedImplementationLeaseIdForSave = null;
+    }
+
+    private void EnsureImplementationLease(Guid attemptId, Guid ownerId, DateTimeOffset now, bool allowExpired = false)
+    {
+        if (ImplementationLease is null || ImplementationLease.AttemptId != attemptId ||
+            ImplementationLease.OwnerId != ownerId)
+            throw new ImplementationException("implementation_lease_conflict",
+                "This process does not own the persisted implementation lease.");
+        if (!allowExpired && !ImplementationLease.IsActive(now))
+            throw new ImplementationException("implementation_lease_expired",
+                "The implementation lease expired before this operation could continue.");
+    }
+
+    private static void EnsureValidLease(ImplementationLease lease)
+    {
+        if (lease.LeaseId == Guid.Empty || lease.AttemptId == Guid.Empty || lease.OwnerId == Guid.Empty ||
+            lease.AcquiredAt.Offset != TimeSpan.Zero || lease.HeartbeatAt.Offset != TimeSpan.Zero || lease.ExpiresAt.Offset != TimeSpan.Zero ||
+            lease.EffectiveDurationSeconds < 1 || lease.AcquiredAt > lease.HeartbeatAt || lease.HeartbeatAt >= lease.ExpiresAt ||
+            lease.ExpiresAt - lease.HeartbeatAt != TimeSpan.FromSeconds(lease.EffectiveDurationSeconds))
+            throw new WorkflowException("A valid implementation owner lease is required.");
     }
 
     private void EnsureStatus(WorkflowStatus expected)

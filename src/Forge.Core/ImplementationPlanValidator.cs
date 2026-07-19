@@ -91,10 +91,12 @@ public static class ImplementationPlanValidator
         if (!string.Equals(plan.RepositoryFingerprint, snapshot.Fingerprint, StringComparison.Ordinal))
             throw new PlanningException("stale_snapshot", "The plan does not match the current repository snapshot.");
 
-        var snapshotPaths = snapshot.Files.Select(file => Normalize(file.RelativePath)).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var snapshotFiles = snapshot.Files.ToDictionary(
+            file => Normalize(file.RelativePath), file => file, RepositoryPathRules.Comparer);
+        var snapshotPaths = snapshotFiles.Keys.ToHashSet(RepositoryPathRules.Comparer);
         var evidenceIds = evidence.Select(item => item.Id).ToHashSet(StringComparer.Ordinal);
         var evidencePaths = evidence.ToDictionary(item => item.Id, item => Normalize(item.RelativePath), StringComparer.Ordinal);
-        var affectedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var affectedPaths = new HashSet<string>(RepositoryPathRules.Comparer);
 
         for (var fileIndex = 0; fileIndex < plan.AffectedFiles.Count; fileIndex++)
         {
@@ -109,13 +111,16 @@ public static class ImplementationPlanValidator
                 $"Affected file {fileIndex + 1} contains an overlong purpose.");
             ValidateEvidenceIdLengths(file.EvidenceIds);
             var path = Normalize(file.Path);
-            if (!IsSafeRelativePath(path) || !affectedPaths.Add(path))
+            if (!RepositoryPathRules.IsSafeRelativePath(file.Path, FilePathMaxLength) || !affectedPaths.Add(path))
                 throw Invalid("The implementation plan contains an unsafe or duplicate affected path.");
             var exists = snapshotPaths.Contains(path);
             if (file.Action is PlannedFileAction.Modify or PlannedFileAction.Delete or PlannedFileAction.Inspect && !exists)
                 throw Invalid($"Planned {file.Action.ToString().ToLowerInvariant()} path '{path}' does not exist in the snapshot.");
             if (file.Action == PlannedFileAction.Create && exists)
                 throw Invalid($"Planned create path '{path}' already exists in the snapshot.");
+            if (exists && file.Action != PlannedFileAction.Inspect &&
+                snapshotFiles.TryGetValue(path, out var metadata) && (metadata.HasUtf8Bom || !metadata.IsStrictUtf8))
+                throw Invalid($"Planned path '{path}' is not an eligible strict UTF-8 file without a byte-order mark.");
             if (exists && !evidencePaths.Values.Contains(path, StringComparer.OrdinalIgnoreCase))
                 throw new PlanningException("missing_direct_evidence", MissingDirectEvidenceMessage);
             ValidateEvidenceIds(file.EvidenceIds, evidenceIds, $"affected file '{path}'");
@@ -149,7 +154,7 @@ public static class ImplementationPlanValidator
             foreach (var rawPath in step.AffectedPaths)
             {
                 var path = Normalize(rawPath);
-                if (!IsSafeRelativePath(path) || !affectedPaths.Contains(path))
+                if (!RepositoryPathRules.IsSafeRelativePath(rawPath, FilePathMaxLength) || !affectedPaths.Contains(path))
                     throw Invalid($"Step {step.Order} references an undeclared or unsafe affected path.");
                 if (snapshotPaths.Contains(path) && step.EvidenceIds.Count == 0)
                     throw Invalid($"Step {step.Order} must cite evidence for existing path '{path}'.");
@@ -172,7 +177,8 @@ public static class ImplementationPlanValidator
             if (coverage.AffectedPaths.Any(path => path.Length > FilePathMaxLength))
                 throw InvalidField($"Requirement coverage item {coverageIndex + 1} contains an overlong affected path.");
             var coveragePaths = coverage.AffectedPaths.Select(Normalize).ToArray();
-            if (coveragePaths.Any(path => !IsSafeRelativePath(path) || !affectedPaths.Contains(path)) ||
+            if (coverage.AffectedPaths.Any(path => !RepositoryPathRules.IsSafeRelativePath(path, FilePathMaxLength)) ||
+                coveragePaths.Any(path => !affectedPaths.Contains(path)) ||
                 coveragePaths.Distinct(StringComparer.OrdinalIgnoreCase).Count() != coveragePaths.Length)
                 throw Invalid($"Requirement coverage item {coverageIndex + 1} references an undeclared, unsafe, or duplicate affected path.");
             if (coverage.StepOrders.Any(order => !validStepOrders.Contains(order)) ||
@@ -195,6 +201,15 @@ public static class ImplementationPlanValidator
 
         if (MentionsSnapshotPathWithoutEvidence(plan.RepositoryUnderstanding, snapshotPaths, evidenceIds))
             throw Invalid("Repository understanding claims about existing files must cite evidence IDs.");
+
+        try
+        {
+            FakeImplementationCapabilityMatrix.ValidatePlan(plan);
+        }
+        catch (ImplementationException exception) when (exception.Category == "implementation_terminal_incompatibility")
+        {
+            throw Invalid(exception.Message);
+        }
     }
 
     private static void ValidateRequiredField(
@@ -282,12 +297,7 @@ public static class ImplementationPlanValidator
             .Concat(plan.UnresolvedQuestions)
             .Concat(plan.RequirementCoverage.SelectMany(item => new[] { item.Requirement }.Concat(item.AffectedPaths)));
 
-    private static bool IsSafeRelativePath(string path) =>
-        !string.IsNullOrWhiteSpace(path) &&
-        !Path.IsPathRooted(path) &&
-        !path.Split('/', '\\').Contains("..");
-
-    private static string Normalize(string path) => path.Replace('\\', '/').Trim();
+    private static string Normalize(string path) => RepositoryPathRules.Normalize(path);
     private static PlanningException Invalid(string message) => new("invalid_plan", message);
     private static PlanningException InvalidField(string message) => new("invalid_plan_field", message);
 }

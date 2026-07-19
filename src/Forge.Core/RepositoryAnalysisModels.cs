@@ -19,7 +19,9 @@ public sealed record RepositoryFileMetadata(
     string ProbableRole,
     bool IsTest,
     string? Association,
-    IReadOnlyList<string> DeclaredSymbols);
+    IReadOnlyList<string> DeclaredSymbols,
+    bool HasUtf8Bom = false,
+    bool IsStrictUtf8 = true);
 
 public sealed record RepositorySnapshot(
     string NormalizedRoot,

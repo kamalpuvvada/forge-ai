@@ -11,6 +11,7 @@ public enum WorkflowStatus
     AwaitingPlanApproval,
     PlanApproved,
     Implementing,
+    AwaitingImplementationReview,
     Validating,
     Reviewing,
     Completed,

@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Http.Json;
+using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
 using Forge.Api.Contracts;
@@ -11,6 +12,7 @@ using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Data.Sqlite;
 using UglyToad.PdfPig;
 
 namespace Forge.Api.Tests;
@@ -50,7 +52,7 @@ public sealed class EngineeringTaskApiTests : IClassFixture<FakeModeFactory>
         Assert.Equal(["createdAt", "id", "originalRequirementPreview", "repository", "status", "updatedAt"],
             summary.EnumerateObject().Select(property => property.Name).Order().ToArray());
         Assert.Equal(id, summary.GetProperty("id").GetGuid());
-        Assert.Equal("C:/history-repository", summary.GetProperty("repository").GetString());
+        Assert.StartsWith("Repository ", summary.GetProperty("repository").GetString());
         Assert.DoesNotContain("implementationPlan", summary.ToString());
         Assert.DoesNotContain("telemetry", summary.ToString());
         Assert.Equal(before, await client.GetStringAsync($"/api/tasks/{id}"));
@@ -221,6 +223,9 @@ public sealed class EngineeringTaskApiTests : IClassFixture<FakeModeFactory>
         analysisResponse.EnsureSuccessStatusCode();
         var analyzed = await analysisResponse.Content.ReadFromJsonAsync<JsonElement>();
         Assert.Equal("Planning", analyzed.GetProperty("status").GetString());
+        Assert.StartsWith("Repository ", analyzed.GetProperty("repository").GetString());
+        Assert.False(analyzed.GetProperty("repositorySnapshot").TryGetProperty("normalizedRoot", out _));
+        Assert.DoesNotContain(_factory.TargetRepositoryPath, analyzed.GetRawText(), StringComparison.OrdinalIgnoreCase);
         Assert.True(analyzed.GetProperty("repositorySnapshot").GetProperty("eligibleTextFileCount").GetInt32() > 0);
         Assert.True(analyzed.GetProperty("evidenceItems").GetArrayLength() > 0);
 
@@ -248,6 +253,122 @@ public sealed class EngineeringTaskApiTests : IClassFixture<FakeModeFactory>
         Assert.Equal("PlanApproved", persisted.GetProperty("status").GetString());
         Assert.True(persisted.GetProperty("evidenceItems").GetArrayLength() > 0);
         Assert.Equal("DeterministicFake", persisted.GetProperty("implementationPlan").GetProperty("source").GetString());
+    }
+
+    [Fact]
+    public async Task Approved_plan_generates_isolated_fake_changes_and_returns_bounded_review_data()
+    {
+        var repository = _factory.TargetRepositoryPath;
+        var activeFile = Path.Combine(repository, "src", "ReportExportService.cs");
+        var contentBefore = await File.ReadAllTextAsync(activeFile);
+        var headBefore = FakeModeFactory.RunGit(repository, "rev-parse", "HEAD");
+        var branchBefore = FakeModeFactory.RunGit(repository, "branch", "--show-current");
+        var statusBefore = FakeModeFactory.RunGit(repository, "status", "--porcelain=v1", "--untracked-files=all");
+
+        var created = await CreateAsync(
+            "Add report export. Acceptance criteria: export is available. Validation: run focused tests.",
+            repository);
+        var id = created.GetProperty("id").GetGuid();
+        (await _client.PostAsync($"/api/tasks/{id}/requirement-approval", null)).EnsureSuccessStatusCode();
+        (await _client.PostAsync($"/api/tasks/{id}/repository-analysis", null)).EnsureSuccessStatusCode();
+        (await _client.PostAsync($"/api/tasks/{id}/plan", null)).EnsureSuccessStatusCode();
+        (await _client.PostAsync($"/api/tasks/{id}/plan-approval", null)).EnsureSuccessStatusCode();
+
+        var response = await _client.PostAsync($"/api/tasks/{id}/implementation", null);
+        if (!response.IsSuccessStatusCode)
+        {
+            var failed = await _client.GetFromJsonAsync<JsonElement>($"/api/tasks/{id}");
+            var token = failed.GetProperty("implementationWorkspace").GetProperty("token").GetString()!;
+            var workspaceStatus = FakeModeFactory.RunGit(Path.Combine(_factory.WorktreeRoot, token),
+                "status", "--porcelain=v1", "--untracked-files=all");
+            Assert.Fail($"{await response.Content.ReadAsStringAsync()} Workspace status: {workspaceStatus}");
+        }
+        var implemented = await response.Content.ReadFromJsonAsync<JsonElement>();
+
+        Assert.Equal("AwaitingImplementationReview", implemented.GetProperty("status").GetString());
+        Assert.Equal("DeterministicFake", implemented.GetProperty("implementationResult").GetProperty("source").GetString());
+        Assert.True(implemented.GetProperty("implementationResult").GetProperty("isDeterministicFake").GetBoolean());
+        Assert.NotEmpty(implemented.GetProperty("implementationResult").GetProperty("changedFiles").EnumerateArray());
+        Assert.Equal("Completed", implemented.GetProperty("implementationRuntime").GetProperty("disposition").GetString());
+        Assert.True(implemented.GetProperty("implementationRuntime").GetProperty("workspaceAvailable").GetBoolean());
+        Assert.True(implemented.GetProperty("implementationRuntime").GetProperty("activeCheckoutVerified").GetBoolean());
+        Assert.True(implemented.GetProperty("implementationResult").GetProperty("fullDiffUtf8Bytes").GetInt32() > 0);
+        Assert.Contains("not AI-authored", implemented.GetProperty("implementationResult").GetProperty("warnings").ToString(), StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(0, implemented.GetProperty("telemetry").GetProperty("totalCalls").GetInt32());
+        Assert.DoesNotContain(_factory.WorktreeRoot, implemented.ToString(), StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("validation succeeded", implemented.ToString(), StringComparison.OrdinalIgnoreCase);
+
+        Assert.Equal(contentBefore, await File.ReadAllTextAsync(activeFile));
+        Assert.Equal(headBefore, FakeModeFactory.RunGit(repository, "rev-parse", "HEAD"));
+        Assert.Equal(branchBefore, FakeModeFactory.RunGit(repository, "branch", "--show-current"));
+        Assert.Equal(statusBefore, FakeModeFactory.RunGit(repository, "status", "--porcelain=v1", "--untracked-files=all"));
+
+        var beforeReadOnlyRoutes = await ReadPersistedStateAsync(_factory.DatabasePath, id);
+        var persisted = await _client.GetFromJsonAsync<JsonElement>($"/api/tasks/{id}");
+        Assert.Equal("AwaitingImplementationReview", persisted.GetProperty("status").GetString());
+        Assert.Equal(implemented.GetProperty("implementationResult").ToString(), persisted.GetProperty("implementationResult").ToString());
+        (await _client.GetAsync("/api/tasks")).EnsureSuccessStatusCode();
+        (await _client.GetAsync($"/api/tasks/{id}/export/plan-pdf")).EnsureSuccessStatusCode();
+        (await _client.GetAsync($"/api/tasks/{id}/export/pdf")).EnsureSuccessStatusCode();
+        var afterReadOnlyRoutes = await ReadPersistedStateAsync(_factory.DatabasePath, id);
+        Assert.Equal(beforeReadOnlyRoutes, afterReadOnlyRoutes);
+    }
+
+    [Fact]
+    public async Task Implementation_endpoint_rejects_invalid_state_without_mutating_repository()
+    {
+        var repository = _factory.TargetRepositoryPath;
+        var statusBefore = FakeModeFactory.RunGit(repository, "status", "--porcelain=v1", "--untracked-files=all");
+        var branchesBefore = FakeModeFactory.RunGit(repository, "branch", "--format=%(refname:short)");
+        var worktreesBefore = Directory.Exists(_factory.WorktreeRoot)
+            ? Directory.GetDirectories(_factory.WorktreeRoot).Order(StringComparer.OrdinalIgnoreCase).ToArray()
+            : [];
+        var created = await CreateAsync("Add report export.", repository);
+
+        var response = await _client.PostAsync($"/api/tasks/{created.GetProperty("id").GetGuid()}/implementation", null);
+        var problem = await response.Content.ReadFromJsonAsync<JsonElement>();
+
+        Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+        Assert.Equal("workflow_conflict", problem.GetProperty("code").GetString());
+        Assert.Equal(statusBefore, FakeModeFactory.RunGit(repository, "status", "--porcelain=v1", "--untracked-files=all"));
+        Assert.Equal(branchesBefore, FakeModeFactory.RunGit(repository, "branch", "--format=%(refname:short)"));
+        Assert.Equal(worktreesBefore, Directory.Exists(_factory.WorktreeRoot)
+            ? Directory.GetDirectories(_factory.WorktreeRoot).Order(StringComparer.OrdinalIgnoreCase).ToArray()
+            : []);
+    }
+
+    [Fact]
+    public async Task Dirty_repository_implementation_failure_is_safe_and_remains_plan_approved()
+    {
+        await using var factory = new FakeModeFactory();
+        using var client = factory.CreateClient();
+        var repository = factory.TargetRepositoryPath;
+        var createdResponse = await client.PostAsJsonAsync("/api/tasks", new
+        {
+            repository,
+            requirement = "Add report export. Acceptance criteria: export is available. Validation: run focused tests."
+        });
+        createdResponse.EnsureSuccessStatusCode();
+        var id = (await createdResponse.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("id").GetGuid();
+        (await client.PostAsync($"/api/tasks/{id}/requirement-approval", null)).EnsureSuccessStatusCode();
+        (await client.PostAsync($"/api/tasks/{id}/repository-analysis", null)).EnsureSuccessStatusCode();
+        (await client.PostAsync($"/api/tasks/{id}/plan", null)).EnsureSuccessStatusCode();
+        (await client.PostAsync($"/api/tasks/{id}/plan-approval", null)).EnsureSuccessStatusCode();
+        await File.WriteAllTextAsync(Path.Combine(repository, "untracked-after-approval.txt"), "dirty");
+
+        var response = await client.PostAsync($"/api/tasks/{id}/implementation", null);
+        var responseText = await response.Content.ReadAsStringAsync();
+        var problem = JsonSerializer.Deserialize<JsonElement>(responseText);
+
+        Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+        Assert.Equal("implementation_repository_dirty", problem.GetProperty("code").GetString());
+        Assert.DoesNotContain(repository, responseText, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(factory.WorktreeRoot, responseText, StringComparison.OrdinalIgnoreCase);
+        var persisted = await client.GetFromJsonAsync<JsonElement>($"/api/tasks/{id}");
+        Assert.Equal("PlanApproved", persisted.GetProperty("status").GetString());
+        Assert.Equal(JsonValueKind.Null, persisted.GetProperty("implementationWorkspace").ValueKind);
+        Assert.False(Directory.Exists(factory.WorktreeRoot) && Directory.EnumerateDirectories(factory.WorktreeRoot)
+            .Any(path => Path.GetFileName(path).Length == 32));
     }
 
     [Fact]
@@ -435,7 +556,7 @@ public sealed class EngineeringTaskApiTests : IClassFixture<FakeModeFactory>
     }
 
     [Fact]
-    public async Task Capabilities_truthfully_report_read_only_fake_planning()
+    public async Task Capabilities_truthfully_report_fake_isolated_implementation_without_validation_or_pr_creation()
     {
         var capabilities = await _client.GetFromJsonAsync<JsonElement>("/api/system/capabilities");
         Assert.True(capabilities.GetProperty("repositoryInspectionAvailable").GetBoolean());
@@ -444,9 +565,11 @@ public sealed class EngineeringTaskApiTests : IClassFixture<FakeModeFactory>
         Assert.Equal("Fake", capabilities.GetProperty("planningProvider").GetString());
         Assert.True(capabilities.GetProperty("clarificationConfigured").GetBoolean());
         Assert.True(capabilities.GetProperty("planningConfigured").GetBoolean());
-        Assert.False(capabilities.GetProperty("targetModificationAvailable").GetBoolean());
+        Assert.Equal("Deterministic Fake", capabilities.GetProperty("implementationProvider").GetString());
+        Assert.True(capabilities.GetProperty("implementationConfigured").GetBoolean());
+        Assert.True(capabilities.GetProperty("targetModificationAvailable").GetBoolean());
         Assert.False(capabilities.GetProperty("validationAvailable").GetBoolean());
-        Assert.False(capabilities.GetProperty("reviewAvailable").GetBoolean());
+        Assert.True(capabilities.GetProperty("reviewAvailable").GetBoolean());
         Assert.False(capabilities.GetProperty("pullRequestCreationAvailable").GetBoolean());
     }
 
@@ -519,6 +642,9 @@ public sealed class EngineeringTaskApiTests : IClassFixture<FakeModeFactory>
             "import { exportReport } from './api'\nexport const App = () => 'task report export'");
         await File.WriteAllTextAsync(Path.Combine(webSource, "api.ts"),
             "export const exportReport = () => 'task report export'");
+        FakeModeFactory.RunGit(factory.TargetRepositoryPath, "add", "--", "web/src/App.tsx", "web/src/api.ts");
+        FakeModeFactory.RunGit(factory.TargetRepositoryPath, "-c", "user.name=Forge API Tests", "-c",
+            "user.email=forge-tests@example.invalid", "commit", "-m", "add frontend fixture");
         var createdResponse = await client.PostAsJsonAsync("/api/tasks", new
         {
             repository = factory.TargetRepositoryPath,
@@ -632,34 +758,82 @@ public sealed class EngineeringTaskApiTests : IClassFixture<FakeModeFactory>
         using var pdf = PdfDocument.Open(bytes);
         return string.Join('\n', pdf.GetPages().Select(page => page.Text));
     }
+
+    private static async Task<string> ReadPersistedStateAsync(string databasePath, Guid id)
+    {
+        await using var connection = new SqliteConnection($"Data Source={databasePath}");
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT RowVersion, UpdatedAt, Status, ImplementationWorkspace, ImplementationResult,
+                   LastImplementationFailure, ImplementationLease
+            FROM EngineeringTasks WHERE Id = $id;
+            """;
+        command.Parameters.AddWithValue("$id", id.ToString());
+        await using var reader = await command.ExecuteReaderAsync();
+        Assert.True(await reader.ReadAsync());
+        return string.Join('|', Enumerable.Range(0, reader.FieldCount)
+            .Select(index => reader.IsDBNull(index) ? "<null>" : reader.GetValue(index).ToString()));
+    }
 }
 
 public class FakeModeFactory : WebApplicationFactory<Program>
 {
     private readonly string _directory = Path.Combine(Path.GetTempPath(), $"forge-api-tests-{Guid.NewGuid():N}");
+    private readonly object _repositoryLock = new();
     public string DatabasePath => Path.Combine(_directory, "forge.db");
+    public string WorktreeRoot => Path.Combine(_directory, "worktrees");
     public string TargetRepositoryPath
     {
         get
         {
             var path = Path.Combine(_directory, "target-repository");
-            Directory.CreateDirectory(Path.Combine(path, "src"));
-            var source = Path.Combine(path, "src", "ReportExportService.cs");
-            if (!File.Exists(source)) File.WriteAllText(source, "public sealed class ReportExportService { }\n");
-            var project = Path.Combine(path, "Forge.Sample.csproj");
-            if (!File.Exists(project)) File.WriteAllText(project, "<Project Sdk=\"Microsoft.NET.Sdk\" />\n");
+            lock (_repositoryLock)
+            {
+                if (!Directory.Exists(Path.Combine(path, ".git")))
+                {
+                    Directory.CreateDirectory(Path.Combine(path, "src"));
+                    File.WriteAllText(Path.Combine(path, "src", "ReportExportService.cs"), "public sealed class ReportExportService { }\n");
+                    File.WriteAllText(Path.Combine(path, "Forge.Sample.csproj"), "<Project Sdk=\"Microsoft.NET.Sdk\" />\n");
+                    RunGit(path, "init", "--initial-branch=main");
+                    RunGit(path, "add", "--", ".");
+                    RunGit(path, "-c", "user.name=Forge API Tests", "-c", "user.email=forge-tests@example.invalid", "commit", "-m", "fixture baseline");
+                }
+            }
             return path;
         }
+    }
+
+    internal static string RunGit(string workingDirectory, params string[] arguments)
+    {
+        var startInfo = new ProcessStartInfo("git")
+        {
+            WorkingDirectory = workingDirectory,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+        foreach (var argument in arguments) startInfo.ArgumentList.Add(argument);
+        startInfo.Environment["GIT_TERMINAL_PROMPT"] = "0";
+        using var process = Process.Start(startInfo) ?? throw new InvalidOperationException("Could not start Git test fixture.");
+        var stdout = process.StandardOutput.ReadToEnd();
+        var stderr = process.StandardError.ReadToEnd();
+        process.WaitForExit();
+        if (process.ExitCode != 0) throw new InvalidOperationException($"Git test fixture failed: {stderr}");
+        return stdout.Trim();
     }
 
     protected override void ConfigureWebHost(IWebHostBuilder builder)
     {
         builder.UseEnvironment("Development");
         builder.UseSetting("Forge:DatabasePath", DatabasePath);
+        builder.UseSetting("Forge:Implementation:WorktreeRoot", WorktreeRoot);
         builder.ConfigureAppConfiguration((_, configuration) => configuration.AddInMemoryCollection(new Dictionary<string, string?>
         {
             ["Forge:DatabasePath"] = DatabasePath,
-            ["Forge:AI:Mode"] = "Fake"
+            ["Forge:AI:Mode"] = "Fake",
+            ["Forge:Implementation:WorktreeRoot"] = WorktreeRoot
         }));
     }
 
@@ -667,7 +841,12 @@ public class FakeModeFactory : WebApplicationFactory<Program>
     {
         base.Dispose(disposing);
         Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
-        if (Directory.Exists(_directory)) Directory.Delete(_directory, true);
+        if (Directory.Exists(_directory))
+        {
+            foreach (var path in Directory.EnumerateFileSystemEntries(_directory, "*", SearchOption.AllDirectories))
+                File.SetAttributes(path, FileAttributes.Normal);
+            Directory.Delete(_directory, true);
+        }
     }
 }
 
@@ -789,17 +968,20 @@ public sealed class OpenAiNoKeyFactory : WebApplicationFactory<Program>
 {
     private readonly string _directory = Path.Combine(Path.GetTempPath(), $"forge-openai-no-key-{Guid.NewGuid():N}");
     public string DatabasePath => Path.Combine(_directory, "forge.db");
+    public string WorktreeRoot => Path.Combine(_directory, "worktrees");
 
     protected override void ConfigureWebHost(IWebHostBuilder builder)
     {
         builder.UseEnvironment("Development");
         builder.UseSetting("Forge:DatabasePath", DatabasePath);
         builder.UseSetting("Forge:AI:Mode", "OpenAI");
+        builder.UseSetting("Forge:Implementation:WorktreeRoot", WorktreeRoot);
         builder.ConfigureAppConfiguration((_, configuration) => configuration.AddInMemoryCollection(
             new Dictionary<string, string?>
             {
                 ["Forge:DatabasePath"] = DatabasePath,
-                ["Forge:AI:Mode"] = "OpenAI"
+                ["Forge:AI:Mode"] = "OpenAI",
+                ["Forge:Implementation:WorktreeRoot"] = WorktreeRoot
             }));
         builder.ConfigureServices(services =>
         {
@@ -826,13 +1008,20 @@ internal static class ApiTestDatabaseGuard
         var configuration = factory.Services.GetRequiredService<IConfiguration>();
         var environment = factory.Services.GetRequiredService<IWebHostEnvironment>();
         var configuredPath = configuration["Forge:DatabasePath"];
+        var configuredWorktreeRoot = configuration["Forge:Implementation:WorktreeRoot"];
         var developmentDatabasePath = Path.GetFullPath(Path.Combine(environment.ContentRootPath, "data", "forge.db"));
+        var productionWorktreeRoot = Path.GetFullPath(new ImplementationWorkspaceOptions().WorktreeRoot);
 
         Assert.True(Path.IsPathFullyQualified(expectedDatabasePath));
         Assert.Equal(expectedDatabasePath, configuredPath);
         Assert.NotEqual(developmentDatabasePath, Path.GetFullPath(expectedDatabasePath));
         Assert.StartsWith(Path.GetTempPath(), expectedDatabasePath, StringComparison.OrdinalIgnoreCase);
         Assert.True(File.Exists(expectedDatabasePath), "The API initializer did not create the isolated test database.");
+        Assert.False(string.IsNullOrWhiteSpace(configuredWorktreeRoot));
+        Assert.StartsWith(Path.GetTempPath(), configuredWorktreeRoot!, StringComparison.OrdinalIgnoreCase);
+        Assert.NotEqual(productionWorktreeRoot, Path.GetFullPath(configuredWorktreeRoot!));
+        Assert.StartsWith(Path.GetDirectoryName(expectedDatabasePath)!, Path.GetFullPath(configuredWorktreeRoot!),
+            StringComparison.OrdinalIgnoreCase);
     }
 }
 

@@ -1,5 +1,7 @@
 using Forge.Core;
 using Forge.Infrastructure;
+using System.Security.Cryptography;
+using System.Text;
 
 namespace Forge.Api.Contracts;
 
@@ -16,8 +18,14 @@ public sealed record EngineeringTaskSummaryResponse(
         summary.Status,
         summary.CreatedAt,
         summary.UpdatedAt,
-        summary.Repository,
+        SafeRepositoryDisplayName(summary.Repository),
         summary.OriginalRequirementPreview);
+
+    internal static string SafeRepositoryDisplayName(string repository)
+    {
+        var bytes = SHA256.HashData(Encoding.UTF8.GetBytes(repository.Trim()));
+        return $"Repository {Convert.ToHexString(bytes.AsSpan(0, 4)).ToLowerInvariant()}";
+    }
 }
 
 public sealed record ClarificationAnswerResponse(string Question, string Answer, DateTimeOffset AnsweredAt);
@@ -70,7 +78,7 @@ public sealed record RepositoryFileResponse(
     bool IsTest, string? Association, IReadOnlyList<string> DeclaredSymbols);
 
 public sealed record RepositorySnapshotResponse(
-    string NormalizedRoot, bool IsGitRepository, string? Branch, string? ShortHeadSha, string? FullHeadSha,
+    bool IsGitRepository, string? Branch, string? ShortHeadSha, string? FullHeadSha,
     string WorkingTreeStatus, int TotalDiscoveredFiles, int EligibleTextFileCount, int ExcludedFileCount,
     IReadOnlyList<string> DetectedLanguages, IReadOnlyList<string> DetectedExtensions,
     IReadOnlyList<string> ProjectFiles, IReadOnlyList<string> TestLocations,
@@ -99,6 +107,64 @@ public sealed record ImplementationPlanResponse(
     string Summary, PlanningSource Source, string? PlanningModel, bool IsDeterministicFake,
     DateTimeOffset CreatedAt, string RepositoryFingerprint);
 
+public sealed record ImplementationWorkspaceResponse(
+    string Token,
+    string Branch,
+    string BaseCommitSha,
+    ImplementationWorkspacePhase Phase,
+    DateTimeOffset CreatedAt,
+    DateTimeOffset UpdatedAt,
+    bool IsAvailable);
+
+public sealed record ImplementationFailureResponse(
+    string Category,
+    string Message,
+    bool RecoveryRequired,
+    DateTimeOffset OccurredAt,
+    bool SafeToResume,
+    bool ActiveCheckoutVerified);
+
+public sealed record ImplementationRuntimeResponse(
+    bool WorkspaceAvailable,
+    bool ActiveCheckoutVerified,
+    ImplementationAttemptDisposition Disposition,
+    string? SafeMessage);
+
+public sealed record ChangedFileReviewResponse(
+    string Path,
+    ImplementationOperationAction Action,
+    string? OriginalContentSha256,
+    string? NewContentSha256,
+    long OriginalBytes,
+    long NewBytes,
+    int OriginalLines,
+    int NewLines,
+    int Additions,
+    int Deletions,
+    string DiffPreview,
+    int FullDiffCharacters,
+    int DisplayedDiffCharacters,
+    bool DiffTruncated,
+    int FullDiffUtf8Bytes,
+    int DisplayedDiffUtf8Bytes);
+
+public sealed record ImplementationResultResponse(
+    ImplementationSource Source,
+    string? Model,
+    string BaseCommitSha,
+    string Branch,
+    string Summary,
+    IReadOnlyList<string> Warnings,
+    IReadOnlyList<ChangedFileReviewResponse> ChangedFiles,
+    int FullDiffCharacters,
+    int DisplayedDiffCharacters,
+    bool DiffTruncated,
+    DateTimeOffset CompletedAt,
+    bool IsDeterministicFake,
+    int FullDiffUtf8Bytes,
+    int DisplayedDiffUtf8Bytes,
+    bool ActiveCheckoutVerified);
+
 public sealed record EngineeringTaskResponse(
     Guid Id,
     string Repository,
@@ -123,9 +189,18 @@ public sealed record EngineeringTaskResponse(
     DateTimeOffset? RepositoryAnalyzedAt,
     string? RepositoryFingerprint,
     DateTimeOffset? PlanCreatedAt,
+    ImplementationWorkspaceResponse? ImplementationWorkspace,
+    ImplementationResultResponse? ImplementationResult,
+    ImplementationFailureResponse? LastImplementationFailure,
+    DateTimeOffset? ImplementationStartedAt,
+    DateTimeOffset? ImplementationCompletedAt,
+    ImplementationRuntimeResponse? ImplementationRuntime,
     ModelTelemetryResponse Telemetry)
 {
-    public static EngineeringTaskResponse FromDomain(EngineeringTask task, ModelCostResolver costResolver)
+    public static EngineeringTaskResponse FromDomain(
+        EngineeringTask task,
+        ModelCostResolver costResolver,
+        ImplementationRuntimeStatus? runtimeStatus = null)
     {
         var calls = task.ModelCalls.Select(call =>
         {
@@ -153,7 +228,6 @@ public sealed record EngineeringTaskResponse(
             calls);
 
         var snapshot = task.RepositorySnapshot is null ? null : new RepositorySnapshotResponse(
-            task.RepositorySnapshot.NormalizedRoot,
             task.RepositorySnapshot.IsGitRepository,
             task.RepositorySnapshot.Branch,
             task.RepositorySnapshot.ShortHeadSha,
@@ -192,10 +266,51 @@ public sealed record EngineeringTaskResponse(
             task.ImplementationPlan.IsDeterministicFake,
             task.ImplementationPlan.CreatedAt,
             task.ImplementationPlan.RepositoryFingerprint);
+        var implementationWorkspace = task.ImplementationWorkspace is null ? null : new ImplementationWorkspaceResponse(
+            task.ImplementationWorkspace.Token,
+            task.ImplementationWorkspace.Branch,
+            task.ImplementationWorkspace.BaseCommitSha,
+            task.ImplementationWorkspace.Phase,
+            task.ImplementationWorkspace.CreatedAt,
+            task.ImplementationWorkspace.UpdatedAt,
+            runtimeStatus?.WorkspaceAvailable ?? false);
+        var implementationFailure = task.LastImplementationFailure is null ? null : new ImplementationFailureResponse(
+            task.LastImplementationFailure.Category,
+            task.LastImplementationFailure.Message,
+            task.LastImplementationFailure.RecoveryRequired,
+            task.LastImplementationFailure.OccurredAt,
+            task.LastImplementationFailure.SafeToResume,
+            task.LastImplementationFailure.ActiveCheckoutVerified);
+        var implementationResult = task.ImplementationResult is null ? null : new ImplementationResultResponse(
+            task.ImplementationResult.Source,
+            task.ImplementationResult.Model,
+            task.ImplementationResult.BaseCommitSha,
+            task.ImplementationResult.Branch,
+            task.ImplementationResult.Summary,
+            task.ImplementationResult.Warnings,
+            task.ImplementationResult.ChangedFiles.Select(file => new ChangedFileReviewResponse(
+                file.Path, file.Action, file.OriginalContentSha256, file.NewContentSha256,
+                file.OriginalBytes, file.NewBytes, file.OriginalLines, file.NewLines,
+                file.Additions, file.Deletions, file.DiffPreview, file.FullDiffCharacters,
+                file.DisplayedDiffCharacters, file.DiffTruncated,
+                file.FullDiffUtf8Bytes, file.DisplayedDiffUtf8Bytes)).ToArray(),
+            task.ImplementationResult.FullDiffCharacters,
+            task.ImplementationResult.DisplayedDiffCharacters,
+            task.ImplementationResult.DiffTruncated,
+            task.ImplementationResult.CompletedAt,
+            task.ImplementationResult.Source == ImplementationSource.DeterministicFake,
+            task.ImplementationResult.FullDiffUtf8Bytes,
+            task.ImplementationResult.DisplayedDiffUtf8Bytes,
+            task.ImplementationResult.ActiveCheckoutVerified);
+        var implementationRuntime = runtimeStatus is null ? null : new ImplementationRuntimeResponse(
+            runtimeStatus.WorkspaceAvailable,
+            runtimeStatus.ActiveCheckoutVerified,
+            runtimeStatus.Disposition,
+            runtimeStatus.SafeMessage);
 
         return new EngineeringTaskResponse(
             task.Id,
-            task.Repository,
+            EngineeringTaskSummaryResponse.SafeRepositoryDisplayName(task.Repository),
             task.OriginalRequirement,
             task.CurrentClarifiedRequirement,
             task.ClarificationAnswers.Select(answer => new ClarificationAnswerResponse(
@@ -227,6 +342,12 @@ public sealed record EngineeringTaskResponse(
             task.RepositoryAnalyzedAt,
             task.RepositoryFingerprint,
             task.PlanCreatedAt,
+            implementationWorkspace,
+            implementationResult,
+            implementationFailure,
+            task.ImplementationStartedAt,
+            task.ImplementationCompletedAt,
+            implementationRuntime,
             telemetry);
     }
 }

@@ -10,9 +10,10 @@ import { TaskHistory } from './TaskHistory'
 import { TaskSelectionCoordinator, newTaskUrl, parseTaskSelection, taskUrl } from './taskNavigation'
 import type { EngineeringTask, EngineeringTaskSummary, SystemCapabilities, WorkflowStatus } from './types'
 import './App.css'
+import './implementation.css'
 
-const stages = ['Understand', 'Clarify', 'Confirm', 'Plan', 'Implement', 'Validate', 'Review', 'Pull Request']
-const stageByStatus: Record<WorkflowStatus, number> = { Draft: 0, Clarifying: 1, RequirementSummaryReady: 2, AwaitingRequirementApproval: 2, ReadyForPlanning: 3, Planning: 3, AwaitingPlanApproval: 3, PlanApproved: 3, Implementing: 4, Validating: 5, Reviewing: 6, Completed: 7, Failed: 0 }
+const stages = ['Understand', 'Clarify', 'Confirm', 'Plan', 'Implement', 'Diff review', 'Validate', 'Review', 'Pull Request']
+const stageByStatus: Record<WorkflowStatus, number> = { Draft: 0, Clarifying: 1, RequirementSummaryReady: 2, AwaitingRequirementApproval: 2, ReadyForPlanning: 3, Planning: 3, AwaitingPlanApproval: 3, PlanApproved: 3, Implementing: 4, AwaitingImplementationReview: 5, Validating: 6, Reviewing: 7, Completed: 8, Failed: 0 }
 
 function App() {
   const [repository, setRepository] = useState('')
@@ -38,6 +39,7 @@ function App() {
   const [error, setError] = useState<string | null>(null)
   const [exportingPdf, setExportingPdf] = useState<'task' | 'plan' | null>(null)
   const [pdfExportError, setPdfExportError] = useState<string | null>(null)
+  const [implementationInFlight, setImplementationInFlight] = useState(false)
   const [copyState, setCopyState] = useState<RequirementCopyState>('idle')
   const [copyError, setCopyError] = useState<string | null>(null)
   const [historyPanelOpen, setHistoryPanelOpen] = useState(false)
@@ -93,6 +95,7 @@ function App() {
     setCopyState('idle')
     setCopyError(null)
     setPlanRevisionInFlight(false)
+    setImplementationInFlight(false)
   }
 
   function captureTaskSelection(taskId: string) {
@@ -333,8 +336,34 @@ function App() {
     }
   }
   function approvePlan() { if (task) void runTaskAction(task.id, () => forgeApi.approvePlan(task.id)) }
+  async function generateImplementation() {
+    if (!task || (task.status !== 'PlanApproved' && task.status !== 'Implementing')) return
+    const token = captureTaskSelection(task.id)
+    if (!token) return
+    setBusy(true); setImplementationInFlight(true); setError(null)
+    try {
+      const implemented = await forgeApi.generateImplementation(task.id)
+      if (!selectionCoordinator.current.matches(token)) return
+      setTask(implemented)
+    } catch (caught) {
+      if (!selectionCoordinator.current.matches(token)) return
+      try {
+        const refreshed = await forgeApi.getTask(task.id)
+        if (!selectionCoordinator.current.matches(token)) return
+        setTask(refreshed)
+      } catch { /* Preserve the safe endpoint error below. */ }
+      if (!selectionCoordinator.current.matches(token)) return
+      setError(caught instanceof Error ? caught.message : 'Implementation generation could not be completed.')
+    } finally {
+      if (selectionCoordinator.current.matches(token)) {
+        setBusy(false)
+        setImplementationInFlight(false)
+      }
+    }
+  }
   async function exportPdf(documentType: 'task' | 'plan') {
-    if (!task || exportingPdf || (documentType === 'task' && task.status !== 'PlanApproved')) return
+    const approvedPlanState = task?.implementationPlan && task.planApprovedAt
+    if (!task || exportingPdf || (documentType === 'task' && !approvedPlanState)) return
     const token = captureTaskSelection(task.id)
     if (!token) return
     const downloader = documentType === 'task' ? pdfDownloader : planPdfDownloader
@@ -380,6 +409,18 @@ function App() {
   const telemetry = task?.telemetry ?? { totalCalls: 0, totalInputTokens: 0, totalCachedInputTokens: 0, totalOutputTokens: 0, totalEstimatedCostUsd: 0, costUnavailableCallCount: 0, isPartialEstimate: false, calls: [] }
   const clarificationCalls = telemetry.calls.filter(call => call.stage === 'Clarification')
   const planningCalls = telemetry.calls.filter(call => call.stage === 'Planning')
+  const implementationCalls = telemetry.calls.filter(call => call.stage === 'Implementation')
+  const implementationDisposition = task?.implementationRuntime?.disposition ?? (task?.lastImplementationFailure?.recoveryRequired
+    ? 'RecoveryRequired'
+    : task?.lastImplementationFailure?.safeToResume ? 'SafeResume' : 'Interrupted')
+  const implementationIsActive = task?.status === 'Implementing' && implementationDisposition === 'Active'
+  const implementationCanResume = task?.status === 'Implementing' && implementationDisposition === 'SafeResume'
+  const activeCheckoutVerified = task?.implementationRuntime?.activeCheckoutVerified
+    ?? task?.implementationResult?.activeCheckoutVerified
+    ?? task?.lastImplementationFailure?.activeCheckoutVerified
+    ?? false
+  const hasApprovedPlan = Boolean(task?.implementationPlan && task.planApprovedAt)
+  const approvedPlanControlsRenderedInState = task ? ['PlanApproved', 'Implementing', 'AwaitingImplementationReview'].includes(task.status) : false
   const planningCost = planningCalls.reduce((total, call) => total + (call.estimatedCostUsd ?? 0), 0)
   const latestFailedPlanningCall = [...planningCalls].reverse().find(call => !call.succeeded)
   const planningRecovery = getPlanningRecovery(latestFailedPlanningCall?.failureCategory ?? null, planningSnapshotStale)
@@ -483,14 +524,29 @@ function App() {
             {!planCorrectionMode ? <div className="approval-row"><p><strong>Explicit plan approval required</strong><br />Approve this plan or request one focused correction.</p><div className="approval-actions"><button className="secondary-button" onClick={() => void analyzeAndPlan()} disabled={busy}>Re-analyze repository</button><button className="secondary-button" onClick={() => setPlanCorrectionMode(true)} disabled={busy}>Request plan correction</button><button className="primary-button compact" onClick={approvePlan} disabled={busy}>Approve plan <span>→</span></button></div></div>
               : <form className="correction-form plan-correction-form" onSubmit={submitPlanCorrection}><div><strong>Request one focused plan correction</strong><p>Forge will reuse the fresh snapshot, refresh only relevant evidence, preserve this plan in history, and make exactly one planning request.</p></div><label><span>PLAN CORRECTION</span><textarea autoFocus value={planCorrection} onChange={event => setPlanCorrection(event.target.value)} placeholder="State the specific gap to correct without restating the full requirement…" rows={5} maxLength={5000} required /><small>{planCorrection.length.toLocaleString()} / 5,000</small></label>{planRevisionInFlight && <div className="revision-progress" aria-live="polite"><span>Checking saved snapshot</span><span>Refreshing targeted evidence</span><span>Generating revised plan</span></div>}<div className="approval-actions"><button type="button" className="secondary-button" onClick={() => { setPlanCorrectionMode(false); setPlanCorrection('') }} disabled={busy}>Cancel</button><button className="primary-button compact" disabled={busy || !planCorrection.trim()}>{planRevisionInFlight ? <><span className="spinner" />Revising plan…</> : 'Submit correction'}</button></div></form>}
           </div>}
-          {task?.status === 'PlanApproved' && <div className="ready-view"><div className="success-seal">✓</div><p className="eyebrow">PLAN APPROVED</p><h2>Your plan and task report are ready.</h2><p>The approved plan PDF contains the implementation plan. The separate task report contains the requirement, clarification history, and complete model-call cost provenance.</p><div className="export-actions"><button className="primary-button compact" onClick={() => void exportPdf('plan')} disabled={exportingPdf !== null}>{exportingPdf === 'plan' ? <><span className="spinner" />Generating plan…</> : 'Download approved plan'}</button><button className="secondary-button" onClick={() => void exportPdf('task')} disabled={exportingPdf !== null}>{exportingPdf === 'task' ? 'Generating task report…' : 'Download task report PDF'}</button></div>{pdfExportError && <p className="export-error" role="alert">{pdfExportError}</p>}</div>}
+          {task?.status === 'PlanApproved' && <div className="ready-view"><div className="success-seal">✓</div><p className="eyebrow">PLAN APPROVED</p><h2>Generate an isolated implementation for diff review.</h2><p>Forge will require a clean Git repository at the approved HEAD, create a task branch and linked worktree outside the active checkout, then apply deterministic Fake changes only in that worktree.</p><div className="coming-next"><span>05</span><div><strong>Safe Fake implementation</strong><p>No validation, staging, commit, push or pull request action will run.</p></div>{capabilities?.implementationConfigured ? <button className="primary-button compact" onClick={() => void generateImplementation()} disabled={busy}>{implementationInFlight ? <><span className="spinner" />Generating…</> : <>Generate implementation <span>→</span></>}</button> : <p className="truth-note" role="status">Implementation generation is currently available only when Forge is configured in deterministic Fake mode.</p>}</div><div className="export-actions"><button className="secondary-button" onClick={() => void exportPdf('plan')} disabled={exportingPdf !== null}>{exportingPdf === 'plan' ? 'Generating plan…' : 'Download approved plan'}</button><button className="secondary-button" onClick={() => void exportPdf('task')} disabled={exportingPdf !== null}>{exportingPdf === 'task' ? 'Generating task report…' : 'Download task report PDF'}</button></div>{pdfExportError && <p className="export-error" role="alert">{pdfExportError}</p>}</div>}
+          {implementationIsActive && <div className="implementation-progress" role="status"><span className="spinner dark" /><p className="eyebrow">ISOLATED IMPLEMENTATION</p><h2>Preparing generated changes for diff review</h2><p>Forge holds a valid implementation lease and is working only in the persisted task worktree.</p></div>}
+          {task?.status === 'Implementing' && !implementationIsActive && <div className="planning-failure implementation-failure"><div className="failure-seal">!</div><p className="eyebrow">IMPLEMENTATION ATTEMPT IS NOT ACTIVE</p><h2>{implementationCanResume ? 'The isolated workspace can be safely resumed' : implementationDisposition === 'TerminalIncompatible' ? 'The approved plan is not compatible with Fake implementation' : 'Workspace recovery is required'}</h2><p>{task.implementationRuntime?.safeMessage ?? task.lastImplementationFailure?.message ?? 'The previous implementation attempt was interrupted.'}</p><small>{implementationCanResume ? 'Forge will verify the matching untouched workspace before it resumes.' : 'Forge will not reset, delete, or overwrite this workspace automatically.'}</small>{implementationCanResume && <button className="primary-button compact" onClick={() => void generateImplementation()} disabled={busy}>Resume implementation <span>→</span></button>}<div className="export-actions"><button className="secondary-button" onClick={() => void exportPdf('plan')} disabled={exportingPdf !== null}>Download approved plan</button><button className="secondary-button" onClick={() => void exportPdf('task')} disabled={exportingPdf !== null}>Download task report PDF</button></div></div>}
+          {task?.status === 'AwaitingImplementationReview' && task.implementationResult && <div className="implementation-review">
+            <div className="action-title"><span className="title-icon">06</span><div><h2>Review the isolated generated changes</h2><p>No validation commands were run and no change was staged, committed, pushed, or proposed as a pull request.</p></div></div>
+            <span className="fake-label">Deterministic Fake implementation · MECHANICAL WORKFLOW DEMONSTRATION</span>
+            {!activeCheckoutVerified && <div className="diff-truncation-banner" role="alert"><strong>Active-checkout postcondition is uncertain.</strong><p>Forge could not verify that the active checkout remained unchanged. Explicit recovery is required before relying on this review.</p></div>}
+            <div className="implementation-truth"><p><strong>Validation commands were not run.</strong></p><p><strong>{activeCheckoutVerified ? 'The active checkout was verified unchanged.' : 'The active checkout could not be verified unchanged.'}</strong></p><p>Workspace: {task.implementationRuntime?.workspaceAvailable ? 'available' : 'unavailable; persisted review remains readable'}</p></div>
+            <section className="plan-section implementation-metadata"><small>IMPLEMENTATION METADATA</small><dl><div><dt>Base commit</dt><dd><code>{task.implementationResult.baseCommitSha}</code></dd></div><div><dt>Generated branch</dt><dd><code>{task.implementationResult.branch}</code></dd></div><div><dt>Source</dt><dd>Deterministic Fake implementation</dd></div></dl></section>
+            <section className="plan-section"><small>SUMMARY</small><p>{task.implementationResult.summary}</p></section>
+            <section className="plan-section"><small>WARNINGS</small><ul>{task.implementationResult.warnings.map(warning => <li key={warning}>{warning}</li>)}</ul></section>
+            {task.implementationResult.diffTruncated && <div className="diff-truncation-banner" role="status"><strong>Displayed diff is incomplete.</strong><p>{task.implementationResult.displayedDiffCharacters.toLocaleString()} of {task.implementationResult.fullDiffCharacters.toLocaleString()} diff characters are persisted for display. File hashes and line counts are complete.</p></div>}
+            <section className="plan-section changed-files"><small>CHANGED FILES</small>{task.implementationResult.changedFiles.map(file => <details className="changed-file-review" key={file.path}><summary><code>{file.path}</code><span>{file.action}</span><b className="diff-counts">+{file.additions} −{file.deletions}</b></summary><div className="changed-file-metadata"><span>{file.originalLines} → {file.newLines} lines</span><span>{file.originalBytes.toLocaleString()} → {file.newBytes.toLocaleString()} bytes</span></div>{file.diffTruncated && <div className="diff-truncation-banner compact"><strong>This file diff is truncated.</strong><span>{file.displayedDiffCharacters.toLocaleString()} of {file.fullDiffCharacters.toLocaleString()} characters displayed.</span></div>}<pre className="unified-diff" tabIndex={0} aria-label={`Unified diff for ${file.path}`}>{file.diffPreview}</pre></details>)}</section>
+            <div className="export-actions"><button className="secondary-button" onClick={() => void exportPdf('plan')} disabled={exportingPdf !== null}>Download approved plan</button><button className="secondary-button" onClick={() => void exportPdf('task')} disabled={exportingPdf !== null}>Download task report PDF</button></div>{pdfExportError && <p className="export-error" role="alert">{pdfExportError}</p>}
+          </div>}
+          {task && hasApprovedPlan && !approvedPlanControlsRenderedInState && <div className="semantic-plan-actions"><div><strong>Approved plan documents</strong><p>The persisted plan approval remains valid in this later workflow state.</p></div><div className="export-actions"><button className="secondary-button" onClick={() => void exportPdf('plan')} disabled={exportingPdf !== null}>Download approved plan</button><button className="secondary-button" onClick={() => void exportPdf('task')} disabled={exportingPdf !== null}>Download task report PDF</button></div></div>}
           {task && task.evidenceItems.length > 0 && <section className="evidence-view"><div className="evidence-heading"><div><p className="eyebrow">SELECTED REPOSITORY EVIDENCE</p><h3>{task.evidenceFilesSelected} files · {task.totalEvidenceCharacters.toLocaleString()} characters</h3></div><span>{task.evidenceFilesInspected} eligible files inspected</span></div>{task.evidenceItems.map(item => <details className="evidence-item" key={item.id}><summary><b>{item.id}</b><code>{item.relativePath}:{item.startLine}-{item.endLine}</code><span>score {item.score}</span></summary><p>{item.reasonSelected}</p><pre>{item.excerpt}</pre></details>)}</section>}
         </section>
         <aside className="context-column">
           <section className="context-card"><div className="aside-title"><span>Repository context</span><i>{task?.repositorySnapshot ? 'READ-ONLY SNAPSHOT' : task ? 'IDENTIFIER ONLY' : 'WAITING'}</i></div>{task ? <><code>{task.repository}</code>{task.repositorySnapshot ? <div className="repository-map"><dl><div><dt>Branch</dt><dd>{task.repositorySnapshot.branch ?? 'n/a'}</dd></div><div><dt>HEAD</dt><dd>{task.repositorySnapshot.shortHeadSha ?? 'n/a'}</dd></div><div><dt>State</dt><dd>{task.repositorySnapshot.workingTreeStatus}</dd></div><div><dt>Files</dt><dd>{task.repositorySnapshot.totalDiscoveredFiles}</dd></div><div><dt>Eligible</dt><dd>{task.repositorySnapshot.eligibleTextFileCount}</dd></div><div><dt>Excluded</dt><dd>{task.repositorySnapshot.excludedFileCount}</dd></div></dl><p><strong>Detected stack</strong><br />{task.repositorySnapshot.detectedLanguages.join(' · ') || 'No supported stack detected'}</p><p><strong>Projects/packages</strong><br />{task.repositorySnapshot.projectFiles.join(', ') || 'None detected'}</p><p><strong>Snapshot freshness</strong><br />{new Date(task.repositorySnapshot.analyzedAt).toLocaleString()}</p>{task.repositorySnapshot.warnings.map(warning => <p className="snapshot-warning" key={warning}>! {warning}</p>)}</div> : <p className="truth-note"><span>!</span> Files are not inspected until requirement approval.</p>}</> : <div className="empty-context"><span>⌘</span><p>Repository details appear after task creation.</p></div>}</section>
           <section className="context-card history-card"><div className="aside-title"><span>Clarification history</span><b>{answeredCount}</b></div>{task && answeredCount > 0 ? task.clarificationAnswers.map((item, index) => <details key={item.answeredAt} open={index === answeredCount - 1}><summary><span>{String(index + 1).padStart(2, '0')}</span>{item.question}</summary><p>{item.answer}</p></details>) : <div className="empty-context compact"><p>Answers are preserved here.</p></div>}</section>
           {task && task.requirementRevisionNotes.length > 0 && <section className="context-card history-card"><div className="aside-title"><span>Summary revisions</span><b>{task.requirementRevisionNotes.length}</b></div>{task.requirementRevisionNotes.map((revision, index) => <details key={revision.submittedAt}><summary><span>R{index + 1}</span>{revision.correction}</summary><p><strong>Previous summary</strong><br />{revision.previousSummary}</p></details>)}</section>}
-          <section className="telemetry-card expanded"><div><span>CLARIFICATION CALLS</span><strong>{clarificationCalls.length}</strong></div><div><span>PLANNING CALLS</span><strong>{planningCalls.length}</strong></div><div><span>INPUT TOKENS</span><strong>{formatTokens(telemetry.totalInputTokens)}</strong></div><div><span>OUTPUT TOKENS</span><strong>{formatTokens(telemetry.totalOutputTokens)}</strong></div><div><span>PLANNING EST. COST</span><strong>${planningCost.toFixed(6)}</strong></div><div><span>TOTAL EST. COST</span><strong>${telemetry.totalEstimatedCostUsd.toFixed(6)}{telemetry.isPartialEstimate ? ' partial' : ''}</strong></div><p><i />{providerLabel}</p>{telemetry.calls.length > 0 && <details className="call-history"><summary>Model call details</summary>{telemetry.calls.map(call => <article key={call.id}><strong>{call.stage} · {call.model}</strong><span className={call.succeeded ? 'call-success' : 'call-failure'}>{call.succeeded ? 'Succeeded' : 'Failed'}</span><small>Reasoning: {call.reasoningEffort} · In {call.inputTokens ?? 'unavailable'} ({call.cachedInputTokens ?? 'unavailable'} cached) · Out {call.outputTokens ?? 'unavailable'} · {call.estimatedCostUsd === null ? 'Cost unavailable' : `Est. $${call.estimatedCostUsd.toFixed(6)}`} · {call.pricingProvenance}</small></article>)}</details>}</section>
+          <section className="telemetry-card expanded"><div><span>CLARIFICATION CALLS</span><strong>{clarificationCalls.length}</strong></div><div><span>PLANNING CALLS</span><strong>{planningCalls.length}</strong></div><div><span>IMPLEMENTATION CALLS</span><strong>{implementationCalls.length}</strong></div><div><span>INPUT TOKENS</span><strong>{formatTokens(telemetry.totalInputTokens)}</strong></div><div><span>OUTPUT TOKENS</span><strong>{formatTokens(telemetry.totalOutputTokens)}</strong></div><div><span>PLANNING EST. COST</span><strong>${planningCost.toFixed(6)}</strong></div><div><span>TOTAL EST. COST</span><strong>${telemetry.totalEstimatedCostUsd.toFixed(6)}{telemetry.isPartialEstimate ? ' partial' : ''}</strong></div><p><i />{providerLabel}</p>{telemetry.calls.length > 0 && <details className="call-history"><summary>Model call details</summary>{telemetry.calls.map(call => <article key={call.id}><strong>{call.stage} · {call.model}</strong><span className={call.succeeded ? 'call-success' : 'call-failure'}>{call.succeeded ? 'Succeeded' : 'Failed'}</span><small>Reasoning: {call.reasoningEffort} · In {call.inputTokens ?? 'unavailable'} ({call.cachedInputTokens ?? 'unavailable'} cached) · Out {call.outputTokens ?? 'unavailable'} · {call.estimatedCostUsd === null ? 'Cost unavailable' : `Est. $${call.estimatedCostUsd.toFixed(6)}`} · {call.pricingProvenance}</small></article>)}</details>}</section>
         </aside>
       </div>
     </main>
