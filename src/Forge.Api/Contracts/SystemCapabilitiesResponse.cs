@@ -18,6 +18,8 @@ public sealed record SystemCapabilitiesResponse(
     bool RepositoryInspectionAvailable,
     bool PlanningAvailable,
     bool TargetModificationAvailable,
+    bool ImplementationApprovalAvailable,
+    bool ImplementationCorrectionAvailable,
     bool ValidationAvailable,
     bool ReviewAvailable,
     bool PullRequestCreationAvailable);

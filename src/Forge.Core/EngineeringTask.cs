@@ -6,6 +6,7 @@ public sealed class EngineeringTask
     private readonly List<RequirementRevisionNote> _requirementRevisionNotes = [];
     private readonly List<PlanRevisionNote> _planRevisionNotes = [];
     private readonly List<ModelCallRecord> _modelCalls = [];
+    private readonly List<ImplementationRevision> _implementationRevisions = [];
 
     private EngineeringTask() { }
 
@@ -17,6 +18,7 @@ public sealed class EngineeringTask
     public IReadOnlyList<RequirementRevisionNote> RequirementRevisionNotes => _requirementRevisionNotes;
     public IReadOnlyList<PlanRevisionNote> PlanRevisionNotes => _planRevisionNotes;
     public IReadOnlyList<ModelCallRecord> ModelCalls => _modelCalls;
+    public IReadOnlyList<ImplementationRevision> ImplementationRevisions => _implementationRevisions;
     public string? CurrentPendingQuestion { get; private set; }
     public string? RequirementSummary { get; private set; }
     public WorkflowStatus Status { get; private set; }
@@ -39,6 +41,8 @@ public sealed class EngineeringTask
     public DateTimeOffset? ImplementationStartedAt { get; private set; }
     public DateTimeOffset? ImplementationCompletedAt { get; private set; }
     public ImplementationLease? ImplementationLease { get; private set; }
+    public Guid? ActiveImplementationRevisionId { get; private set; }
+    public Guid? ApprovedImplementationRevisionId { get; private set; }
     public long RowVersion { get; private set; }
     public Guid? ExpectedImplementationLeaseIdForSave { get; private set; }
 
@@ -286,6 +290,17 @@ public sealed class EngineeringTask
         ImplementationStartedAt = now;
         ImplementationCompletedAt = null;
         ImplementationLease = lease;
+        var planFingerprint = ImplementationReviewFingerprint.ComputePlan(ImplementationPlan);
+        var revision = new ImplementationRevision(
+            Guid.NewGuid(), 1, ImplementationRevisionKind.Initial, null,
+            planFingerprint, workspace.BaseCommitSha,
+            null, null, null, lease.AttemptId, now, null,
+            ImplementationGenerationState.Generating, ImplementationReviewState.NotReviewable,
+            ImplementationWorkspace, null, null, null, lease, null, null);
+        _implementationRevisions.Clear();
+        _implementationRevisions.Add(revision);
+        ActiveImplementationRevisionId = revision.RevisionId;
+        ApprovedImplementationRevisionId = null;
         Status = WorkflowStatus.Implementing;
         UpdatedAt = now;
     }
@@ -310,6 +325,14 @@ public sealed class EngineeringTask
         ExpectedImplementationLeaseIdForSave = ImplementationLease?.LeaseId;
         ImplementationLease = replacementLease;
         LastImplementationFailure = null;
+        UpdateActiveRevision(revision => revision with
+        {
+            GenerationCommandId = replacementLease.AttemptId,
+            GenerationState = ImplementationGenerationState.Generating,
+            Workspace = ImplementationWorkspace,
+            Failure = null,
+            Lease = replacementLease
+        });
         UpdatedAt = now;
     }
 
@@ -325,6 +348,11 @@ public sealed class EngineeringTask
         var leaseDuration = TimeSpan.FromSeconds(ImplementationLease!.EffectiveDurationSeconds);
         if (leaseDuration <= TimeSpan.Zero) leaseDuration = TimeSpan.FromMinutes(5);
         ImplementationLease = ImplementationLease with { HeartbeatAt = now, ExpiresAt = now.Add(leaseDuration) };
+        UpdateActiveRevision(revision => revision with
+        {
+            Workspace = ImplementationWorkspace,
+            Lease = ImplementationLease
+        });
         UpdatedAt = now;
     }
 
@@ -355,6 +383,12 @@ public sealed class EngineeringTask
                 UpdatedAt = now
             };
         ImplementationLease = null;
+        UpdateActiveRevision(revision => revision with
+        {
+            Workspace = ImplementationWorkspace,
+            Failure = LastImplementationFailure,
+            Lease = null
+        });
         UpdatedAt = now;
     }
 
@@ -379,6 +413,23 @@ public sealed class EngineeringTask
         };
         ImplementationCompletedAt = now;
         ImplementationLease = null;
+        UpdateActiveRevision(revision =>
+        {
+            var fingerprint = ImplementationReviewFingerprint.ComputeResult(
+                Id, revision.RevisionId, revision.RevisionNumber, revision.Kind,
+                revision.PlanFingerprint, ImplementationResult);
+            return revision with
+            {
+                GenerationCompletedAt = now,
+                GenerationState = ImplementationGenerationState.Succeeded,
+                ReviewState = ImplementationReviewState.Current,
+                Workspace = ImplementationWorkspace,
+                Result = ImplementationResult,
+                ResultFingerprint = fingerprint,
+                Failure = null,
+                Lease = null
+            };
+        });
         Status = WorkflowStatus.AwaitingImplementationReview;
         UpdatedAt = now;
     }
@@ -398,7 +449,81 @@ public sealed class EngineeringTask
             Phase = ImplementationWorkspacePhase.RecoveryRequired,
             UpdatedAt = now
         };
+        UpdateActiveRevision(revision =>
+        {
+            var fingerprint = ImplementationReviewFingerprint.ComputeResult(
+                Id, revision.RevisionId, revision.RevisionNumber, revision.Kind,
+                revision.PlanFingerprint, ImplementationResult);
+            return revision with
+            {
+                Workspace = ImplementationWorkspace,
+                Result = ImplementationResult,
+                ResultFingerprint = fingerprint,
+                Failure = LastImplementationFailure
+            };
+        });
         UpdatedAt = now;
+    }
+
+    public bool ApproveImplementation(
+        Guid commandId,
+        long expectedRowVersion,
+        Guid expectedRevisionId,
+        string expectedResultFingerprint,
+        DateTimeOffset now)
+    {
+        if (commandId == Guid.Empty || expectedRevisionId == Guid.Empty || expectedRowVersion < 0)
+            throw new ArgumentException("A valid implementation approval request is required.");
+
+        var active = GetActiveRevision();
+        if (Status == WorkflowStatus.ImplementationApproved)
+        {
+            if (active is { ReviewState: ImplementationReviewState.Approved } &&
+                active.ApprovalCommandId == commandId &&
+                active.ApprovalExpectedRowVersion == expectedRowVersion &&
+                active.RevisionId == expectedRevisionId &&
+                string.Equals(active.ResultFingerprint, expectedResultFingerprint, StringComparison.Ordinal))
+                return false;
+            throw new WorkflowException("The implementation is already approved and cannot accept another approval command.");
+        }
+
+        EnsureStatus(WorkflowStatus.AwaitingImplementationReview);
+        if (RowVersion != expectedRowVersion)
+            throw new TaskConcurrencyException("The task changed after this implementation review was loaded. Reload it before approving.");
+        if (active is null || active.RevisionId != expectedRevisionId)
+            throw new TaskConcurrencyException("The implementation revision changed after this review was loaded. Reload it before approving.");
+        if (!string.Equals(active.ResultFingerprint, expectedResultFingerprint, StringComparison.Ordinal))
+            throw new TaskConcurrencyException("The implementation review changed after it was loaded. Reload it before approving.");
+        if (ImplementationPlan is null || active.Result is null ||
+            active.GenerationState != ImplementationGenerationState.Succeeded ||
+            active.ReviewState != ImplementationReviewState.Current)
+            throw new ImplementationException("implementation_review_incomplete",
+                "The current implementation review is incomplete and cannot be approved.");
+        if (!active.Result.ActiveCheckoutVerified)
+            throw new ImplementationException("implementation_review_ineligible",
+                "The implementation review cannot be approved because Forge could not verify that the active checkout remained unchanged.");
+        var planFingerprint = ImplementationReviewFingerprint.ComputePlan(ImplementationPlan);
+        var resultFingerprint = ImplementationReviewFingerprint.ComputeResult(
+            Id, active.RevisionId, active.RevisionNumber, active.Kind, planFingerprint, active.Result);
+        if (!string.Equals(active.PlanFingerprint, planFingerprint, StringComparison.Ordinal) ||
+            !string.Equals(active.BaseCommitSha, active.Result.BaseCommitSha, StringComparison.Ordinal) ||
+            RepositorySnapshot?.FullHeadSha is null ||
+            !string.Equals(active.BaseCommitSha, RepositorySnapshot.FullHeadSha, StringComparison.Ordinal) ||
+            !string.Equals(active.ResultFingerprint, resultFingerprint, StringComparison.Ordinal))
+            throw new ImplementationException("implementation_review_incomplete",
+                "The current implementation review is incomplete and cannot be approved.");
+
+        UpdateActiveRevision(revision => revision with
+        {
+            ReviewState = ImplementationReviewState.Approved,
+            ApprovedAt = now,
+            ApprovalCommandId = commandId,
+            ApprovalExpectedRowVersion = expectedRowVersion
+        });
+        ApprovedImplementationRevisionId = active.RevisionId;
+        Status = WorkflowStatus.ImplementationApproved;
+        UpdatedAt = now;
+        return true;
     }
 
     public void RequestPlanRevision(string correction, DateTimeOffset now)
@@ -510,7 +635,10 @@ public sealed class EngineeringTask
         DateTimeOffset? implementationStartedAt = null,
         DateTimeOffset? implementationCompletedAt = null,
         ImplementationLease? implementationLease = null,
-        long rowVersion = 0)
+        long rowVersion = 0,
+        IEnumerable<ImplementationRevision>? implementationRevisions = null,
+        Guid? activeImplementationRevisionId = null,
+        Guid? approvedImplementationRevisionId = null)
     {
         var task = new EngineeringTask
         {
@@ -542,12 +670,17 @@ public sealed class EngineeringTask
             ImplementationStartedAt = implementationStartedAt,
             ImplementationCompletedAt = implementationCompletedAt,
             ImplementationLease = implementationLease,
+            ActiveImplementationRevisionId = activeImplementationRevisionId,
+            ApprovedImplementationRevisionId = approvedImplementationRevisionId,
             RowVersion = rowVersion
         };
         task._clarificationAnswers.AddRange(answers);
         task._requirementRevisionNotes.AddRange(revisionNotes);
         task._planRevisionNotes.AddRange(planRevisionNotes ?? []);
         task._modelCalls.AddRange(modelCalls);
+        task._implementationRevisions.AddRange(implementationRevisions ?? []);
+        if (task._implementationRevisions.Count == 0)
+            task.SynthesizeLegacyInitialRevision();
         return task;
     }
 
@@ -568,6 +701,48 @@ public sealed class EngineeringTask
         if (!allowExpired && !ImplementationLease.IsActive(now))
             throw new ImplementationException("implementation_lease_expired",
                 "The implementation lease expired before this operation could continue.");
+    }
+
+    private ImplementationRevision? GetActiveRevision() => ActiveImplementationRevisionId is { } id
+        ? _implementationRevisions.SingleOrDefault(revision => revision.RevisionId == id)
+        : null;
+
+    private void UpdateActiveRevision(Func<ImplementationRevision, ImplementationRevision> update)
+    {
+        var id = ActiveImplementationRevisionId ??
+            throw new WorkflowException("An active implementation revision is required.");
+        var index = _implementationRevisions.FindIndex(revision => revision.RevisionId == id);
+        if (index < 0) throw new WorkflowException("The active implementation revision is missing.");
+        _implementationRevisions[index] = update(_implementationRevisions[index]);
+    }
+
+    private void SynthesizeLegacyInitialRevision()
+    {
+        if (ImplementationPlan is null || ImplementationWorkspace is null ||
+            Status is not (WorkflowStatus.Implementing or WorkflowStatus.AwaitingImplementationReview)) return;
+
+        var planFingerprint = ImplementationReviewFingerprint.ComputePlan(ImplementationPlan);
+        var stableSeed = ImplementationResult is null
+            ? $"{planFingerprint}:{ImplementationWorkspace.BaseCommitSha}:{ImplementationStartedAt:O}"
+            : ImplementationReviewFingerprint.ComputeResult(
+                Id, Guid.Empty, 1, ImplementationRevisionKind.Initial, planFingerprint, ImplementationResult);
+        var revisionId = ImplementationReviewFingerprint.CreateLegacyRevisionId(Id, stableSeed);
+        var resultFingerprint = ImplementationResult is null ? null : ImplementationReviewFingerprint.ComputeResult(
+            Id, revisionId, 1, ImplementationRevisionKind.Initial, planFingerprint, ImplementationResult);
+        var generationCommandId = ImplementationLease?.AttemptId ??
+            ImplementationReviewFingerprint.CreateLegacyRevisionId(Id, $"generation:{stableSeed}");
+        _implementationRevisions.Add(new ImplementationRevision(
+            revisionId, 1, ImplementationRevisionKind.Initial, null,
+            planFingerprint, ImplementationWorkspace.BaseCommitSha,
+            null, null, null, generationCommandId,
+            ImplementationStartedAt ?? ImplementationWorkspace.CreatedAt,
+            ImplementationResult?.CompletedAt,
+            ImplementationResult is null ? ImplementationGenerationState.Generating : ImplementationGenerationState.Succeeded,
+            ImplementationResult is null ? ImplementationReviewState.NotReviewable : ImplementationReviewState.Current,
+            ImplementationWorkspace, ImplementationResult, resultFingerprint,
+            LastImplementationFailure, ImplementationLease, null, null));
+        ActiveImplementationRevisionId = revisionId;
+        ApprovedImplementationRevisionId = null;
     }
 
     private static void EnsureValidLease(ImplementationLease lease)

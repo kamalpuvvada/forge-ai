@@ -69,6 +69,7 @@ public sealed class ImplementationPlanPdfExporterTests
     [Theory]
     [InlineData(WorkflowStatus.Implementing)]
     [InlineData(WorkflowStatus.AwaitingImplementationReview)]
+    [InlineData(WorkflowStatus.ImplementationApproved)]
     [InlineData(WorkflowStatus.Validating)]
     [InlineData(WorkflowStatus.Reviewing)]
     [InlineData(WorkflowStatus.Completed)]

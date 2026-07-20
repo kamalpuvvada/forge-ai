@@ -14,3 +14,9 @@ public sealed record RequestRequirementRevisionRequest(
 
 public sealed record RequestPlanRevisionRequest(
     [Required, StringLength(5000)] string Correction);
+
+public sealed record ApproveImplementationRequest(
+    Guid CommandId,
+    [Range(0, long.MaxValue - 1)] long ExpectedRowVersion,
+    Guid ExpectedRevisionId,
+    [Required, RegularExpression("^[0-9a-f]{64}$")] string ExpectedResultFingerprint);

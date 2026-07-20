@@ -29,6 +29,9 @@ public enum ImplementationWorkspacePhase
 
 public sealed class ImplementationLimits
 {
+    public int MaximumImplementationRevisions { get; set; } = 6;
+    public int MaximumPersistedImplementationRevisionJsonCharacters { get; set; } = 2_000_000;
+    public int MaximumPersistedImplementationRevisionJsonBytes { get; set; } = 4_000_000;
     public int MaximumApprovedOperations { get; set; } = 10;
     public int MaximumCurrentFileCharacters { get; set; } = 100_000;
     public int MaximumTotalCurrentCharacters { get; set; } = 300_000;
@@ -179,10 +182,56 @@ public sealed record ImplementationResult(
     DateTimeOffset CompletedAt,
     int FullDiffUtf8Bytes = 0,
     int DisplayedDiffUtf8Bytes = 0,
-    bool ActiveCheckoutVerified = true,
+    bool ActiveCheckoutVerified = false,
     string WorktreeFingerprint = "",
     int WorktreeFileCount = 0,
     long WorktreeBytes = 0);
+
+public enum ImplementationRevisionKind
+{
+    Initial,
+    Correction
+}
+
+public enum ImplementationGenerationState
+{
+    Requested,
+    Generating,
+    Succeeded,
+    Failed
+}
+
+public enum ImplementationReviewState
+{
+    NotReviewable,
+    Current,
+    Superseded,
+    Approved
+}
+
+public sealed record ImplementationRevision(
+    Guid RevisionId,
+    int RevisionNumber,
+    ImplementationRevisionKind Kind,
+    Guid? PreviousRevisionId,
+    string PlanFingerprint,
+    string BaseCommitSha,
+    string? CorrectionInstruction,
+    DateTimeOffset? CorrectionSubmittedAt,
+    Guid? CorrectionCommandId,
+    Guid GenerationCommandId,
+    DateTimeOffset GenerationStartedAt,
+    DateTimeOffset? GenerationCompletedAt,
+    ImplementationGenerationState GenerationState,
+    ImplementationReviewState ReviewState,
+    ImplementationWorkspace? Workspace,
+    ImplementationResult? Result,
+    string? ResultFingerprint,
+    ImplementationFailure? Failure,
+    ImplementationLease? Lease,
+    DateTimeOffset? ApprovedAt,
+    Guid? ApprovalCommandId,
+    long? ApprovalExpectedRowVersion = null);
 
 public sealed record ActiveCheckoutSignature(
     string Branch,

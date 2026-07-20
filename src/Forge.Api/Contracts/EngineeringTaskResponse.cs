@@ -100,7 +100,6 @@ public sealed record ImplementationPlanResponse(
     DateTimeOffset CreatedAt, string RepositoryFingerprint);
 
 public sealed record ImplementationWorkspaceResponse(
-    string Token,
     string Branch,
     string BaseCommitSha,
     ImplementationWorkspacePhase Phase,
@@ -157,6 +156,26 @@ public sealed record ImplementationResultResponse(
     int DisplayedDiffUtf8Bytes,
     bool ActiveCheckoutVerified);
 
+public sealed record ImplementationRevisionResponse(
+    Guid RevisionId,
+    int RevisionNumber,
+    ImplementationRevisionKind Kind,
+    Guid? PreviousRevisionId,
+    string PlanFingerprint,
+    string BaseCommitSha,
+    DateTimeOffset GenerationStartedAt,
+    DateTimeOffset? GenerationCompletedAt,
+    ImplementationGenerationState GenerationState,
+    ImplementationReviewState ReviewState,
+    string? FailureCategory,
+    string? FailureMessage,
+    string? ResultFingerprint,
+    int ChangedFileCount,
+    DateTimeOffset? CorrectionSubmittedAt,
+    DateTimeOffset? ApprovedAt,
+    bool IsCurrent,
+    bool IsApproved);
+
 public sealed record EngineeringTaskResponse(
     Guid Id,
     string Repository,
@@ -187,6 +206,10 @@ public sealed record EngineeringTaskResponse(
     DateTimeOffset? ImplementationStartedAt,
     DateTimeOffset? ImplementationCompletedAt,
     ImplementationRuntimeResponse? ImplementationRuntime,
+    long RowVersion,
+    Guid? ActiveImplementationRevisionId,
+    Guid? ApprovedImplementationRevisionId,
+    IReadOnlyList<ImplementationRevisionResponse> ImplementationRevisions,
     ModelTelemetryResponse Telemetry)
 {
     public static EngineeringTaskResponse FromDomain(
@@ -259,8 +282,7 @@ public sealed record EngineeringTaskResponse(
             task.ImplementationPlan.CreatedAt,
             task.ImplementationPlan.RepositoryFingerprint);
         var implementationWorkspace = task.ImplementationWorkspace is null ? null : new ImplementationWorkspaceResponse(
-            task.ImplementationWorkspace.Token,
-            task.ImplementationWorkspace.Branch,
+            ImplementationBranchDisplay.Format(task.ImplementationWorkspace.Branch),
             task.ImplementationWorkspace.BaseCommitSha,
             task.ImplementationWorkspace.Phase,
             task.ImplementationWorkspace.CreatedAt,
@@ -277,7 +299,7 @@ public sealed record EngineeringTaskResponse(
             task.ImplementationResult.Source,
             task.ImplementationResult.Model is null ? null : SafeImplementationText(task.ImplementationResult.Model, "unavailable"),
             task.ImplementationResult.BaseCommitSha,
-            task.ImplementationResult.Branch,
+            ImplementationBranchDisplay.Format(task.ImplementationResult.Branch),
             SafeImplementationText(task.ImplementationResult.Summary, "Implementation summary unavailable."),
             task.ImplementationResult.Warnings.Select(warning =>
                 SafeImplementationText(warning, "Implementation warning removed.")).ToArray(),
@@ -301,6 +323,27 @@ public sealed record EngineeringTaskResponse(
             runtimeStatus.Disposition,
             runtimeStatus.SafeMessage is null ? null : SafeImplementationText(runtimeStatus.SafeMessage,
                 "Implementation runtime details are unavailable."));
+        var implementationRevisions = task.ImplementationRevisions.Select(revision =>
+            new ImplementationRevisionResponse(
+                revision.RevisionId,
+                revision.RevisionNumber,
+                revision.Kind,
+                revision.PreviousRevisionId,
+                revision.PlanFingerprint,
+                revision.BaseCommitSha,
+                revision.GenerationStartedAt,
+                revision.GenerationCompletedAt,
+                revision.GenerationState,
+                revision.ReviewState,
+                revision.Failure is null ? null : SafeImplementationText(revision.Failure.Category, "implementation_failure"),
+                revision.Failure is null ? null : SafeImplementationText(revision.Failure.Message,
+                    "Implementation generation failed safely."),
+                revision.ResultFingerprint,
+                revision.Result?.ChangedFiles.Count ?? 0,
+                revision.CorrectionSubmittedAt,
+                revision.ApprovedAt,
+                task.ActiveImplementationRevisionId == revision.RevisionId,
+                task.ApprovedImplementationRevisionId == revision.RevisionId)).ToArray();
 
         return new EngineeringTaskResponse(
             task.Id,
@@ -342,6 +385,10 @@ public sealed record EngineeringTaskResponse(
             task.ImplementationStartedAt,
             task.ImplementationCompletedAt,
             implementationRuntime,
+            task.RowVersion,
+            task.ActiveImplementationRevisionId,
+            task.ApprovedImplementationRevisionId,
+            implementationRevisions,
             telemetry);
     }
 

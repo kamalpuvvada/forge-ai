@@ -48,7 +48,20 @@ public sealed class SqliteDatabaseInitializer(string connectionString)
                 ImplementationStartedAt TEXT NULL,
                 ImplementationCompletedAt TEXT NULL,
                 ImplementationLease TEXT NULL,
+                ImplementationRevisions TEXT NOT NULL DEFAULT '[]',
+                ActiveImplementationRevisionId TEXT NULL,
+                ApprovedImplementationRevisionId TEXT NULL,
                 RowVersion INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS ImplementationApprovalCommands (
+                CommandId TEXT PRIMARY KEY NOT NULL CHECK(length(CommandId) = 36),
+                TaskId TEXT NOT NULL CHECK(length(TaskId) = 36),
+                ExpectedRowVersion INTEGER NOT NULL CHECK(ExpectedRowVersion >= 0),
+                RevisionId TEXT NOT NULL CHECK(length(RevisionId) = 36),
+                ResultFingerprint TEXT NOT NULL CHECK(length(ResultFingerprint) = 64),
+                ApprovedRowVersion INTEGER NULL CHECK(ApprovedRowVersion >= 1),
+                ApprovalTimestamp TEXT NULL,
+                CHECK((ApprovedRowVersion IS NULL) = (ApprovalTimestamp IS NULL))
             );
             """;
         await command.ExecuteNonQueryAsync(cancellationToken);
@@ -70,6 +83,9 @@ public sealed class SqliteDatabaseInitializer(string connectionString)
         await EnsureColumnAsync(connection, "ImplementationStartedAt", "TEXT NULL", cancellationToken);
         await EnsureColumnAsync(connection, "ImplementationCompletedAt", "TEXT NULL", cancellationToken);
         await EnsureColumnAsync(connection, "ImplementationLease", "TEXT NULL", cancellationToken);
+        await EnsureColumnAsync(connection, "ImplementationRevisions", "TEXT NOT NULL DEFAULT '[]'", cancellationToken);
+        await EnsureColumnAsync(connection, "ActiveImplementationRevisionId", "TEXT NULL", cancellationToken);
+        await EnsureColumnAsync(connection, "ApprovedImplementationRevisionId", "TEXT NULL", cancellationToken);
         await EnsureColumnAsync(connection, "RowVersion", "INTEGER NOT NULL DEFAULT 0", cancellationToken);
         await EnsureIndexAsync(connection, cancellationToken);
     }

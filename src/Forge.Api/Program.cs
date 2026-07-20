@@ -28,7 +28,6 @@ var workspaceOptions = builder.Configuration.GetSection("Forge:Implementation").
 if (!Path.IsPathFullyQualified(workspaceOptions.WorktreeRoot))
     workspaceOptions.WorktreeRoot = Path.GetFullPath(workspaceOptions.WorktreeRoot, builder.Environment.ContentRootPath);
 var gitProcessOptions = builder.Configuration.GetSection("Forge:Implementation:Git").Get<GitProcessOptions>() ?? new GitProcessOptions();
-gitProcessOptions.ExecutablePath = GitExecutableResolver.Resolve(gitProcessOptions.ExecutablePath);
 gitProcessOptions.OwnedRoot = workspaceOptions.WorktreeRoot;
 gitProcessOptions.HooksDirectory = Path.Combine(workspaceOptions.WorktreeRoot, ".empty-hooks");
 gitProcessOptions.SafeHomeDirectory = Path.Combine(workspaceOptions.WorktreeRoot, ".git-home");
@@ -69,15 +68,21 @@ builder.Services.AddSingleton<IPlanningEngine>(services => aiOptions.Mode switch
 });
 if (string.Equals(aiOptions.Mode, ForgeAiModes.Fake, StringComparison.OrdinalIgnoreCase))
     builder.Services.AddSingleton<IImplementationEngine, FakeImplementationEngine>();
-builder.Services.AddSingleton<IEngineeringTaskRepository>(services => new SqliteEngineeringTaskRepository(
+builder.Services.AddSingleton(services => new SqliteEngineeringTaskRepository(
     connectionString, implementationLimits, services.GetRequiredService<TimeProvider>()));
+builder.Services.AddSingleton<IEngineeringTaskRepository>(services =>
+    services.GetRequiredService<SqliteEngineeringTaskRepository>());
+builder.Services.AddSingleton<IImplementationApprovalRepository>(services =>
+    services.GetRequiredService<SqliteEngineeringTaskRepository>());
 builder.Services.AddSingleton<IRepositoryDiscoveryService, RepositoryDiscoveryService>();
 builder.Services.AddSingleton<IEvidenceSelectionService, DeterministicEvidenceSelectionService>();
 builder.Services.AddSingleton<RepositoryFileSafetyPolicy>();
+builder.Services.AddSingleton<IGitExecutablePathResolver, GitExecutablePathResolver>();
 builder.Services.AddSingleton<IGitProcessRunner, GitProcessRunner>();
 builder.Services.AddSingleton<IImplementationWorkspaceManager, GitWorktreeManager>();
 builder.Services.AddSingleton(new SqliteDatabaseInitializer(connectionString));
 builder.Services.AddScoped<EngineeringTaskService>();
+builder.Services.AddScoped<ImplementationApprovalService>();
 
 var app = builder.Build();
 if (app.Environment.IsDevelopment())

@@ -40,6 +40,16 @@ public interface IGitProcessRunner
         GitCommandKind commandKind = GitCommandKind.ReadOnly);
 }
 
+public interface IGitExecutablePathResolver
+{
+    string Resolve(string? configuredPath);
+}
+
+public sealed class GitExecutablePathResolver : IGitExecutablePathResolver
+{
+    public string Resolve(string? configuredPath) => GitExecutableResolver.Resolve(configuredPath);
+}
+
 public static class GitExecutableResolver
 {
     public static string Resolve(string? configuredPath = null)
@@ -120,13 +130,24 @@ public sealed class GitProcessRunner : IGitProcessRunner
     private readonly string safeHomeDirectory;
     private readonly ISafeDirectoryAncestry ancestry;
 
-    public GitProcessRunner(GitProcessOptions options) : this(options, new SafeDirectoryAncestry()) { }
+    public GitProcessRunner(GitProcessOptions options)
+        : this(options, new GitExecutablePathResolver(), new SafeDirectoryAncestry()) { }
+
+    public GitProcessRunner(GitProcessOptions options, IGitExecutablePathResolver executableResolver)
+        : this(options, executableResolver, new SafeDirectoryAncestry()) { }
 
     internal GitProcessRunner(GitProcessOptions options, ISafeDirectoryAncestry ancestry)
+        : this(options, new GitExecutablePathResolver(), ancestry) { }
+
+    internal GitProcessRunner(
+        GitProcessOptions options,
+        IGitExecutablePathResolver executableResolver,
+        ISafeDirectoryAncestry ancestry)
     {
         this.options = options ?? throw new ArgumentNullException(nameof(options));
+        ArgumentNullException.ThrowIfNull(executableResolver);
         this.ancestry = ancestry ?? throw new ArgumentNullException(nameof(ancestry));
-        executablePath = GitExecutableResolver.Resolve(options.ExecutablePath);
+        executablePath = executableResolver.Resolve(options.ExecutablePath);
         ownedRoot = NormalizeOwnedRoot(options.OwnedRoot);
         hooksDirectory = NormalizeOwnedDirectory(
             string.IsNullOrWhiteSpace(options.HooksDirectory) ? Path.Combine(ownedRoot, ".empty-hooks") : options.HooksDirectory);

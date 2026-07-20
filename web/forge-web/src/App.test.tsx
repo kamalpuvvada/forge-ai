@@ -31,6 +31,7 @@ const apiModule = vi.hoisted(() => {
       requestPlanRevision: vi.fn(),
       approvePlan: vi.fn(),
       generateImplementation: vi.fn(),
+      approveImplementation: vi.fn(),
       exportTaskPdf: vi.fn(),
       exportPlanPdf: vi.fn(),
       getCapabilities: vi.fn(),
@@ -77,6 +78,8 @@ const capabilities: SystemCapabilities = {
   repositoryInspectionAvailable: true,
   planningAvailable: true,
   targetModificationAvailable: true,
+  implementationApprovalAvailable: true,
+  implementationCorrectionAvailable: false,
   validationAvailable: false,
   reviewAvailable: true,
   pullRequestCreationAvailable: false,
@@ -88,6 +91,17 @@ describe('App task navigation hardening', () => {
     document.body.innerHTML = ''
     ;(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
     window.history.replaceState(null, '', '/')
+    Object.defineProperty(HTMLDialogElement.prototype, 'showModal', {
+      configurable: true,
+      value(this: HTMLDialogElement) { this.setAttribute('open', '') },
+    })
+    Object.defineProperty(HTMLDialogElement.prototype, 'close', {
+      configurable: true,
+      value(this: HTMLDialogElement) {
+        this.removeAttribute('open')
+        this.dispatchEvent(new Event('close'))
+      },
+    })
     forgeApi.getCapabilities.mockResolvedValue(capabilities)
     forgeApi.listTasks.mockResolvedValue([])
     forgeApi.getTask.mockRejectedValue(new Error('getTask was not configured for this test.'))
@@ -101,6 +115,7 @@ describe('App task navigation hardening', () => {
     forgeApi.requestPlanRevision.mockRejectedValue(new Error('requestPlanRevision was not configured for this test.'))
     forgeApi.approvePlan.mockRejectedValue(new Error('approvePlan was not configured for this test.'))
     forgeApi.generateImplementation.mockRejectedValue(new Error('generateImplementation was not configured for this test.'))
+    forgeApi.approveImplementation.mockRejectedValue(new Error('approveImplementation was not configured for this test.'))
     taskPdfDownloader.run.mockResolvedValue(undefined)
     planPdfDownloader.run.mockResolvedValue(undefined)
     requirementCopier.run.mockResolvedValue(undefined)
@@ -244,6 +259,196 @@ describe('App task navigation hardening', () => {
     expect(findButton(rendered.container, 'Download task report PDF')).toBeTruthy()
   })
 
+  it('confirms and approves the exact persisted implementation revision', async () => {
+    const review = buildImplementationReviewTask(firstId)
+    const approvedAt = '2026-07-18T12:10:00.000Z'
+    const approved: EngineeringTask = {
+      ...review,
+      status: 'ImplementationApproved',
+      rowVersion: review.rowVersion + 1,
+      approvedImplementationRevisionId: review.activeImplementationRevisionId,
+      implementationRuntime: null,
+      implementationRevisions: review.implementationRevisions.map(revision => ({
+        ...revision, reviewState: 'Approved', approvedAt, isApproved: true,
+      })),
+    }
+    forgeApi.getTask.mockResolvedValue(review)
+    forgeApi.approveImplementation.mockResolvedValue(approved)
+
+    await navigate(taskUrl(firstId))
+    const rendered = await renderApp()
+    await click(findButton(rendered.container, 'Approve implementation'))
+    await settle()
+
+    const dialog = rendered.container.querySelector('dialog')!
+    expect(dialog.hasAttribute('open')).toBe(true)
+    expect(document.activeElement?.textContent).toBe('Cancel')
+    expect(dialog.textContent).toContain('Validation was not run.')
+    expect(dialog.textContent).toContain('No files were staged.')
+    expect(dialog.textContent).toContain('No commit or push occurred.')
+    expect(dialog.textContent).toContain('Approval accepts the persisted review only.')
+
+    await act(async () => { dialog.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })) })
+    await settle()
+    expect(dialog.hasAttribute('open')).toBe(false)
+
+    await click(findButton(rendered.container, 'Approve implementation'))
+    await click(findButton(rendered.container, 'Confirm approval'))
+    await expectText(rendered.container, 'Implementation approved')
+    expect(forgeApi.approveImplementation).toHaveBeenCalledWith(firstId, expect.objectContaining({
+      expectedRowVersion: 7,
+      expectedRevisionId: '11111111-1111-4111-8111-111111111111',
+      expectedResultFingerprint: 'b'.repeat(64),
+      commandId: expect.any(String),
+    }))
+    expect(rendered.container.textContent).toContain('Revision 1 was approved')
+    expect(rendered.container.textContent).toContain('Validation was not run')
+    expect(Array.from(rendered.container.querySelectorAll('button')).some(button =>
+      button.textContent?.includes('Approve implementation'))).toBe(false)
+    expect(findButton(rendered.container, 'Download approved plan')).toBeTruthy()
+    expect(findButton(rendered.container, 'Download task report PDF')).toBeTruthy()
+  })
+
+  it('submits one approval command when the native dialog confirmation is activated twice rapidly', async () => {
+    const review = buildImplementationReviewTask(firstId)
+    const pending = deferred<EngineeringTask>()
+    const commandId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    const randomUuid = vi.spyOn(crypto, 'randomUUID').mockReturnValue(commandId)
+    forgeApi.getTask.mockResolvedValue(review)
+    forgeApi.approveImplementation.mockReturnValue(pending.promise)
+
+    await navigate(taskUrl(firstId))
+    const rendered = await renderApp()
+    await click(findButton(rendered.container, 'Approve implementation'))
+    const dialog = rendered.container.querySelector('dialog')!
+    const confirm = findButton(dialog, 'Confirm approval')
+
+    await act(async () => {
+      confirm.click()
+      confirm.click()
+    })
+
+    expect(dialog.hasAttribute('open')).toBe(false)
+    expect(forgeApi.approveImplementation).toHaveBeenCalledTimes(1)
+    expect(randomUuid).toHaveBeenCalledTimes(1)
+    expect(forgeApi.approveImplementation).toHaveBeenCalledWith(firstId, expect.objectContaining({ commandId }))
+
+    pending.resolve({
+      ...review,
+      status: 'ImplementationApproved',
+      rowVersion: review.rowVersion + 1,
+      approvedImplementationRevisionId: review.activeImplementationRevisionId,
+      implementationRevisions: review.implementationRevisions.map(revision => ({
+        ...revision,
+        reviewState: 'Approved',
+        approvedAt: '2026-07-18T12:10:00.000Z',
+        isApproved: true,
+      })),
+    })
+    await expectText(rendered.container, 'Implementation approved')
+    expect(forgeApi.approveImplementation).toHaveBeenCalledTimes(1)
+    expect(rendered.container.textContent).not.toContain('changed while approval was pending')
+    randomUuid.mockRestore()
+  })
+
+  it('uses an accessible fallback when native dialog support is unavailable', async () => {
+    Reflect.deleteProperty(HTMLDialogElement.prototype, 'showModal')
+    const review = buildImplementationReviewTask(firstId)
+    forgeApi.getTask.mockResolvedValue(review)
+    forgeApi.approveImplementation.mockResolvedValue({
+      ...review,
+      status: 'ImplementationApproved',
+      rowVersion: review.rowVersion + 1,
+      approvedImplementationRevisionId: review.activeImplementationRevisionId,
+      implementationRevisions: review.implementationRevisions.map(revision => ({
+        ...revision,
+        reviewState: 'Approved',
+        approvedAt: '2026-07-18T12:10:00.000Z',
+        isApproved: true,
+      })),
+    })
+
+    await navigate(taskUrl(firstId))
+    const rendered = await renderApp()
+    expect(rendered.container.querySelector('[role="dialog"]')).toBeNull()
+
+    await click(findButton(rendered.container, 'Approve implementation'))
+    await settle()
+    const fallback = rendered.container.querySelector('[role="dialog"]') as HTMLElement
+    expect(fallback).toBeTruthy()
+    expect(fallback.getAttribute('aria-modal')).toBe('true')
+    expect(fallback.getAttribute('aria-labelledby')).toBe('implementation-approval-title')
+    expect(fallback.getAttribute('aria-describedby')).toBe('implementation-approval-description')
+    expect(document.activeElement?.textContent).toBe('Cancel')
+
+    await act(async () => fallback.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })))
+    await settle()
+    expect(rendered.container.querySelector('[role="dialog"]')).toBeNull()
+
+    await click(findButton(rendered.container, 'Approve implementation'))
+    await click(findButton(rendered.container, 'Cancel'))
+    expect(rendered.container.querySelector('[role="dialog"]')).toBeNull()
+
+    await click(findButton(rendered.container, 'Approve implementation'))
+    await click(findButton(rendered.container, 'Confirm approval'))
+    await expectText(rendered.container, 'Implementation approved')
+    expect(forgeApi.approveImplementation).toHaveBeenCalledTimes(1)
+  })
+
+  it('closes an open approval dialog when task selection changes', async () => {
+    const review = buildImplementationReviewTask(firstId)
+    forgeApi.getTask.mockResolvedValue(review)
+    await navigate(taskUrl(firstId))
+    const rendered = await renderApp()
+    await click(findButton(rendered.container, 'Approve implementation'))
+    expect(rendered.container.querySelector('dialog')?.hasAttribute('open')).toBe(true)
+
+    await click(findButton(rendered.container, 'New task'))
+    await settle()
+
+    expect(window.location.pathname).toBe('/')
+    expect(rendered.container.querySelector('dialog')).toBeNull()
+    expect(rendered.container.textContent).toContain('What are we building?')
+  })
+
+  it('reloads and announces a stale implementation approval conflict', async () => {
+    const review = buildImplementationReviewTask(firstId)
+    const refreshed = buildImplementationReviewTask(firstId)
+    refreshed.rowVersion = 8
+    refreshed.implementationRevisions[0].resultFingerprint = 'c'.repeat(64)
+    forgeApi.getTask.mockResolvedValueOnce(review).mockResolvedValueOnce(refreshed)
+    forgeApi.approveImplementation.mockRejectedValue(
+      new apiModule.ForgeApiError('The task changed.', 'task_concurrency_conflict'))
+
+    await navigate(taskUrl(firstId))
+    const rendered = await renderApp()
+    await click(findButton(rendered.container, 'Approve implementation'))
+    await click(findButton(rendered.container, 'Confirm approval'))
+    await expectText(rendered.container, 'The implementation review changed while approval was pending.')
+
+    expect(forgeApi.getTask).toHaveBeenCalledTimes(2)
+    expect(rendered.container.textContent).toContain('cccccccccccc')
+  })
+
+  it('does not let a stale approval response restore a task after New task navigation', async () => {
+    const review = buildImplementationReviewTask(firstId)
+    const pending = deferred<EngineeringTask>()
+    forgeApi.getTask.mockResolvedValue(review)
+    forgeApi.approveImplementation.mockReturnValue(pending.promise)
+
+    await navigate(taskUrl(firstId))
+    const rendered = await renderApp()
+    await click(findButton(rendered.container, 'Approve implementation'))
+    await click(findButton(rendered.container, 'Confirm approval'))
+    await click(findButton(rendered.container, 'New task'))
+    pending.resolve({ ...review, status: 'ImplementationApproved' })
+    await settle()
+
+    expect(window.location.pathname).toBe('/')
+    expect(rendered.container.textContent).toContain('What are we building?')
+    expect(rendered.container.textContent).not.toContain('Implementation approved')
+  })
+
   it('renders recoverable implementation failure without claiming changes or validation', async () => {
     forgeApi.getTask.mockResolvedValue(buildTask(firstId, 'Implementing', {
       implementationPlan: buildPlan(),
@@ -272,7 +477,6 @@ describe('App task navigation hardening', () => {
     forgeApi.getTask.mockResolvedValue(buildTask(firstId, 'Implementing', {
       implementationPlan: buildPlan(),
       implementationWorkspace: {
-        token: firstId.replaceAll('-', ''),
         branch: `forge/task-${firstId.replaceAll('-', '')}`,
         baseCommitSha: '0123456789abcdef0123456789abcdef01234567',
         phase: 'Ready',
@@ -369,9 +573,11 @@ describe('App task navigation hardening', () => {
     await navigate(taskUrl(firstId))
     const rendered = await renderApp()
 
-    await expectText(rendered.container, 'Active-checkout postcondition is uncertain.')
-    expect(rendered.container.textContent).toContain('could not be verified unchanged')
+    await expectText(rendered.container, 'This review cannot be approved.')
+    expect(rendered.container.textContent).toContain('could not verify that the active checkout remained unchanged')
     expect(rendered.container.textContent).not.toContain('The active checkout was verified unchanged.')
+    expect(Array.from(rendered.container.querySelectorAll('button')).some(button =>
+      button.textContent?.includes('Approve implementation'))).toBe(false)
   })
 
   it.each(['Validating', 'Reviewing', 'Completed'] as const)('keeps semantic approved-plan downloads in %s', async status => {
@@ -737,6 +943,10 @@ function buildTask(id: string, status: WorkflowStatus, overrides: Partial<Engine
     implementationStartedAt: null,
     implementationCompletedAt: null,
     implementationRuntime: null,
+    rowVersion: 1,
+    activeImplementationRevisionId: null,
+    approvedImplementationRevisionId: null,
+    implementationRevisions: [],
     telemetry: {
       totalCalls: 0,
       totalInputTokens: 0,
@@ -757,7 +967,6 @@ function buildImplementationReviewTask(id: string): EngineeringTask {
     planApprovedAt: completedAt,
     implementationPlan: buildPlan(),
     implementationWorkspace: {
-      token: id.replaceAll('-', ''),
       branch: `forge/task-${id.replaceAll('-', '')}`,
       baseCommitSha: '0123456789abcdef0123456789abcdef01234567',
       phase: 'Completed',
@@ -802,6 +1011,28 @@ function buildImplementationReviewTask(id: string): EngineeringTask {
     implementationRuntime: { workspaceAvailable: true, activeCheckoutVerified: true, disposition: 'Completed', safeMessage: null },
     implementationStartedAt: completedAt,
     implementationCompletedAt: completedAt,
+    rowVersion: 7,
+    activeImplementationRevisionId: '11111111-1111-4111-8111-111111111111',
+    implementationRevisions: [{
+      revisionId: '11111111-1111-4111-8111-111111111111',
+      revisionNumber: 1,
+      kind: 'Initial',
+      previousRevisionId: null,
+      planFingerprint: 'a'.repeat(64),
+      baseCommitSha: '0123456789abcdef0123456789abcdef01234567',
+      generationStartedAt: completedAt,
+      generationCompletedAt: completedAt,
+      generationState: 'Succeeded',
+      reviewState: 'Current',
+      failureCategory: null,
+      failureMessage: null,
+      resultFingerprint: 'b'.repeat(64),
+      changedFileCount: 1,
+      correctionSubmittedAt: null,
+      approvedAt: null,
+      isCurrent: true,
+      isApproved: false,
+    }],
   })
 }
 

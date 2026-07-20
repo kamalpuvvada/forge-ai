@@ -95,3 +95,9 @@
 **Decision:** Preserve the installed SDK's response status and incomplete reason, parse structured output only when completed, classify output-limit and content-filter incompleteness separately, and raise the planning allowance to 6,000 tokens while capping plan collections.
 **Reason:** A response cut off at its configured allowance is operational truncation, not an ordinary malformed semantic plan. Explicit classification preserves accurate usage/cost and provides a recoverable user-triggered retry without exposing partial output.
 **Trade-off:** The higher allowance can increase worst-case cost; compact prompts, reduced repository metadata, strict collection limits, and no automatic retry bound that risk.
+
+## 017 — Implementation approval binds persisted review evidence
+
+**Decision:** Store a bounded authoritative implementation-revision ledger and require task row version, active revision ID, approved-plan fingerprint, base commit, canonical result fingerprint, and verified unchanged-checkout completion evidence before transitioning to `ImplementationApproved`. Bind every approval command ID globally in SQLite to its complete semantic request, task result row, and immutable timestamp in the same transaction. Route approval through a persistence-only dependency graph, and project tokenized implementation branches through one safe display formatter.
+**Reason:** A human decision must identify the exact review that was accepted and remain auditable without mutating or even observing the physical workspace during approval.
+**Trade-off:** The active implementation fields are temporarily duplicated as a compatibility projection and must validate exactly against revision 1. Approval does not prove that the retained worktree is still available; a future validation or delivery command must reverify it.

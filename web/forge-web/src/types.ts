@@ -1,4 +1,4 @@
-export type WorkflowStatus = 'Draft' | 'Clarifying' | 'RequirementSummaryReady' | 'AwaitingRequirementApproval' | 'ReadyForPlanning' | 'Planning' | 'AwaitingPlanApproval' | 'PlanApproved' | 'Implementing' | 'AwaitingImplementationReview' | 'Validating' | 'Reviewing' | 'Completed' | 'Failed'
+export type WorkflowStatus = 'Draft' | 'Clarifying' | 'RequirementSummaryReady' | 'AwaitingRequirementApproval' | 'ReadyForPlanning' | 'Planning' | 'AwaitingPlanApproval' | 'PlanApproved' | 'Implementing' | 'AwaitingImplementationReview' | 'ImplementationApproved' | 'Validating' | 'Reviewing' | 'Completed' | 'Failed'
 export interface ClarificationAnswer { question: string; answer: string; answeredAt: string }
 export interface RequirementRevision { correction: string; previousSummary: string; submittedAt: string }
 export interface PlanRevision {
@@ -58,7 +58,7 @@ export interface ImplementationPlan {
 }
 export type ImplementationOperationAction = 'Create' | 'Modify' | 'Delete'
 export interface ImplementationWorkspace {
-  token: string; branch: string; baseCommitSha: string; phase: 'Reserved' | 'Ready' | 'RecoveryRequired' | 'Completed' | 'WorkspacePreparing' | 'WorkspacePrepared' | 'MutationStarted' | 'ApplyCompleted' | 'ResultPersisted' | 'Interrupted'
+  branch: string; baseCommitSha: string; phase: 'Reserved' | 'Ready' | 'RecoveryRequired' | 'Completed' | 'WorkspacePreparing' | 'WorkspacePrepared' | 'MutationStarted' | 'ApplyCompleted' | 'ResultPersisted' | 'Interrupted'
   createdAt: string; updatedAt: string; isAvailable: boolean
 }
 export type ImplementationAttemptDisposition = 'None' | 'Active' | 'SafeResume' | 'RecoveryRequired' | 'Interrupted' | 'TerminalIncompatible' | 'Completed'
@@ -73,6 +73,13 @@ export interface ImplementationResult {
   source: 'DeterministicFake' | 'OpenAI'; model: string | null; baseCommitSha: string; branch: string; summary: string
   warnings: string[]; changedFiles: ChangedFileReview[]; fullDiffCharacters: number; displayedDiffCharacters: number
   diffTruncated: boolean; completedAt: string; isDeterministicFake: boolean; fullDiffUtf8Bytes: number; displayedDiffUtf8Bytes: number; activeCheckoutVerified: boolean
+}
+export interface ImplementationRevision {
+  revisionId: string; revisionNumber: number; kind: 'Initial' | 'Correction'; previousRevisionId: string | null
+  planFingerprint: string; baseCommitSha: string; generationStartedAt: string; generationCompletedAt: string | null
+  generationState: 'Requested' | 'Generating' | 'Succeeded' | 'Failed'; reviewState: 'NotReviewable' | 'Current' | 'Superseded' | 'Approved'
+  failureCategory: string | null; failureMessage: string | null; resultFingerprint: string | null; changedFileCount: number
+  correctionSubmittedAt: string | null; approvedAt: string | null; isCurrent: boolean; isApproved: boolean
 }
 export interface EngineeringTask {
   id: string
@@ -104,6 +111,10 @@ export interface EngineeringTask {
   implementationStartedAt: string | null
   implementationCompletedAt: string | null
   implementationRuntime: ImplementationRuntime | null
+  rowVersion: number
+  activeImplementationRevisionId: string | null
+  approvedImplementationRevisionId: string | null
+  implementationRevisions: ImplementationRevision[]
   telemetry: ModelTelemetry
 }
 export interface EngineeringTaskSummary {
@@ -132,6 +143,8 @@ export interface SystemCapabilities {
   repositoryInspectionAvailable: boolean
   planningAvailable: boolean
   targetModificationAvailable: boolean
+  implementationApprovalAvailable: boolean
+  implementationCorrectionAvailable: boolean
   validationAvailable: boolean
   reviewAvailable: boolean
   pullRequestCreationAvailable: boolean
