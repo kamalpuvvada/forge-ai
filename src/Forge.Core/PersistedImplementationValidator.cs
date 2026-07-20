@@ -17,7 +17,11 @@ public static class PersistedImplementationValidator
         DateTimeOffset? implementationStartedAt = null,
         DateTimeOffset? implementationCompletedAt = null,
         DateTimeOffset? now = null,
-        DateTimeOffset? taskUpdatedAt = null)
+        DateTimeOffset? taskUpdatedAt = null,
+        Guid? taskId = null,
+        IReadOnlyList<ImplementationRevision>? revisions = null,
+        Guid? activeRevisionId = null,
+        Guid? approvedRevisionId = null)
     {
         ArgumentNullException.ThrowIfNull(limits);
         if (workspace is not null) ValidateWorkspace(workspace);
@@ -34,6 +38,9 @@ public static class PersistedImplementationValidator
         }
         if (failure is not null) ValidateFailure(failure);
         if (lease is not null) ValidateLease(lease, limits, now);
+
+        ValidateRevisionLedger(status, taskId, plan, workspace, result, failure, lease,
+            revisions ?? [], activeRevisionId, approvedRevisionId, limits, taskUpdatedAt, now);
 
         if ((workspace is not null || result is not null || failure is not null || lease is not null) &&
             (plan is null || planApprovedAt is null)) Corrupt();
@@ -61,6 +68,10 @@ public static class PersistedImplementationValidator
                 ValidateCompletedArtifacts(workspace, result, failure, lease, implementationStartedAt,
                     implementationCompletedAt, allowLegacyEmpty: false);
                 break;
+            case WorkflowStatus.ImplementationApproved:
+                ValidateCompletedArtifacts(workspace, result, failure, lease, implementationStartedAt,
+                    implementationCompletedAt, allowLegacyEmpty: false);
+                break;
             case WorkflowStatus.Validating:
             case WorkflowStatus.Reviewing:
             case WorkflowStatus.Completed:
@@ -75,6 +86,130 @@ public static class PersistedImplementationValidator
 
         ValidateTimestamps(workspace, result, failure, implementationStartedAt, implementationCompletedAt,
             taskUpdatedAt, now);
+    }
+
+    private static void ValidateRevisionLedger(
+        WorkflowStatus status,
+        Guid? taskId,
+        ImplementationPlan? plan,
+        ImplementationWorkspace? workspace,
+        ImplementationResult? result,
+        ImplementationFailure? failure,
+        ImplementationLease? lease,
+        IReadOnlyList<ImplementationRevision> revisions,
+        Guid? activeRevisionId,
+        Guid? approvedRevisionId,
+        ImplementationLimits limits,
+        DateTimeOffset? taskUpdatedAt,
+        DateTimeOffset? now)
+    {
+        if (revisions.Count == 0)
+        {
+            if (activeRevisionId is not null || approvedRevisionId is not null ||
+                status == WorkflowStatus.ImplementationApproved) Corrupt();
+            return;
+        }
+        if (taskId is null || taskId == Guid.Empty || plan is null || revisions.Count > limits.MaximumImplementationRevisions)
+            Corrupt();
+
+        var planFingerprint = ImplementationReviewFingerprint.ComputePlan(plan);
+        var ids = new HashSet<Guid>();
+        for (var index = 0; index < revisions.Count; index++)
+        {
+            var revision = revisions[index];
+            if (revision.RevisionId == Guid.Empty || !ids.Add(revision.RevisionId) ||
+                revision.RevisionNumber != index + 1 || !Enum.IsDefined(revision.Kind) ||
+                revision.Kind != ImplementationRevisionKind.Initial || index != 0 ||
+                revision.PreviousRevisionId is not null ||
+                revision.CorrectionInstruction is not null || revision.CorrectionSubmittedAt is not null ||
+                revision.CorrectionCommandId is not null || revision.GenerationCommandId == Guid.Empty ||
+                !Enum.IsDefined(revision.GenerationState) || !Enum.IsDefined(revision.ReviewState) ||
+                !IsLowerSha256(revision.PlanFingerprint) ||
+                !string.Equals(revision.PlanFingerprint, planFingerprint, StringComparison.Ordinal) ||
+                !IsObjectId(revision.BaseCommitSha) || revision.GenerationStartedAt.Offset != TimeSpan.Zero ||
+                revision.GenerationCompletedAt is { } generationCompleted && generationCompleted.Offset != TimeSpan.Zero ||
+                revision.ApprovedAt is { } approvedAt && approvedAt.Offset != TimeSpan.Zero)
+                Corrupt();
+
+            if (revision.Workspace is not null) ValidateWorkspace(revision.Workspace);
+            if (revision.Result is not null) ValidateResult(revision.Result, revision.Workspace, plan, limits);
+            if (revision.Failure is not null) ValidateFailure(revision.Failure);
+            if (revision.Lease is not null) ValidateLease(revision.Lease, limits, now);
+            if (revision.Workspace is not null &&
+                !string.Equals(revision.BaseCommitSha, revision.Workspace.BaseCommitSha, StringComparison.Ordinal)) Corrupt();
+
+            if (revision.GenerationState == ImplementationGenerationState.Succeeded)
+            {
+                if (revision.Result is null || revision.Workspace is null || revision.GenerationCompletedAt is null ||
+                    revision.ResultFingerprint is null || !IsLowerSha256(revision.ResultFingerprint) || revision.Lease is not null)
+                    Corrupt();
+                var computed = ImplementationReviewFingerprint.ComputeResult(
+                    taskId.Value, revision.RevisionId, revision.RevisionNumber, revision.Kind,
+                    revision.PlanFingerprint, revision.Result);
+                if (!string.Equals(computed, revision.ResultFingerprint, StringComparison.Ordinal) ||
+                    revision.Result.CompletedAt > revision.GenerationCompletedAt) Corrupt();
+            }
+            else if (revision.Result is not null || revision.ResultFingerprint is not null ||
+                     revision.GenerationCompletedAt is not null ||
+                     revision.ReviewState != ImplementationReviewState.NotReviewable) Corrupt();
+
+            if (revision.ReviewState == ImplementationReviewState.Approved)
+            {
+                if (revision.GenerationState != ImplementationGenerationState.Succeeded ||
+                    revision.ApprovedAt is null || revision.ApprovalCommandId is null || revision.ApprovalCommandId == Guid.Empty ||
+                    revision.ApprovalExpectedRowVersion is null or < 0)
+                    Corrupt();
+            }
+            else if (revision.ApprovedAt is not null || revision.ApprovalCommandId is not null ||
+                     revision.ApprovalExpectedRowVersion is not null) Corrupt();
+            if (revision.ApprovedAt is { } approvalTime &&
+                (revision.GenerationCompletedAt > approvalTime || taskUpdatedAt is { } updated && approvalTime > updated)) Corrupt();
+        }
+
+        var active = activeRevisionId is { } activeId
+            ? revisions.SingleOrDefault(revision => revision.RevisionId == activeId)
+            : null;
+        var reviewableCount = revisions.Count(revision =>
+            revision.ReviewState is ImplementationReviewState.Current or ImplementationReviewState.Approved);
+        if (active is null || status == WorkflowStatus.Implementing && reviewableCount != 0 ||
+            status is not WorkflowStatus.Implementing && reviewableCount != 1) Corrupt();
+        if (active.ReviewState is not (ImplementationReviewState.Current or ImplementationReviewState.Approved) &&
+            status is not WorkflowStatus.Implementing) Corrupt();
+
+        var approved = approvedRevisionId is { } approvedId
+            ? revisions.SingleOrDefault(revision => revision.RevisionId == approvedId)
+            : null;
+        if (revisions.Count(revision => revision.ReviewState == ImplementationReviewState.Approved) > 1 ||
+            (approvedRevisionId is null) != (approved is null)) Corrupt();
+
+        if (status == WorkflowStatus.ImplementationApproved)
+        {
+            if (approved is null || active.RevisionId != approved.RevisionId ||
+                active.ReviewState != ImplementationReviewState.Approved ||
+                approved.Result?.ActiveCheckoutVerified != true) Corrupt();
+        }
+        else if (approvedRevisionId is not null || approved is not null) Corrupt();
+
+        if (status == WorkflowStatus.Implementing)
+        {
+            if (active.GenerationState != ImplementationGenerationState.Generating ||
+                active.ReviewState != ImplementationReviewState.NotReviewable) Corrupt();
+        }
+        else if (status == WorkflowStatus.AwaitingImplementationReview)
+        {
+            if (active.GenerationState != ImplementationGenerationState.Succeeded ||
+                active.ReviewState != ImplementationReviewState.Current) Corrupt();
+        }
+
+        if (!Equals(active.Workspace, workspace) || !Equals(active.Failure, failure) || !Equals(active.Lease, lease)) Corrupt();
+        if (active.Result is null != (result is null)) Corrupt();
+        if (result is not null)
+        {
+            var projectionFingerprint = ImplementationReviewFingerprint.ComputeResult(
+                taskId.Value, active.RevisionId, active.RevisionNumber, active.Kind,
+                active.PlanFingerprint, result);
+            if (!string.Equals(projectionFingerprint, active.ResultFingerprint, StringComparison.Ordinal)) Corrupt();
+        }
     }
 
     private static void ValidateImplementing(
@@ -273,6 +408,8 @@ public static class PersistedImplementationValidator
 
     private static bool IsObjectId(string? value) => value is { Length: 40 or 64 } && value.All(Uri.IsHexDigit);
     private static bool IsSha256(string? value) => value is { Length: 64 } && value.All(Uri.IsHexDigit);
+    private static bool IsLowerSha256(string? value) => value is { Length: 64 } &&
+        value.All(character => character is >= '0' and <= '9' or >= 'a' and <= 'f');
     [DoesNotReturn]
     private static void Corrupt() => throw new TaskDataCorruptException(
         "Stored implementation data is invalid or incomplete. The task cannot be resumed automatically.");

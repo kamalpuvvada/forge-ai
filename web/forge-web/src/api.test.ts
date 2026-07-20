@@ -48,4 +48,25 @@ describe('task PDF API helper', () => {
     expect(fetch).toHaveBeenNthCalledWith(2, '/api/tasks/abc/export/plan-pdf', { headers: { Accept: 'application/pdf' } })
     expect(parseSafePdfFilename('attachment; filename="../bad.pdf"', 'abc', 'plan')).toBe('forge-plan-abc.pdf')
   })
+
+  it('posts exact implementation approval preconditions as JSON', async () => {
+    const fetch = vi.fn().mockResolvedValue(new Response('{}', {
+      status: 200, headers: { 'Content-Type': 'application/json' },
+    }))
+    vi.stubGlobal('fetch', fetch)
+    const payload = {
+      commandId: '11111111-1111-4111-8111-111111111111',
+      expectedRowVersion: 7,
+      expectedRevisionId: '22222222-2222-4222-8222-222222222222',
+      expectedResultFingerprint: 'a'.repeat(64),
+    }
+
+    await forgeApi.approveImplementation('task-id', payload)
+
+    expect(fetch).toHaveBeenCalledWith('/api/tasks/task-id/implementation-approval', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+      headers: { 'Content-Type': 'application/json' },
+    })
+  })
 })

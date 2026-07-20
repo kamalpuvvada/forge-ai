@@ -21,6 +21,190 @@ public sealed class ImplementationWorkflowTests
         Assert.Equal(WorkflowStatus.AwaitingImplementationReview, task.Status);
         Assert.NotNull(task.ImplementationResult);
         Assert.Equal(ImplementationWorkspacePhase.ResultPersisted, task.ImplementationWorkspace?.Phase);
+        var revision = Assert.Single(task.ImplementationRevisions);
+        Assert.Equal(1, revision.RevisionNumber);
+        Assert.Equal(ImplementationRevisionKind.Initial, revision.Kind);
+        Assert.Equal(ImplementationGenerationState.Succeeded, revision.GenerationState);
+        Assert.Equal(ImplementationReviewState.Current, revision.ReviewState);
+        Assert.Equal(revision.RevisionId, task.ActiveImplementationRevisionId);
+        Assert.Matches("^[0-9a-f]{64}$", revision.PlanFingerprint);
+        Assert.Matches("^[0-9a-f]{64}$", revision.ResultFingerprint!);
+    }
+
+    [Fact]
+    public void Exact_current_review_can_be_approved_once_and_replayed_idempotently()
+    {
+        var task = ApprovedTask();
+        var workspace = Workspace();
+        var lease = Lease(Now.AddMinutes(1));
+        task.BeginImplementation(workspace, lease, Now.AddMinutes(1));
+        task.StoreImplementationResult(Result(workspace), lease.AttemptId, lease.OwnerId, Now.AddMinutes(2));
+        var revision = Assert.Single(task.ImplementationRevisions);
+        var commandId = Guid.NewGuid();
+
+        Assert.True(task.ApproveImplementation(commandId, task.RowVersion, revision.RevisionId,
+            revision.ResultFingerprint!, Now.AddMinutes(3)));
+        var approved = Assert.Single(task.ImplementationRevisions);
+        Assert.Equal(WorkflowStatus.ImplementationApproved, task.Status);
+        Assert.Equal(ImplementationReviewState.Approved, approved.ReviewState);
+        Assert.Equal(approved.RevisionId, task.ApprovedImplementationRevisionId);
+        Assert.Equal(Now.AddMinutes(3), approved.ApprovedAt);
+
+        Assert.False(task.ApproveImplementation(commandId, 0, approved.RevisionId,
+            approved.ResultFingerprint!, Now.AddMinutes(4)));
+        Assert.Equal(Now.AddMinutes(3), Assert.Single(task.ImplementationRevisions).ApprovedAt);
+        Assert.Throws<WorkflowException>(() => task.ApproveImplementation(commandId, 1,
+            approved.RevisionId, approved.ResultFingerprint!, Now.AddMinutes(4)));
+        Assert.Throws<WorkflowException>(() => task.ApproveImplementation(Guid.NewGuid(), task.RowVersion,
+            approved.RevisionId, approved.ResultFingerprint!, Now.AddMinutes(4)));
+    }
+
+    [Fact]
+    public void Approval_rejects_stale_row_revision_and_result_fingerprint()
+    {
+        var task = ApprovedTask();
+        var workspace = Workspace();
+        var lease = Lease(Now.AddMinutes(1));
+        task.BeginImplementation(workspace, lease, Now.AddMinutes(1));
+        task.StoreImplementationResult(Result(workspace), lease.AttemptId, lease.OwnerId, Now.AddMinutes(2));
+        var revision = Assert.Single(task.ImplementationRevisions);
+
+        Assert.Throws<TaskConcurrencyException>(() => task.ApproveImplementation(Guid.NewGuid(), 1,
+            revision.RevisionId, revision.ResultFingerprint!, Now.AddMinutes(3)));
+        Assert.Throws<TaskConcurrencyException>(() => task.ApproveImplementation(Guid.NewGuid(), task.RowVersion,
+            Guid.NewGuid(), revision.ResultFingerprint!, Now.AddMinutes(3)));
+        Assert.Throws<TaskConcurrencyException>(() => task.ApproveImplementation(Guid.NewGuid(), task.RowVersion,
+            revision.RevisionId, new string('0', 64), Now.AddMinutes(3)));
+        Assert.Equal(WorkflowStatus.AwaitingImplementationReview, task.Status);
+    }
+
+    [Fact]
+    public void Approval_rejects_uncertain_checkout_evidence_without_mutating_review()
+    {
+        var task = ApprovedTask();
+        var workspace = Workspace();
+        var lease = Lease(Now.AddMinutes(1));
+        task.BeginImplementation(workspace, lease, Now.AddMinutes(1));
+        task.StoreImplementationResult(Result(workspace), lease.AttemptId, lease.OwnerId, Now.AddMinutes(2));
+        task.RecordImplementationPostconditionFailure(new ImplementationFailure(
+            "implementation_active_checkout_changed",
+            "Forge could not verify that the active checkout remained unchanged.",
+            true,
+            Now.AddMinutes(3),
+            ActiveCheckoutVerified: false), Now.AddMinutes(3));
+        var revision = Assert.Single(task.ImplementationRevisions);
+        var before = System.Text.Json.JsonSerializer.Serialize(task);
+
+        var exception = Assert.Throws<ImplementationException>(() => task.ApproveImplementation(
+            Guid.NewGuid(), task.RowVersion, revision.RevisionId, revision.ResultFingerprint!, Now.AddMinutes(4)));
+
+        Assert.Equal("implementation_review_ineligible", exception.Category);
+        Assert.Equal(before, System.Text.Json.JsonSerializer.Serialize(task));
+        Assert.Equal(WorkflowStatus.AwaitingImplementationReview, task.Status);
+        Assert.Null(task.ApprovedImplementationRevisionId);
+    }
+
+    [Fact]
+    public void Implementation_approval_is_forbidden_before_and_after_the_review_gate()
+    {
+        var before = ApprovedTask();
+        Assert.Throws<WorkflowException>(() => before.ApproveImplementation(Guid.NewGuid(), before.RowVersion,
+            Guid.NewGuid(), new string('a', 64), Now));
+
+        var workspace = Workspace();
+        var lease = Lease(Now.AddMinutes(1));
+        before.BeginImplementation(workspace, lease, Now.AddMinutes(1));
+        before.StoreImplementationResult(Result(workspace), lease.AttemptId, lease.OwnerId, Now.AddMinutes(2));
+        var revision = Assert.Single(before.ImplementationRevisions);
+        before.ApproveImplementation(Guid.NewGuid(), before.RowVersion, revision.RevisionId,
+            revision.ResultFingerprint!, Now.AddMinutes(3));
+        Assert.Throws<WorkflowException>(() => before.ApproveImplementation(Guid.NewGuid(), before.RowVersion,
+            revision.RevisionId, revision.ResultFingerprint!, Now.AddMinutes(4)));
+        Assert.Throws<WorkflowException>(() => before.RequestPlanRevision("Change the approved plan.", Now.AddMinutes(4)));
+    }
+
+    [Fact]
+    public void Canonical_result_fingerprint_binds_every_review_surface()
+    {
+        var taskId = Guid.NewGuid();
+        var revisionId = Guid.NewGuid();
+        var workspace = Workspace();
+        const string preview = "diff --git a/src/App.cs b/src/App.cs";
+        var result = Result(workspace) with
+        {
+            ChangedFiles = [new ChangedFileReview("src/App.cs", ImplementationOperationAction.Modify,
+                new string('3', 64), new string('4', 64), 10, 20, 1, 2, 1, 0,
+                preview, preview.Length, preview.Length, false, preview.Length, preview.Length)],
+            FullDiffCharacters = preview.Length,
+            DisplayedDiffCharacters = preview.Length,
+            FullDiffUtf8Bytes = preview.Length,
+            DisplayedDiffUtf8Bytes = preview.Length,
+            WorktreeFingerprint = new string('5', 64),
+            WorktreeFileCount = 1,
+            WorktreeBytes = 20
+        };
+        var planFingerprint = new string('a', 64);
+        var baseline = ImplementationReviewFingerprint.ComputeResult(taskId, revisionId, 1,
+            ImplementationRevisionKind.Initial, planFingerprint, result);
+        var file = Assert.Single(result.ChangedFiles);
+        var mutations = new ImplementationResult[]
+        {
+            result with { Source = ImplementationSource.OpenAI },
+            result with { Model = "model" },
+            result with { BaseCommitSha = new string('b', 40) },
+            result with { Branch = result.Branch + "-changed" },
+            result with { Summary = result.Summary + " changed" },
+            result with { Warnings = ["changed"] },
+            result with { ChangedFiles = [file with { Path = "src/Other.cs" }] },
+            result with { ChangedFiles = [file with { Action = ImplementationOperationAction.Create }] },
+            result with { ChangedFiles = [file with { OriginalContentSha256 = new string('1', 64) }] },
+            result with { ChangedFiles = [file with { NewContentSha256 = new string('2', 64) }] },
+            result with { ChangedFiles = [file with { OriginalBytes = file.OriginalBytes + 1 }] },
+            result with { ChangedFiles = [file with { NewBytes = file.NewBytes + 1 }] },
+            result with { ChangedFiles = [file with { OriginalLines = file.OriginalLines + 1 }] },
+            result with { ChangedFiles = [file with { NewLines = file.NewLines + 1 }] },
+            result with { ChangedFiles = [file with { Additions = file.Additions + 1 }] },
+            result with { ChangedFiles = [file with { Deletions = file.Deletions + 1 }] },
+            result with { ChangedFiles = [file with { DiffPreview = file.DiffPreview + "x" }] },
+            result with { ChangedFiles = [file with { FullDiffCharacters = file.FullDiffCharacters + 1 }] },
+            result with { ChangedFiles = [file with { DisplayedDiffCharacters = file.DisplayedDiffCharacters + 1 }] },
+            result with { ChangedFiles = [file with { DiffTruncated = !file.DiffTruncated }] },
+            result with { ChangedFiles = [file with { FullDiffUtf8Bytes = file.FullDiffUtf8Bytes + 1 }] },
+            result with { ChangedFiles = [file with { DisplayedDiffUtf8Bytes = file.DisplayedDiffUtf8Bytes + 1 }] },
+            result with { FullDiffCharacters = result.FullDiffCharacters + 1 },
+            result with { DisplayedDiffCharacters = result.DisplayedDiffCharacters + 1 },
+            result with { DiffTruncated = !result.DiffTruncated },
+            result with { FullDiffUtf8Bytes = result.FullDiffUtf8Bytes + 1 },
+            result with { DisplayedDiffUtf8Bytes = result.DisplayedDiffUtf8Bytes + 1 },
+            result with { CompletedAt = result.CompletedAt.AddSeconds(1) },
+            result with { ActiveCheckoutVerified = !result.ActiveCheckoutVerified },
+            result with { WorktreeFingerprint = new string('3', 64) },
+            result with { WorktreeFileCount = result.WorktreeFileCount + 1 },
+            result with { WorktreeBytes = result.WorktreeBytes + 1 }
+        };
+
+        Assert.All(mutations, mutation => Assert.NotEqual(baseline,
+            ImplementationReviewFingerprint.ComputeResult(taskId, revisionId, 1,
+                ImplementationRevisionKind.Initial, planFingerprint, mutation)));
+        Assert.NotEqual(baseline, ImplementationReviewFingerprint.ComputeResult(taskId, Guid.NewGuid(), 1,
+            ImplementationRevisionKind.Initial, planFingerprint, result));
+        Assert.NotEqual(baseline, ImplementationReviewFingerprint.ComputeResult(taskId, revisionId, 2,
+            ImplementationRevisionKind.Initial, planFingerprint, result));
+        Assert.NotEqual(baseline, ImplementationReviewFingerprint.ComputeResult(taskId, revisionId, 1,
+            ImplementationRevisionKind.Initial, new string('b', 64), result));
+        Assert.NotEqual(baseline, ImplementationReviewFingerprint.ComputeResult(Guid.NewGuid(), revisionId, 1,
+            ImplementationRevisionKind.Initial, planFingerprint, result));
+        Assert.NotEqual(baseline, ImplementationReviewFingerprint.ComputeResult(taskId, revisionId, 1,
+            ImplementationRevisionKind.Correction, planFingerprint, result));
+
+        var secondFile = file with { Path = "src/Second.cs", NewContentSha256 = new string('6', 64) };
+        var ordered = result with { ChangedFiles = [file, secondFile] };
+        var reversed = ordered with { ChangedFiles = [secondFile, file] };
+        Assert.NotEqual(
+            ImplementationReviewFingerprint.ComputeResult(taskId, revisionId, 1,
+                ImplementationRevisionKind.Initial, planFingerprint, ordered),
+            ImplementationReviewFingerprint.ComputeResult(taskId, revisionId, 1,
+                ImplementationRevisionKind.Initial, planFingerprint, reversed));
     }
 
     [Fact]
@@ -320,7 +504,14 @@ public sealed class ImplementationWorkflowTests
         var task = EngineeringTask.Create("C:/repo", "Requirement", Now);
         task.ApplyClarificationEvaluation(ClarificationEvaluation.Summarize("Approved requirement"), Now);
         task.ApproveRequirementSummary(Now);
-        var snapshot = PlanningWorkflowTests.Snapshot(Now);
+        var snapshot = PlanningWorkflowTests.Snapshot(Now) with
+        {
+            IsGitRepository = true,
+            Branch = "main",
+            ShortHeadSha = "aaaaaaaa",
+            FullHeadSha = new string('a', 40),
+            WorkingTreeStatus = "clean"
+        };
         var evidence = PlanningWorkflowTests.Evidence();
         task.BeginRepositoryAnalysis(Now);
         task.StoreRepositorySnapshot(snapshot, Now);
@@ -343,10 +534,11 @@ public sealed class ImplementationWorkflowTests
         task.PlanRevisionNotes, workspace);
 
     private static ImplementationWorkspace Workspace() => new(
-        new string('a', 32), "forge/task-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "abc",
+        new string('a', 32), "forge/task-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", new string('a', 40),
         ImplementationWorkspacePhase.Reserved, Now, Now, false);
 
     private static ImplementationResult Result(ImplementationWorkspace workspace) => new(
         ImplementationSource.DeterministicFake, null, workspace.BaseCommitSha, workspace.Branch,
-        "Summary", ["Warning"], [], 0, 0, false, Now.AddMinutes(2));
+        "Summary", ["Warning"], [], 0, 0, false, Now.AddMinutes(2),
+        ActiveCheckoutVerified: true);
 }

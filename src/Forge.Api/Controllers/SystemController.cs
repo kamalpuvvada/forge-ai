@@ -36,6 +36,8 @@ public sealed class SystemController(ForgeAiOptions options, OpenAIConfiguration
             true,
             isFake || isOpenAi && planningConfigured,
             implementationConfigured,
+            true,
+            false,
             false,
             implementationConfigured,
             false));

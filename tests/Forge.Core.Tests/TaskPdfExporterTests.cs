@@ -141,9 +141,17 @@ public sealed class TaskPdfExporterTests
         var text = Extract(Exporter().Export(task, runtime));
 
         Assert.Contains("AwaitingImplementationReview", text);
+        Assert.Contains("Implementation revision chronology", text);
+        Assert.Contains("Implementation revision 1 — CURRENT", text);
+        Assert.Contains("Generation disposition: Succeeded", text);
+        Assert.Contains("Review disposition: Current", text);
+        var revision = Assert.Single(task.ImplementationRevisions);
+        Assert.Contains(revision.PlanFingerprint, text);
+        Assert.Contains(revision.ResultFingerprint!, text);
+        Assert.DoesNotContain(revision.RevisionId.ToString(), text, StringComparison.OrdinalIgnoreCase);
         Assert.Contains("Plan approval status: APPROVED", text);
         Assert.Contains(new string('a', 40), text);
-        Assert.Contains("forge/task-[internal-id-redacted]", text);
+        Assert.Contains(ImplementationBranchDisplay.SafeLabel, text);
         Assert.DoesNotContain("forge/task-0123456789abcdef0123456789abcdef", text, StringComparison.Ordinal);
         Assert.Contains("Source: DeterministicFake", text);
         foreach (var path in new[] { "src/GreetingService.cs", "config/settings.json", "README.md" })
@@ -178,6 +186,72 @@ public sealed class TaskPdfExporterTests
         Assert.DoesNotContain(@"C:\unrelated\worktree", text, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("COMPLETE-EVIDENCE-EXCERPT-MARKER", text);
         Assert.DoesNotContain("System.InvalidOperationException", text);
+    }
+
+    [Fact]
+    public void Uncertain_checkout_review_is_explicitly_not_eligible_for_approval()
+    {
+        var task = ImplementedAuditTask();
+        task.RecordImplementationPostconditionFailure(new ImplementationFailure(
+            "implementation_active_checkout_changed",
+            "Forge could not verify that the active checkout remained unchanged.",
+            true,
+            Now.AddMinutes(7),
+            ActiveCheckoutVerified: false), Now.AddMinutes(7));
+
+        var text = Extract(Exporter().Export(task));
+
+        Assert.Contains("NOT ELIGIBLE FOR APPROVAL", text);
+        Assert.Contains("could not verify that the active checkout remained unchanged", text);
+        Assert.Contains("Active checkout verified when implementation completed: no", text);
+        Assert.DoesNotContain("APPROVED PERSISTED IMPLEMENTATION REVIEW", text);
+    }
+
+    [Fact]
+    public void Approved_implementation_report_identifies_exact_revision_timestamp_and_persisted_evidence_boundary()
+    {
+        var task = ImplementedAuditTask();
+        var current = Assert.Single(task.ImplementationRevisions);
+        var commandId = Guid.NewGuid();
+        task.ApproveImplementation(commandId, task.RowVersion, current.RevisionId,
+            current.ResultFingerprint!, Now.AddMinutes(7));
+
+        var text = Extract(Exporter().Export(task,
+            new ImplementationReportRuntimeStatus(false, ImplementationAttemptDisposition.RecoveryRequired,
+                "The isolated workspace was not observed at export time.")));
+
+        var approved = Assert.Single(task.ImplementationRevisions);
+        Assert.Contains("Workflow status: ImplementationApproved", text);
+        Assert.Contains("Implementation revision 1 — CURRENT / APPROVED", text);
+        Assert.Contains("Review disposition: Approved", text);
+        Assert.Contains($"Approved at: {Now.AddMinutes(7):O}", text);
+        Assert.Contains(approved.ResultFingerprint!, text);
+        Assert.Contains("approval applies to the exact persisted review evidence", text);
+        Assert.Contains("validation was not run", text, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("APPROVED PERSISTED IMPLEMENTATION REVIEW", text);
+        Assert.Contains("staged", text, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("committed", text, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("pushed", text, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("NOT EXECUTED", text);
+        Assert.DoesNotContain(commandId.ToString(), text, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(task.ImplementationWorkspace!.Token, text, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Legacy_completed_review_gets_a_stable_synthetic_revision_in_pdf_without_approval()
+    {
+        var source = ImplementedAuditTask();
+        var legacy = CopyImplementationState(source, source.ImplementationResult,
+            source.ImplementationWorkspace, source.LastImplementationFailure);
+        var firstRevision = Assert.Single(legacy.ImplementationRevisions);
+        var first = Extract(Exporter().Export(legacy));
+        var second = Extract(Exporter().Export(legacy));
+
+        Assert.Equal(first, second);
+        Assert.Contains("Implementation revision 1 — CURRENT", first);
+        Assert.Contains(firstRevision.ResultFingerprint!, first);
+        Assert.Contains("Approved at: not approved", first);
+        Assert.Null(legacy.ApprovedImplementationRevisionId);
     }
 
     [Fact]
@@ -591,7 +665,7 @@ public sealed class TaskPdfExporterTests
 
         foreach (var forbidden in new[] { "Alice Smith", "Shared Folder", "/opt/acme", "/home/user", token })
             Assert.DoesNotContain(forbidden, text, StringComparison.OrdinalIgnoreCase);
-        Assert.Contains("forge/task-[internal-id-redacted]", text);
+        Assert.Contains(ImplementationBranchDisplay.SafeLabel, text);
         Assert.Contains("--- a/src/Safe.cs", text);
         Assert.Contains("+++ b/src/Safe.cs", text);
         Assert.Contains("@@ -1 +1 @@", text);
@@ -831,26 +905,34 @@ public sealed class TaskPdfExporterTests
     }
 
     [Fact]
-    public void Legacy_result_json_without_completion_metadata_renders_not_recorded()
+    public void Missing_checkout_certainty_rehydrates_false_changes_fingerprint_and_cannot_produce_approved_pdf()
     {
         var source = ImplementedAuditTask();
         var node = JsonNode.Parse(JsonSerializer.Serialize(source.ImplementationResult, JsonOptions))!.AsObject();
         node.Remove("activeCheckoutVerified");
-        node.Remove("worktreeFingerprint");
-        node.Remove("worktreeFileCount");
-        node.Remove("worktreeBytes");
         var legacy = node.Deserialize<ImplementationResult>(JsonOptions)!;
         var task = CopyImplementationState(source, legacy, source.ImplementationWorkspace!, null);
+        var revision = Assert.Single(task.ImplementationRevisions);
+        var verifiedFingerprint = ImplementationReviewFingerprint.ComputeResult(
+            task.Id, revision.RevisionId, revision.RevisionNumber, revision.Kind,
+            revision.PlanFingerprint, legacy with { ActiveCheckoutVerified = true });
 
         var text = Extract(Exporter().Export(task, new ImplementationReportRuntimeStatus(false,
             ImplementationAttemptDisposition.RecoveryRequired, null)));
 
-        Assert.True(legacy.ActiveCheckoutVerified);
-        Assert.Empty(legacy.WorktreeFingerprint);
-        Assert.Contains("Active checkout verified when implementation completed: not recorded", text);
-        Assert.Contains("Isolated worktree file count: not recorded", text);
-        Assert.Contains("Isolated worktree byte count: not recorded", text);
+        Assert.False(legacy.ActiveCheckoutVerified);
+        Assert.Equal(revision.ResultFingerprint, ImplementationReviewFingerprint.ComputeResult(
+            task.Id, revision.RevisionId, revision.RevisionNumber, revision.Kind,
+            revision.PlanFingerprint, legacy));
+        Assert.NotEqual(verifiedFingerprint, revision.ResultFingerprint);
+        var exception = Assert.Throws<ImplementationException>(() => task.ApproveImplementation(
+            Guid.NewGuid(), task.RowVersion, revision.RevisionId, revision.ResultFingerprint!, Now.AddMinutes(7)));
+        Assert.Equal("implementation_review_ineligible", exception.Category);
+        Assert.Equal(WorkflowStatus.AwaitingImplementationReview, task.Status);
+        Assert.Contains("NOT ELIGIBLE FOR APPROVAL", text);
+        Assert.Contains("Active checkout verified when implementation completed: no", text);
         Assert.DoesNotContain("Active checkout verified when implementation completed: yes", text);
+        Assert.DoesNotContain("APPROVED PERSISTED IMPLEMENTATION REVIEW", text);
     }
 
     [Fact]

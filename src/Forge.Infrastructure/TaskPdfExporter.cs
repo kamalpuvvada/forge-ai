@@ -41,6 +41,7 @@ public sealed class TaskPdfExporter(
     private const int MaximumUnresolvedQuestions = 25;
     private const int MaximumImplementationWarnings = 25;
     private const int MaximumChangedFiles = 25;
+    private const int MaximumImplementationRevisions = 6;
     private const int MaximumModelCalls = 100;
     private const int MaximumJoinedValues = 100;
     private const int MaximumJoinedCharacters = 10_000;
@@ -100,6 +101,7 @@ public sealed class TaskPdfExporter(
 
         if (task.RepositorySnapshot is { } snapshot) WriteRepositoryAnalysis(writer, task, snapshot);
         if (task.ImplementationPlan is { } plan) WriteImplementationPlan(writer, task, plan);
+        if (task.ImplementationRevisions.Count > 0) WriteImplementationRevisionChronology(writer, task);
         if (HasImplementationAttempt(task, runtimeStatus)) WriteImplementationAttempt(writer, task, runtimeStatus);
         if (task.ImplementationResult is { } result) WriteImplementationReview(writer, task, result);
 
@@ -180,6 +182,43 @@ public sealed class TaskPdfExporter(
         writer.Field("Plan approved", RecordedAt(task.PlanApprovedAt));
         writer.Field("Implementation started", RecordedAt(task.ImplementationStartedAt));
         writer.Field("Implementation completed", RecordedAt(task.ImplementationCompletedAt));
+        var approved = task.ImplementationRevisions.SingleOrDefault(revision =>
+            revision.RevisionId == task.ApprovedImplementationRevisionId);
+        writer.Field("Implementation approved", RecordedAt(approved?.ApprovedAt));
+    }
+
+    private static void WriteImplementationRevisionChronology(FlowWriter writer, EngineeringTask task)
+    {
+        writer.Section("Implementation revision chronology", FlowElementKind.SubsectionWithBody);
+        WriteCollection(writer, task.ImplementationRevisions, MaximumImplementationRevisions, (revision, _) =>
+        {
+            var labels = new List<string>();
+            if (task.ActiveImplementationRevisionId == revision.RevisionId) labels.Add("CURRENT");
+            if (task.ApprovedImplementationRevisionId == revision.RevisionId) labels.Add("APPROVED");
+            writer.Subsection($"Implementation revision {revision.RevisionNumber}" +
+                              (labels.Count == 0 ? string.Empty : $" — {string.Join(" / ", labels)}"));
+            writer.Field("Kind", revision.Kind.ToString());
+            writer.Field("Approved plan fingerprint", revision.PlanFingerprint);
+            writer.Field("Base commit SHA", revision.BaseCommitSha);
+            writer.Field("Generation started", FormatTimestamp(revision.GenerationStartedAt));
+            writer.Field("Generation completed", revision.GenerationCompletedAt is { } completed
+                ? FormatTimestamp(completed)
+                : "not recorded");
+            writer.Field("Generation disposition", revision.GenerationState.ToString());
+            writer.Field("Review disposition", revision.ReviewState.ToString());
+            writer.Field("Persisted result fingerprint", revision.ResultFingerprint ?? "not recorded");
+            writer.Field("Changed-file count", FormatNumber(revision.Result?.ChangedFiles.Count ?? 0));
+            writer.Field("Approved at", revision.ApprovedAt is { } approved
+                ? FormatTimestamp(approved)
+                : "not approved");
+            if (revision.Failure is { } failure)
+            {
+                writer.Field("Safe failure category", failure.Category);
+                writer.Field("Safe failure message", failure.Message);
+            }
+        });
+        if (task.Status == WorkflowStatus.ImplementationApproved)
+            writer.Body("Implementation approval applies to the exact persisted review evidence above. It did not run validation or verify current physical workspace availability.");
     }
 
     private static void WriteRevisionHistory(FlowWriter writer, EngineeringTask task)
@@ -381,10 +420,14 @@ public sealed class TaskPdfExporter(
         ImplementationResult result)
     {
         writer.Section("Implementation review");
+        if (task.Status == WorkflowStatus.ImplementationApproved)
+            writer.Body("APPROVED PERSISTED IMPLEMENTATION REVIEW — validation was not run and no files were staged, committed, pushed, or submitted as a pull request.");
+        else if (!result.ActiveCheckoutVerified)
+            writer.Body("NOT ELIGIBLE FOR APPROVAL — Forge could not verify that the active checkout remained unchanged when implementation completed.");
         writer.Field("Source", result.Source.ToString());
         writer.Field("Model", result.Model ?? "none (deterministic Fake implementation)");
         writer.Field("Base commit SHA", result.BaseCommitSha);
-        writer.Field("Isolated task branch", result.Branch);
+        writer.Field("Isolated task branch", ImplementationBranchDisplay.Format(result.Branch));
         writer.Field("Completed at", FormatTimestamp(result.CompletedAt));
         writer.Field("Implementation summary", result.Summary);
         writer.Subsection("Implementation warnings");

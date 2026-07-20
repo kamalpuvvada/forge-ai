@@ -10,6 +10,8 @@
 - [x] Explicit `PlanApproved` gate with legacy approved-plan compatibility
 - [x] Safe deterministic Fake implementation in an isolated task worktree
 - [x] Persisted bounded changed-file metadata and human diff-review state
+- [x] Bounded implementation-revision ledger and exact persisted-review approval
+- [x] Globally bound atomic approval commands, verified-checkout eligibility, and token-safe branch projection
 - [x] Stage-specific clarification/planning telemetry and truthful capabilities
 - [x] README setup and validation commands
 - [ ] Curated demo repository and demo data

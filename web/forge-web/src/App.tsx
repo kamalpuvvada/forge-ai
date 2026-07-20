@@ -13,7 +13,7 @@ import './App.css'
 import './implementation.css'
 
 const stages = ['Understand', 'Clarify', 'Confirm', 'Plan', 'Implement', 'Diff review', 'Validate', 'Review', 'Pull Request']
-const stageByStatus: Record<WorkflowStatus, number> = { Draft: 0, Clarifying: 1, RequirementSummaryReady: 2, AwaitingRequirementApproval: 2, ReadyForPlanning: 3, Planning: 3, AwaitingPlanApproval: 3, PlanApproved: 3, Implementing: 4, AwaitingImplementationReview: 5, Validating: 6, Reviewing: 7, Completed: 8, Failed: 0 }
+const stageByStatus: Record<WorkflowStatus, number> = { Draft: 0, Clarifying: 1, RequirementSummaryReady: 2, AwaitingRequirementApproval: 2, ReadyForPlanning: 3, Planning: 3, AwaitingPlanApproval: 3, PlanApproved: 3, Implementing: 4, AwaitingImplementationReview: 5, ImplementationApproved: 5, Validating: 6, Reviewing: 7, Completed: 8, Failed: 0 }
 
 function App() {
   const [repository, setRepository] = useState('')
@@ -40,6 +40,8 @@ function App() {
   const [exportingPdf, setExportingPdf] = useState<'task' | 'plan' | null>(null)
   const [pdfExportError, setPdfExportError] = useState<string | null>(null)
   const [implementationInFlight, setImplementationInFlight] = useState(false)
+  const [approvalInFlight, setApprovalInFlight] = useState(false)
+  const [approvalDialogOpen, setApprovalDialogOpen] = useState(false)
   const [copyState, setCopyState] = useState<RequirementCopyState>('idle')
   const [copyError, setCopyError] = useState<string | null>(null)
   const [historyPanelOpen, setHistoryPanelOpen] = useState(false)
@@ -50,6 +52,9 @@ function App() {
   const copyResetTimer = useRef<number | null>(null)
   const historyToggleButton = useRef<HTMLButtonElement | null>(null)
   const historyPanelHeading = useRef<HTMLHeadingElement | null>(null)
+  const approvalDialog = useRef<HTMLDialogElement | null>(null)
+  const approvalCancelButton = useRef<HTMLButtonElement | null>(null)
+  const approvalSubmissionActive = useRef(false)
   const selectedTaskId = task?.id ?? null
   const activeStage = task ? stageByStatus[task.status] : 0
   const answeredCount = task?.clarificationAnswers.length ?? 0
@@ -96,6 +101,9 @@ function App() {
     setCopyError(null)
     setPlanRevisionInFlight(false)
     setImplementationInFlight(false)
+    setApprovalInFlight(false)
+    approvalSubmissionActive.current = false
+    setApprovalDialogOpen(false)
   }
 
   function captureTaskSelection(taskId: string) {
@@ -171,6 +179,15 @@ function App() {
     window.addEventListener('keydown', handleEscape)
     return () => window.removeEventListener('keydown', handleEscape)
   }, [historyPanelOpen])
+
+  useEffect(() => {
+    if (!approvalDialogOpen) return
+    const nativeDialogSupported = typeof HTMLDialogElement !== 'undefined'
+      && typeof HTMLDialogElement.prototype.showModal === 'function'
+    const dialog = approvalDialog.current
+    if (nativeDialogSupported && dialog && !dialog.open) dialog.showModal()
+    approvalCancelButton.current?.focus()
+  }, [approvalDialogOpen])
 
   async function runTaskAction(taskId: string, action: () => Promise<EngineeringTask>, onSuccess?: () => void) {
     const token = captureTaskSelection(taskId)
@@ -361,6 +378,51 @@ function App() {
       }
     }
   }
+  function closeApprovalDialog() {
+    const dialog = approvalDialog.current
+    if (dialog?.open && typeof dialog.close === 'function') dialog.close()
+    setApprovalDialogOpen(false)
+  }
+  async function approveImplementation() {
+    if (approvalSubmissionActive.current || !task || task.status !== 'AwaitingImplementationReview' ||
+      task.implementationResult?.activeCheckoutVerified !== true) return
+    const revision = task.implementationRevisions.find(item => item.revisionId === task.activeImplementationRevisionId)
+    if (!revision?.resultFingerprint) return
+    const token = captureTaskSelection(task.id)
+    if (!token) return
+    approvalSubmissionActive.current = true
+    closeApprovalDialog()
+    setBusy(true); setApprovalInFlight(true); setError(null)
+    try {
+      const approved = await forgeApi.approveImplementation(task.id, {
+        commandId: crypto.randomUUID(),
+        expectedRowVersion: task.rowVersion,
+        expectedRevisionId: revision.revisionId,
+        expectedResultFingerprint: revision.resultFingerprint,
+      })
+      if (!selectionCoordinator.current.matches(token)) return
+      setTask(approved)
+    } catch (caught) {
+      if (!selectionCoordinator.current.matches(token)) return
+      if (caught instanceof ForgeApiError && ['task_concurrency_conflict', 'workflow_conflict'].includes(caught.code ?? '')) {
+        try {
+          const refreshed = await forgeApi.getTask(task.id)
+          if (!selectionCoordinator.current.matches(token)) return
+          setTask(refreshed)
+        } catch { /* Keep the safe conflict message below. */ }
+        if (!selectionCoordinator.current.matches(token)) return
+        setError('The implementation review changed while approval was pending. Review the current revision before trying again.')
+      } else {
+        setError(caught instanceof Error ? caught.message : 'The implementation review could not be approved.')
+      }
+    } finally {
+      if (selectionCoordinator.current.matches(token)) {
+        setBusy(false)
+        setApprovalInFlight(false)
+        approvalSubmissionActive.current = false
+      }
+    }
+  }
   async function exportPdf(documentType: 'task' | 'plan') {
     const approvedPlanState = task?.implementationPlan && task.planApprovedAt
     if (!task || exportingPdf || (documentType === 'task' && !approvedPlanState)) return
@@ -419,8 +481,18 @@ function App() {
     ?? task?.implementationResult?.activeCheckoutVerified
     ?? task?.lastImplementationFailure?.activeCheckoutVerified
     ?? false
+  const persistedCheckoutVerified = task?.implementationResult?.activeCheckoutVerified === true
   const hasApprovedPlan = Boolean(task?.implementationPlan && task.planApprovedAt)
-  const approvedPlanControlsRenderedInState = task ? ['PlanApproved', 'Implementing', 'AwaitingImplementationReview'].includes(task.status) : false
+  const approvedPlanControlsRenderedInState = task ? ['PlanApproved', 'Implementing', 'AwaitingImplementationReview', 'ImplementationApproved'].includes(task.status) : false
+  const activeImplementationRevision = task?.implementationRevisions.find(revision => revision.revisionId === task.activeImplementationRevisionId) ?? null
+  const nativeApprovalDialogSupported = typeof HTMLDialogElement !== 'undefined'
+    && typeof HTMLDialogElement.prototype.showModal === 'function'
+  const approvalDialogContents = <>
+    <h2 id="implementation-approval-title">Approve implementation revision {activeImplementationRevision?.revisionNumber}</h2>
+    <p id="implementation-approval-description">Fingerprint: <code>{activeImplementationRevision?.resultFingerprint?.slice(0, 12)}…</code></p>
+    <ul><li>Validation was not run.</li><li>No files were staged.</li><li>No commit or push occurred.</li><li>Approval accepts the persisted review only.</li></ul>
+    <div className="approval-actions"><button ref={approvalCancelButton} type="button" className="secondary-button" onClick={closeApprovalDialog}>Cancel</button><button type="button" className="primary-button compact" onClick={() => void approveImplementation()} disabled={approvalInFlight}>{approvalInFlight ? 'Approving…' : 'Confirm approval'}</button></div>
+  </>
   const planningCost = planningCalls.reduce((total, call) => total + (call.estimatedCostUsd ?? 0), 0)
   const latestFailedPlanningCall = [...planningCalls].reverse().find(call => !call.succeeded)
   const planningRecovery = getPlanningRecovery(latestFailedPlanningCall?.failureCategory ?? null, planningSnapshotStale)
@@ -527,16 +599,22 @@ function App() {
           {task?.status === 'PlanApproved' && <div className="ready-view"><div className="success-seal">✓</div><p className="eyebrow">PLAN APPROVED</p><h2>Generate an isolated implementation for diff review.</h2><p>Forge will require a clean Git repository at the approved HEAD, create a task branch and linked worktree outside the active checkout, then apply deterministic Fake changes only in that worktree.</p><div className="coming-next"><span>05</span><div><strong>Safe Fake implementation</strong><p>No validation, staging, commit, push or pull request action will run.</p></div>{capabilities?.implementationConfigured ? <button className="primary-button compact" onClick={() => void generateImplementation()} disabled={busy}>{implementationInFlight ? <><span className="spinner" />Generating…</> : <>Generate implementation <span>→</span></>}</button> : <p className="truth-note" role="status">Implementation generation is currently available only when Forge is configured in deterministic Fake mode.</p>}</div><div className="export-actions"><button className="secondary-button" onClick={() => void exportPdf('plan')} disabled={exportingPdf !== null}>{exportingPdf === 'plan' ? 'Generating plan…' : 'Download approved plan'}</button><button className="secondary-button" onClick={() => void exportPdf('task')} disabled={exportingPdf !== null}>{exportingPdf === 'task' ? 'Generating task report…' : 'Download task report PDF'}</button></div>{pdfExportError && <p className="export-error" role="alert">{pdfExportError}</p>}</div>}
           {implementationIsActive && <div className="implementation-progress" role="status"><span className="spinner dark" /><p className="eyebrow">ISOLATED IMPLEMENTATION</p><h2>Preparing generated changes for diff review</h2><p>Forge holds a valid implementation lease and is working only in the persisted task worktree.</p></div>}
           {task?.status === 'Implementing' && !implementationIsActive && <div className="planning-failure implementation-failure"><div className="failure-seal">!</div><p className="eyebrow">IMPLEMENTATION ATTEMPT IS NOT ACTIVE</p><h2>{implementationCanResume ? 'The isolated workspace can be safely resumed' : implementationDisposition === 'TerminalIncompatible' ? 'The approved plan is not compatible with Fake implementation' : 'Workspace recovery is required'}</h2><p>{task.implementationRuntime?.safeMessage ?? task.lastImplementationFailure?.message ?? 'The previous implementation attempt was interrupted.'}</p><small>{implementationCanResume ? 'Forge will verify the matching untouched workspace before it resumes.' : 'Forge will not reset, delete, or overwrite this workspace automatically.'}</small>{implementationCanResume && <button className="primary-button compact" onClick={() => void generateImplementation()} disabled={busy}>Resume implementation <span>→</span></button>}<div className="export-actions"><button className="secondary-button" onClick={() => void exportPdf('plan')} disabled={exportingPdf !== null}>Download approved plan</button><button className="secondary-button" onClick={() => void exportPdf('task')} disabled={exportingPdf !== null}>Download task report PDF</button></div></div>}
-          {task?.status === 'AwaitingImplementationReview' && task.implementationResult && <div className="implementation-review">
-            <div className="action-title"><span className="title-icon">06</span><div><h2>Review the isolated generated changes</h2><p>No validation commands were run and no change was staged, committed, pushed, or proposed as a pull request.</p></div></div>
+          {(task?.status === 'AwaitingImplementationReview' || task?.status === 'ImplementationApproved') && task.implementationResult && <div className="implementation-review">
+            <div className="action-title"><span className="title-icon">06</span><div><h2>{task.status === 'ImplementationApproved' ? 'Implementation approved' : 'Review the isolated generated changes'}</h2><p>No validation commands were run and no change was staged, committed, pushed, or proposed as a pull request.</p></div></div>
             <span className="fake-label">Deterministic Fake implementation · MECHANICAL WORKFLOW DEMONSTRATION</span>
-            {!activeCheckoutVerified && <div className="diff-truncation-banner" role="alert"><strong>Active-checkout postcondition is uncertain.</strong><p>Forge could not verify that the active checkout remained unchanged. Explicit recovery is required before relying on this review.</p></div>}
-            <div className="implementation-truth"><p><strong>Validation commands were not run.</strong></p><p><strong>{activeCheckoutVerified ? 'The active checkout was verified unchanged.' : 'The active checkout could not be verified unchanged.'}</strong></p><p>Workspace: {task.implementationRuntime?.workspaceAvailable ? 'available' : 'unavailable; persisted review remains readable'}</p></div>
+            {task.status === 'ImplementationApproved' && activeImplementationRevision && <div className="implementation-approved" role="status"><strong>Implementation approved</strong><p>Revision {activeImplementationRevision.revisionNumber} was approved on {activeImplementationRevision.approvedAt ? new Date(activeImplementationRevision.approvedAt).toLocaleString() : 'an unrecorded date'}.</p><code>{activeImplementationRevision.resultFingerprint?.slice(0, 12)}…</code><small>This approval accepts persisted review evidence only. Validation was not run, and nothing was staged, committed, pushed, or submitted as a pull request.</small></div>}
+            {!persistedCheckoutVerified && <div className="diff-truncation-banner" role="alert"><strong>This review cannot be approved.</strong><p>Forge could not verify that the active checkout remained unchanged when implementation completed. This persisted completion evidence is not safely approvable.</p></div>}
+            <div className="implementation-truth"><p><strong>Validation commands were not run.</strong></p><p><strong>{activeCheckoutVerified ? 'The active checkout was verified unchanged.' : 'The active checkout could not be verified unchanged.'}</strong></p><p>Workspace: {task.implementationRuntime ? task.implementationRuntime.workspaceAvailable ? 'available' : 'unavailable; persisted review remains readable' : 'not observed during approval; persisted review remains readable'}</p></div>
             <section className="plan-section implementation-metadata"><small>IMPLEMENTATION METADATA</small><dl><div><dt>Base commit</dt><dd><code>{task.implementationResult.baseCommitSha}</code></dd></div><div><dt>Generated branch</dt><dd><code>{task.implementationResult.branch}</code></dd></div><div><dt>Source</dt><dd>Deterministic Fake implementation</dd></div></dl></section>
             <section className="plan-section"><small>SUMMARY</small><p>{task.implementationResult.summary}</p></section>
             <section className="plan-section"><small>WARNINGS</small><ul>{task.implementationResult.warnings.map(warning => <li key={warning}>{warning}</li>)}</ul></section>
             {task.implementationResult.diffTruncated && <div className="diff-truncation-banner" role="status"><strong>Displayed diff is incomplete.</strong><p>{task.implementationResult.displayedDiffCharacters.toLocaleString()} of {task.implementationResult.fullDiffCharacters.toLocaleString()} diff characters are persisted for display. File hashes and line counts are complete.</p></div>}
             <section className="plan-section changed-files"><small>CHANGED FILES</small>{task.implementationResult.changedFiles.map(file => <details className="changed-file-review" key={file.path}><summary><code>{file.path}</code><span>{file.action}</span><b className="diff-counts">+{file.additions} −{file.deletions}</b></summary><div className="changed-file-metadata"><span>{file.originalLines} → {file.newLines} lines</span><span>{file.originalBytes.toLocaleString()} → {file.newBytes.toLocaleString()} bytes</span></div>{file.diffTruncated && <div className="diff-truncation-banner compact"><strong>This file diff is truncated.</strong><span>{file.displayedDiffCharacters.toLocaleString()} of {file.fullDiffCharacters.toLocaleString()} characters displayed.</span></div>}<pre className="unified-diff" tabIndex={0} aria-label={`Unified diff for ${file.path}`}>{file.diffPreview}</pre></details>)}</section>
+            <details className="implementation-revision-history"><summary>Implementation revision history</summary>{task.implementationRevisions.map(revision => <article key={revision.revisionId}><div><strong>Revision {revision.revisionNumber} · {revision.kind}</strong>{revision.isCurrent && <span>CURRENT</span>}{revision.isApproved && <span>APPROVED</span>}</div><p>{revision.generationState} · {revision.reviewState} · {revision.changedFileCount} changed file{revision.changedFileCount === 1 ? '' : 's'}</p><code>{revision.resultFingerprint ?? 'Result fingerprint not recorded'}</code>{revision.approvedAt && <small>Approved {new Date(revision.approvedAt).toLocaleString()}</small>}</article>)}</details>
+            {task.status === 'AwaitingImplementationReview' && persistedCheckoutVerified && activeImplementationRevision?.resultFingerprint && <div className="approval-row implementation-approval-row"><p><strong>Explicit implementation approval required</strong><br />Approval accepts revision {activeImplementationRevision.revisionNumber} and its exact persisted review fingerprint.</p><button type="button" className="primary-button compact" onClick={() => setApprovalDialogOpen(true)} disabled={busy || approvalInFlight}>Approve implementation <span>→</span></button></div>}
+            {nativeApprovalDialogSupported
+              ? <dialog ref={approvalDialog} className="approval-dialog" onCancel={event => { event.preventDefault(); closeApprovalDialog() }} onClose={() => setApprovalDialogOpen(false)} onKeyDown={event => { if (event.key === 'Escape') { event.preventDefault(); closeApprovalDialog() } }} aria-labelledby="implementation-approval-title" aria-describedby="implementation-approval-description">{approvalDialogContents}</dialog>
+              : approvalDialogOpen && <div className="approval-dialog approval-dialog-fallback" role="dialog" aria-modal="true" aria-labelledby="implementation-approval-title" aria-describedby="implementation-approval-description" onKeyDown={event => { if (event.key === 'Escape') { event.preventDefault(); closeApprovalDialog() } }}>{approvalDialogContents}</div>}
             <div className="export-actions"><button className="secondary-button" onClick={() => void exportPdf('plan')} disabled={exportingPdf !== null}>Download approved plan</button><button className="secondary-button" onClick={() => void exportPdf('task')} disabled={exportingPdf !== null}>Download task report PDF</button></div>{pdfExportError && <p className="export-error" role="alert">{pdfExportError}</p>}
           </div>}
           {task && hasApprovedPlan && !approvedPlanControlsRenderedInState && <div className="semantic-plan-actions"><div><strong>Approved plan documents</strong><p>The persisted plan approval remains valid in this later workflow state.</p></div><div className="export-actions"><button className="secondary-button" onClick={() => void exportPdf('plan')} disabled={exportingPdf !== null}>Download approved plan</button><button className="secondary-button" onClick={() => void exportPdf('task')} disabled={exportingPdf !== null}>Download task report PDF</button></div></div>}

@@ -6,6 +6,7 @@ using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using Forge.Api.Contracts;
 using Forge.Api.Controllers;
 using Forge.Core;
@@ -346,8 +347,7 @@ public sealed class EngineeringTaskApiTests : IClassFixture<FakeModeFactory>
         if (!response.IsSuccessStatusCode)
         {
             var failed = await _client.GetFromJsonAsync<JsonElement>($"/api/tasks/{id}");
-            var token = failed.GetProperty("implementationWorkspace").GetProperty("token").GetString()!;
-            var workspaceStatus = FakeModeFactory.RunGit(Path.Combine(_factory.WorktreeRoot, token),
+            var workspaceStatus = FakeModeFactory.RunGit(Path.Combine(_factory.WorktreeRoot, id.ToString("N")),
                 "status", "--porcelain=v1", "--untracked-files=all");
             Assert.Fail($"{await response.Content.ReadAsStringAsync()} Workspace status: {workspaceStatus}");
         }
@@ -365,6 +365,27 @@ public sealed class EngineeringTaskApiTests : IClassFixture<FakeModeFactory>
         Assert.Equal(0, implemented.GetProperty("telemetry").GetProperty("totalCalls").GetInt32());
         Assert.DoesNotContain(_factory.WorktreeRoot, implemented.ToString(), StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("validation succeeded", implemented.ToString(), StringComparison.OrdinalIgnoreCase);
+        Assert.False(implemented.GetProperty("implementationWorkspace").TryGetProperty("token", out _));
+        var revision = Assert.Single(implemented.GetProperty("implementationRevisions").EnumerateArray());
+        Assert.Equal(1, revision.GetProperty("revisionNumber").GetInt32());
+        Assert.True(revision.GetProperty("isCurrent").GetBoolean());
+        Assert.Matches("^[0-9a-f]{64}$", revision.GetProperty("resultFingerprint").GetString()!);
+        Assert.True(implemented.GetProperty("implementationResult").GetProperty("activeCheckoutVerified").GetBoolean());
+        var resultFingerprint = revision.GetProperty("resultFingerprint").GetString()!;
+        var (compatibilityResultJson, revisionLedgerJson) = await ReadImplementationResultJsonAsync(
+            _factory.DatabasePath, id);
+        using (var compatibilityDocument = JsonDocument.Parse(compatibilityResultJson))
+            Assert.True(compatibilityDocument.RootElement.GetProperty("activeCheckoutVerified").GetBoolean());
+        using (var ledgerDocument = JsonDocument.Parse(revisionLedgerJson))
+            Assert.True(ledgerDocument.RootElement[0].GetProperty("result")
+                .GetProperty("activeCheckoutVerified").GetBoolean());
+        SqliteConnection.ClearAllPools();
+        var reopened = (await new SqliteEngineeringTaskRepository($"Data Source={_factory.DatabasePath}")
+            .GetAsync(id))!;
+        Assert.True(reopened.ImplementationResult!.ActiveCheckoutVerified);
+        var reopenedRevision = Assert.Single(reopened.ImplementationRevisions);
+        Assert.True(reopenedRevision.Result!.ActiveCheckoutVerified);
+        Assert.Equal(resultFingerprint, reopenedRevision.ResultFingerprint);
 
         Assert.Equal(contentBefore, await File.ReadAllTextAsync(activeFile));
         Assert.Equal(headBefore, FakeModeFactory.RunGit(repository, "rev-parse", "HEAD"));
@@ -380,6 +401,246 @@ public sealed class EngineeringTaskApiTests : IClassFixture<FakeModeFactory>
         (await _client.GetAsync($"/api/tasks/{id}/export/pdf")).EnsureSuccessStatusCode();
         var afterReadOnlyRoutes = await ReadPersistedStateAsync(_factory.DatabasePath, id);
         Assert.Equal(beforeReadOnlyRoutes, afterReadOnlyRoutes);
+    }
+
+    [Fact]
+    public async Task Exact_implementation_approval_is_idempotent_terminal_and_does_not_touch_either_checkout()
+    {
+        var repository = _factory.TargetRepositoryPath;
+        var created = await CreateAsync(
+            "Add report export. Acceptance criteria: export is available. Validation: inspect the bounded diff.",
+            repository);
+        var id = created.GetProperty("id").GetGuid();
+        (await _client.PostAsync($"/api/tasks/{id}/requirement-approval", null)).EnsureSuccessStatusCode();
+        (await _client.PostAsync($"/api/tasks/{id}/repository-analysis", null)).EnsureSuccessStatusCode();
+        (await _client.PostAsync($"/api/tasks/{id}/plan", null)).EnsureSuccessStatusCode();
+        (await _client.PostAsync($"/api/tasks/{id}/plan-approval", null)).EnsureSuccessStatusCode();
+        var generation = await _client.PostAsync($"/api/tasks/{id}/implementation", null);
+        Assert.True(generation.IsSuccessStatusCode, await generation.Content.ReadAsStringAsync());
+        var generationJson = await generation.Content.ReadAsStringAsync();
+        var review = JsonDocument.Parse(generationJson).RootElement.Clone();
+        var internalIdentities = await ReadImplementationIdentitiesAsync(_factory.DatabasePath, id);
+        Assert.All(internalIdentities, identity =>
+            Assert.DoesNotContain(identity, generationJson, StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(ImplementationBranchDisplay.SafeLabel, generationJson, StringComparison.Ordinal);
+        var revision = Assert.Single(review.GetProperty("implementationRevisions").EnumerateArray());
+        var commandId = Guid.NewGuid();
+        var payload = new
+        {
+            commandId,
+            expectedRowVersion = review.GetProperty("rowVersion").GetInt64(),
+            expectedRevisionId = revision.GetProperty("revisionId").GetGuid(),
+            expectedResultFingerprint = revision.GetProperty("resultFingerprint").GetString()
+        };
+        var sourceBefore = DirectoryIdentity(repository);
+        var worktreesBefore = DirectoryIdentity(_factory.WorktreeRoot);
+
+        var response = await _client.PostAsJsonAsync($"/api/tasks/{id}/implementation-approval", payload);
+        Assert.True(response.IsSuccessStatusCode, await response.Content.ReadAsStringAsync());
+        var approvedJson = await response.Content.ReadAsStringAsync();
+        var approved = JsonDocument.Parse(approvedJson).RootElement.Clone();
+        Assert.All(internalIdentities, identity =>
+            Assert.DoesNotContain(identity, approvedJson, StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(ImplementationBranchDisplay.SafeLabel, approvedJson, StringComparison.Ordinal);
+        var approvedRevision = Assert.Single(approved.GetProperty("implementationRevisions").EnumerateArray());
+        Assert.Equal("ImplementationApproved", approved.GetProperty("status").GetString());
+        Assert.Equal("Approved", approvedRevision.GetProperty("reviewState").GetString());
+        Assert.True(approvedRevision.GetProperty("isApproved").GetBoolean());
+        Assert.Equal(payload.expectedRevisionId, approved.GetProperty("approvedImplementationRevisionId").GetGuid());
+        Assert.Equal(JsonValueKind.Null, approved.GetProperty("implementationRuntime").ValueKind);
+        Assert.Equal(sourceBefore, DirectoryIdentity(repository));
+        Assert.Equal(worktreesBefore, DirectoryIdentity(_factory.WorktreeRoot));
+
+        var approvedRowVersion = approved.GetProperty("rowVersion").GetInt64();
+        var approvedAt = approvedRevision.GetProperty("approvedAt").GetString();
+        var replay = await _client.PostAsJsonAsync($"/api/tasks/{id}/implementation-approval", payload);
+        replay.EnsureSuccessStatusCode();
+        var replayed = await replay.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Equal(approvedRowVersion, replayed.GetProperty("rowVersion").GetInt64());
+        Assert.Equal(approvedAt, Assert.Single(replayed.GetProperty("implementationRevisions").EnumerateArray())
+            .GetProperty("approvedAt").GetString());
+
+        var conflict = await _client.PostAsJsonAsync($"/api/tasks/{id}/implementation-approval",
+            payload with { commandId = Guid.NewGuid() });
+        Assert.Equal(HttpStatusCode.Conflict, conflict.StatusCode);
+        Assert.Equal("workflow_conflict", (await conflict.Content.ReadFromJsonAsync<JsonElement>())
+            .GetProperty("code").GetString());
+        Assert.Equal(sourceBefore, DirectoryIdentity(repository));
+        Assert.Equal(worktreesBefore, DirectoryIdentity(_factory.WorktreeRoot));
+    }
+
+    [Fact]
+    public async Task Implementation_approval_returns_safe_validation_stale_and_missing_task_problem_details()
+    {
+        var repository = _factory.TargetRepositoryPath;
+        var created = await CreateAsync(
+            "Add report export. Acceptance criteria: export is available. Validation: inspect the bounded diff.",
+            repository);
+        var id = created.GetProperty("id").GetGuid();
+        (await _client.PostAsync($"/api/tasks/{id}/requirement-approval", null)).EnsureSuccessStatusCode();
+        (await _client.PostAsync($"/api/tasks/{id}/repository-analysis", null)).EnsureSuccessStatusCode();
+        (await _client.PostAsync($"/api/tasks/{id}/plan", null)).EnsureSuccessStatusCode();
+        (await _client.PostAsync($"/api/tasks/{id}/plan-approval", null)).EnsureSuccessStatusCode();
+        var generated = await _client.PostAsync($"/api/tasks/{id}/implementation", null);
+        Assert.True(generated.IsSuccessStatusCode, await generated.Content.ReadAsStringAsync());
+        var review = await generated.Content.ReadFromJsonAsync<JsonElement>();
+        var revision = Assert.Single(review.GetProperty("implementationRevisions").EnumerateArray());
+        var rowVersion = review.GetProperty("rowVersion").GetInt64();
+        var revisionId = revision.GetProperty("revisionId").GetGuid();
+        var fingerprint = revision.GetProperty("resultFingerprint").GetString()!;
+
+        var malformedRequests = new object[]
+        {
+            new { commandId = Guid.Empty, expectedRowVersion = rowVersion, expectedRevisionId = revisionId, expectedResultFingerprint = fingerprint },
+            new { commandId = Guid.NewGuid(), expectedRowVersion = -1, expectedRevisionId = revisionId, expectedResultFingerprint = fingerprint },
+            new { commandId = Guid.NewGuid(), expectedRowVersion = rowVersion, expectedRevisionId = Guid.Empty, expectedResultFingerprint = fingerprint },
+            new { commandId = Guid.NewGuid(), expectedRowVersion = rowVersion, expectedRevisionId = revisionId, expectedResultFingerprint = fingerprint.ToUpperInvariant() }
+        };
+        foreach (var malformed in malformedRequests)
+        {
+            var response = await _client.PostAsJsonAsync($"/api/tasks/{id}/implementation-approval", malformed);
+            Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+            Assert.DoesNotContain(_factory.WorktreeRoot, await response.Content.ReadAsStringAsync(),
+                StringComparison.OrdinalIgnoreCase);
+        }
+
+        foreach (var stale in new object[]
+                 {
+                     new { commandId = Guid.NewGuid(), expectedRowVersion = rowVersion + 1, expectedRevisionId = revisionId, expectedResultFingerprint = fingerprint },
+                     new { commandId = Guid.NewGuid(), expectedRowVersion = rowVersion, expectedRevisionId = Guid.NewGuid(), expectedResultFingerprint = fingerprint },
+                     new { commandId = Guid.NewGuid(), expectedRowVersion = rowVersion, expectedRevisionId = revisionId, expectedResultFingerprint = new string('0', 64) }
+                 })
+        {
+            var response = await _client.PostAsJsonAsync($"/api/tasks/{id}/implementation-approval", stale);
+            Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+            var problem = await response.Content.ReadFromJsonAsync<JsonElement>();
+            Assert.Equal("task_concurrency_conflict", problem.GetProperty("code").GetString());
+            Assert.DoesNotContain("forge/task-", problem.ToString(), StringComparison.OrdinalIgnoreCase);
+        }
+
+        var missing = await _client.PostAsJsonAsync($"/api/tasks/{Guid.NewGuid()}/implementation-approval", new
+        {
+            commandId = Guid.NewGuid(),
+            expectedRowVersion = 1,
+            expectedRevisionId = Guid.NewGuid(),
+            expectedResultFingerprint = new string('a', 64)
+        });
+        Assert.Equal(HttpStatusCode.NotFound, missing.StatusCode);
+        Assert.Equal("task_not_found", (await missing.Content.ReadFromJsonAsync<JsonElement>())
+            .GetProperty("code").GetString());
+    }
+
+    [Fact]
+    public async Task Uncertain_checkout_review_returns_422_without_persisting_approval()
+    {
+        var task = CreatePersistedImplementationReview(activeCheckoutVerified: false);
+        var repository = _factory.Services.GetRequiredService<IEngineeringTaskRepository>();
+        await repository.SaveAsync(task);
+        var revision = Assert.Single(task.ImplementationRevisions);
+        var before = await ReadPersistedStateAsync(_factory.DatabasePath, task.Id);
+        var commandsBefore = await CountApprovalCommandsAsync(_factory.DatabasePath);
+
+        var response = await _client.PostAsJsonAsync($"/api/tasks/{task.Id}/implementation-approval", new
+        {
+            commandId = Guid.NewGuid(),
+            expectedRowVersion = task.RowVersion,
+            expectedRevisionId = revision.RevisionId,
+            expectedResultFingerprint = revision.ResultFingerprint
+        });
+
+        Assert.Equal(HttpStatusCode.UnprocessableEntity, response.StatusCode);
+        var problem = await response.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Equal("implementation_review_ineligible", problem.GetProperty("code").GetString());
+        Assert.Equal(before, await ReadPersistedStateAsync(_factory.DatabasePath, task.Id));
+        Assert.Equal(commandsBefore, await CountApprovalCommandsAsync(_factory.DatabasePath));
+    }
+
+    [Fact]
+    public void Complete_task_response_redacts_real_branch_when_runtime_workspace_is_unavailable()
+    {
+        var task = CreatePersistedImplementationReview(activeCheckoutVerified: true);
+        var token = task.ImplementationWorkspace!.Token;
+        var branch = task.ImplementationWorkspace.Branch;
+        var response = EngineeringTaskResponse.FromDomain(
+            task,
+            new ModelCostResolver(new ModelCostCalculator(new Dictionary<string, ModelPricing>())),
+            new ImplementationRuntimeStatus(false, true, ImplementationAttemptDisposition.RecoveryRequired,
+                "The persisted review remains readable."));
+        var options = new JsonSerializerOptions(JsonSerializerDefaults.Web);
+        options.Converters.Add(new JsonStringEnumConverter());
+
+        var json = JsonSerializer.Serialize(response, options);
+
+        Assert.DoesNotContain(token, json, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(branch, json, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains(ImplementationBranchDisplay.SafeLabel, json, StringComparison.Ordinal);
+        Assert.Contains("\"workspaceAvailable\":false", json, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Approval_first_command_uses_production_di_without_resolving_operational_git_or_creating_roots()
+    {
+        using var factory = new ApprovalOnlyNoIoFactory();
+        using var client = factory.CreateClient();
+        void AssertNoOperationalIo()
+        {
+            Assert.Equal(0, factory.GitResolver.Calls);
+            Assert.False(Directory.Exists(factory.WorktreeRoot));
+            foreach (var directory in new[] { ".empty-hooks", ".git-home", ".locks", ".recovery", "recovery" })
+                Assert.False(Directory.Exists(Path.Combine(factory.WorktreeRoot, directory)));
+        }
+
+        var task = CreatePersistedImplementationReview(activeCheckoutVerified: true);
+        await factory.Services.GetRequiredService<IEngineeringTaskRepository>().SaveAsync(task);
+        var revision = Assert.Single(task.ImplementationRevisions);
+        var payload = new
+        {
+            commandId = Guid.NewGuid(),
+            expectedRowVersion = task.RowVersion,
+            expectedRevisionId = revision.RevisionId,
+            expectedResultFingerprint = revision.ResultFingerprint
+        };
+
+        var malformed = await client.PostAsJsonAsync($"/api/tasks/{task.Id}/implementation-approval",
+            payload with { commandId = Guid.Empty });
+        Assert.Equal(HttpStatusCode.BadRequest, malformed.StatusCode);
+        AssertNoOperationalIo();
+        var missing = await client.PostAsJsonAsync($"/api/tasks/{Guid.NewGuid()}/implementation-approval",
+            payload with { commandId = Guid.NewGuid() });
+        Assert.Equal(HttpStatusCode.NotFound, missing.StatusCode);
+        AssertNoOperationalIo();
+        var stale = await client.PostAsJsonAsync($"/api/tasks/{task.Id}/implementation-approval",
+            payload with { expectedRowVersion = task.RowVersion + 1 });
+        Assert.Equal(HttpStatusCode.Conflict, stale.StatusCode);
+        AssertNoOperationalIo();
+
+        var uncertain = CreatePersistedImplementationReview(activeCheckoutVerified: false);
+        await factory.Services.GetRequiredService<IEngineeringTaskRepository>().SaveAsync(uncertain);
+        var uncertainRevision = Assert.Single(uncertain.ImplementationRevisions);
+        var uncertainResponse = await client.PostAsJsonAsync(
+            $"/api/tasks/{uncertain.Id}/implementation-approval", new
+            {
+                commandId = Guid.NewGuid(),
+                expectedRowVersion = uncertain.RowVersion,
+                expectedRevisionId = uncertainRevision.RevisionId,
+                expectedResultFingerprint = uncertainRevision.ResultFingerprint
+            });
+        Assert.Equal(HttpStatusCode.UnprocessableEntity, uncertainResponse.StatusCode);
+        AssertNoOperationalIo();
+
+        var approved = await client.PostAsJsonAsync($"/api/tasks/{task.Id}/implementation-approval", payload);
+        approved.EnsureSuccessStatusCode();
+        AssertNoOperationalIo();
+        var replay = await client.PostAsJsonAsync($"/api/tasks/{task.Id}/implementation-approval", payload);
+        replay.EnsureSuccessStatusCode();
+        AssertNoOperationalIo();
+        var conflictingReplay = await client.PostAsJsonAsync(
+            $"/api/tasks/{task.Id}/implementation-approval",
+            payload with { expectedRowVersion = task.RowVersion + 1 });
+        Assert.Equal(HttpStatusCode.Conflict, conflictingReplay.StatusCode);
+        AssertNoOperationalIo();
+
+        Assert.Equal(1, await CountApprovalCommandsAsync(factory.DatabasePath));
     }
 
     [Fact]
@@ -879,8 +1140,8 @@ public sealed class EngineeringTaskApiTests : IClassFixture<FakeModeFactory>
         Assert.Contains("Plan approval status: APPROVED", text);
         Assert.Contains("Implementation review", text);
         Assert.Contains("Changed-file review", text);
-        var rawBranch = implemented.GetProperty("implementationResult").GetProperty("branch").GetString()!;
-        Assert.Contains("forge/task-[internal-id-redacted]", text, StringComparison.Ordinal);
+        var rawBranch = (await ReadImplementationIdentitiesAsync(factory.DatabasePath, id))[1];
+        Assert.Contains(ImplementationBranchDisplay.SafeLabel, text, StringComparison.Ordinal);
         Assert.DoesNotContain(rawBranch, text, StringComparison.Ordinal);
         Assert.DoesNotContain("Workspace token", text, StringComparison.OrdinalIgnoreCase);
         Assert.Contains("Relative path: ManualTarget.csproj", text);
@@ -969,6 +1230,8 @@ public sealed class EngineeringTaskApiTests : IClassFixture<FakeModeFactory>
         Assert.Equal("Deterministic Fake", capabilities.GetProperty("implementationProvider").GetString());
         Assert.True(capabilities.GetProperty("implementationConfigured").GetBoolean());
         Assert.True(capabilities.GetProperty("targetModificationAvailable").GetBoolean());
+        Assert.True(capabilities.GetProperty("implementationApprovalAvailable").GetBoolean());
+        Assert.False(capabilities.GetProperty("implementationCorrectionAvailable").GetBoolean());
         Assert.False(capabilities.GetProperty("validationAvailable").GetBoolean());
         Assert.True(capabilities.GetProperty("reviewAvailable").GetBoolean());
         Assert.False(capabilities.GetProperty("pullRequestCreationAvailable").GetBoolean());
@@ -1201,6 +1464,44 @@ public sealed class EngineeringTaskApiTests : IClassFixture<FakeModeFactory>
         return task;
     }
 
+    private static EngineeringTask CreatePersistedImplementationReview(bool activeCheckoutVerified)
+    {
+        var task = CreatePersistedImplementationAttempt();
+        var workspace = task.ImplementationWorkspace!;
+        var lease = task.ImplementationLease!;
+        const string diff = "diff --git a/src/App.cs b/src/App.cs";
+        var result = new ImplementationResult(
+            ImplementationSource.DeterministicFake,
+            null,
+            workspace.BaseCommitSha,
+            workspace.Branch,
+            "Persisted implementation review.",
+            [],
+            [new ChangedFileReview("src/App.cs", ImplementationOperationAction.Modify,
+                new string('3', 64), new string('4', 64), 10, 20, 1, 2, 1, 0,
+                diff, diff.Length, diff.Length, false, Encoding.UTF8.GetByteCount(diff),
+                Encoding.UTF8.GetByteCount(diff))],
+            diff.Length,
+            diff.Length,
+            false,
+            task.ImplementationStartedAt!.Value.AddMinutes(1),
+            Encoding.UTF8.GetByteCount(diff),
+            Encoding.UTF8.GetByteCount(diff),
+            true,
+            new string('5', 64),
+            1,
+            20);
+        task.StoreImplementationResult(result, lease.AttemptId, lease.OwnerId, result.CompletedAt);
+        if (!activeCheckoutVerified)
+            task.RecordImplementationPostconditionFailure(new ImplementationFailure(
+                "implementation_active_checkout_changed",
+                "Forge could not verify that the active checkout remained unchanged.",
+                true,
+                result.CompletedAt.AddMinutes(1),
+                ActiveCheckoutVerified: false), result.CompletedAt.AddMinutes(1));
+        return task;
+    }
+
     private static async Task<string> CreatePlanConstraintTargetAsync(FakeModeFactory factory)
     {
         var repository = Path.Combine(Path.GetDirectoryName(factory.DatabasePath)!, "plan-constraint-target");
@@ -1239,7 +1540,8 @@ public sealed class EngineeringTaskApiTests : IClassFixture<FakeModeFactory>
         await using var command = connection.CreateCommand();
         command.CommandText = """
             SELECT RowVersion, UpdatedAt, Status, ImplementationWorkspace, ImplementationResult,
-                   LastImplementationFailure, ImplementationLease
+                   LastImplementationFailure, ImplementationLease, ImplementationRevisions,
+                   ActiveImplementationRevisionId, ApprovedImplementationRevisionId
             FROM EngineeringTasks WHERE Id = $id;
             """;
         command.Parameters.AddWithValue("$id", id.ToString());
@@ -1247,6 +1549,50 @@ public sealed class EngineeringTaskApiTests : IClassFixture<FakeModeFactory>
         Assert.True(await reader.ReadAsync());
         return string.Join('|', Enumerable.Range(0, reader.FieldCount)
             .Select(index => reader.IsDBNull(index) ? "<null>" : reader.GetValue(index).ToString()));
+    }
+
+    private static async Task<long> CountApprovalCommandsAsync(string databasePath)
+    {
+        await using var connection = new SqliteConnection($"Data Source={databasePath}");
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT COUNT(*) FROM ImplementationApprovalCommands;";
+        return (long)(await command.ExecuteScalarAsync())!;
+    }
+
+    private static async Task<(string CompatibilityResult, string RevisionLedger)> ReadImplementationResultJsonAsync(
+        string databasePath,
+        Guid id)
+    {
+        await using var connection = new SqliteConnection($"Data Source={databasePath}");
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT ImplementationResult, ImplementationRevisions FROM EngineeringTasks WHERE Id = $id;";
+        command.Parameters.AddWithValue("$id", id.ToString());
+        await using var reader = await command.ExecuteReaderAsync();
+        Assert.True(await reader.ReadAsync());
+        return (reader.GetString(0), reader.GetString(1));
+    }
+
+    private static async Task<string[]> ReadImplementationIdentitiesAsync(
+        string databasePath,
+        Guid id)
+    {
+        await using var connection = new SqliteConnection($"Data Source={databasePath}");
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT ImplementationWorkspace FROM EngineeringTasks WHERE Id = $id;";
+        command.Parameters.AddWithValue("$id", id.ToString());
+        var json = (string)(await command.ExecuteScalarAsync())!;
+        using var document = JsonDocument.Parse(json);
+        return
+        [
+            document.RootElement.GetProperty("token").GetString()!,
+            document.RootElement.GetProperty("branch").GetString()!,
+            document.RootElement.GetProperty("repositoryIdentity").GetString()!,
+            document.RootElement.GetProperty("gitCommonDirectoryIdentity").GetString()!,
+            document.RootElement.GetProperty("ownershipReference").GetString()!
+        ];
     }
 
     private static async Task<string> ReadPersistedJsonAsync(string databasePath, Guid id)
@@ -1257,7 +1603,8 @@ public sealed class EngineeringTaskApiTests : IClassFixture<FakeModeFactory>
         command.CommandText = """
             SELECT ClarificationAnswers, RequirementRevisionNotes, ModelCalls, RepositorySnapshot,
                    EvidenceItems, ImplementationPlan, PlanRevisionNotes, ImplementationWorkspace,
-                   ImplementationResult, LastImplementationFailure, ImplementationLease
+                   ImplementationResult, LastImplementationFailure, ImplementationLease,
+                   ImplementationRevisions, ActiveImplementationRevisionId, ApprovedImplementationRevisionId
             FROM EngineeringTasks WHERE Id = $id;
             """;
         command.Parameters.AddWithValue("$id", id.ToString());
@@ -1365,6 +1712,32 @@ public class FakeModeFactory : WebApplicationFactory<Program>
             foreach (var path in Directory.EnumerateFileSystemEntries(_directory, "*", SearchOption.AllDirectories))
                 File.SetAttributes(path, FileAttributes.Normal);
             Directory.Delete(_directory, true);
+        }
+    }
+}
+
+public sealed class ApprovalOnlyNoIoFactory : FakeModeFactory
+{
+    public CountingRejectingGitResolver GitResolver { get; } = new();
+
+    protected override void ConfigureWebHost(IWebHostBuilder builder)
+    {
+        base.ConfigureWebHost(builder);
+        builder.ConfigureServices(services =>
+        {
+            services.RemoveAll<IGitExecutablePathResolver>();
+            services.AddSingleton<IGitExecutablePathResolver>(GitResolver);
+        });
+    }
+
+    public sealed class CountingRejectingGitResolver : IGitExecutablePathResolver
+    {
+        public int Calls { get; private set; }
+
+        public string Resolve(string? configuredPath)
+        {
+            Calls++;
+            throw new InvalidOperationException("The approval dependency graph resolved Git unexpectedly.");
         }
     }
 }

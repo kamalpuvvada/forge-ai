@@ -45,7 +45,8 @@ public sealed class EngineeringTaskService(
             ? ImplementationAttemptDisposition.RecoveryRequired
             : failure is { SafeToResume: false }
                 ? ImplementationAttemptDisposition.TerminalIncompatible
-                : task.Status == WorkflowStatus.AwaitingImplementationReview && task.ImplementationResult is not null
+                : (task.Status is WorkflowStatus.AwaitingImplementationReview or WorkflowStatus.ImplementationApproved) &&
+                  task.ImplementationResult is not null
                     ? available ? ImplementationAttemptDisposition.Completed : ImplementationAttemptDisposition.RecoveryRequired
                     : activeLease
                         ? ImplementationAttemptDisposition.Active
@@ -62,7 +63,8 @@ public sealed class EngineeringTaskService(
             ImplementationAttemptDisposition.Active => null,
             ImplementationAttemptDisposition.SafeResume => "The previous implementation attempt is no longer active and can be safely resumed after workspace verification.",
             ImplementationAttemptDisposition.Completed when !available => "The persisted review is available, but its isolated worktree is missing or changed.",
-            ImplementationAttemptDisposition.RecoveryRequired when task.Status == WorkflowStatus.AwaitingImplementationReview && !available =>
+            ImplementationAttemptDisposition.RecoveryRequired when
+                (task.Status is WorkflowStatus.AwaitingImplementationReview or WorkflowStatus.ImplementationApproved) && !available =>
                 failure?.Message ?? "The persisted review remains readable, but its isolated worktree is missing or changed and requires recovery.",
             ImplementationAttemptDisposition.RecoveryRequired => failure?.Message ?? "The interrupted implementation requires explicit recovery.",
             ImplementationAttemptDisposition.TerminalIncompatible => failure?.Message ?? "The approved plan is not compatible with deterministic Fake implementation.",
@@ -95,7 +97,8 @@ public sealed class EngineeringTaskService(
             ? ImplementationAttemptDisposition.RecoveryRequired
             : failure is { SafeToResume: false }
                 ? ImplementationAttemptDisposition.TerminalIncompatible
-                : task.Status == WorkflowStatus.AwaitingImplementationReview && task.ImplementationResult is not null
+                : (task.Status is WorkflowStatus.AwaitingImplementationReview or WorkflowStatus.ImplementationApproved) &&
+                  task.ImplementationResult is not null
                     ? available ? ImplementationAttemptDisposition.Completed : ImplementationAttemptDisposition.RecoveryRequired
                     : activeLease
                         ? ImplementationAttemptDisposition.Active
@@ -114,7 +117,8 @@ public sealed class EngineeringTaskService(
                 "The persisted implementation attempt can be considered for resume after explicit workspace verification.",
             ImplementationAttemptDisposition.Completed =>
                 "The expected isolated workspace path was observed with valid non-reparse worktree metadata at export time; no Git or checkout verification was performed.",
-            ImplementationAttemptDisposition.RecoveryRequired when task.Status == WorkflowStatus.AwaitingImplementationReview && !available =>
+            ImplementationAttemptDisposition.RecoveryRequired when
+                (task.Status is WorkflowStatus.AwaitingImplementationReview or WorkflowStatus.ImplementationApproved) && !available =>
                 failure?.Message ?? "The persisted review remains readable, but the isolated workspace was not observed at export time.",
             ImplementationAttemptDisposition.RecoveryRequired =>
                 failure?.Message ?? "The persisted implementation attempt requires explicit recovery.",
