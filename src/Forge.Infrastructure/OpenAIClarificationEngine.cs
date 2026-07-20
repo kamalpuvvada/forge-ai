@@ -89,12 +89,9 @@ public sealed class OpenAIClarificationEngine(
                     ResponseSchema),
                 cancellationToken);
 
+            var structuredOutput = OpenAIResponseTopologyValidator.RequireSingleOutputText(response);
             var completedAt = timeProvider.GetUtcNow();
-            var estimatedCost = costCalculator.Calculate(
-                pricingSnapshot,
-                response.InputTokens,
-                response.CachedInputTokens,
-                response.OutputTokens).TotalCostUsd;
+            var estimatedCost = TryEstimateCost(response, pricingSnapshot);
             var call = new ModelCallRecord(
                 callId,
                 ModelCallStage.Clarification,
@@ -104,16 +101,17 @@ public sealed class OpenAIClarificationEngine(
                 startedAt,
                 completedAt,
                 true,
-                response.ResponseId,
-                response.InputTokens,
-                response.CachedInputTokens,
-                response.OutputTokens,
-                response.ReasoningTokens,
+                OpenAIProviderIdentifier.Normalize(response.ResponseId),
+                response.UsageAvailable ? response.InputTokens : null,
+                response.UsageAvailable ? response.CachedInputTokens : null,
+                response.UsageAvailable ? response.OutputTokens : null,
+                response.UsageAvailable ? response.ReasoningTokens : null,
                 estimatedCost,
                 null,
-                pricingSnapshot);
+                pricingSnapshot,
+                OpenAIProviderIdentifier.Normalize(response.ProviderRequestId));
 
-            return ParseEvaluation(response.OutputText, call);
+            return ParseEvaluation(structuredOutput, call);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -125,7 +123,12 @@ public sealed class OpenAIClarificationEngine(
         }
         catch (Exception exception)
         {
-            var category = exception is OpenAITransportException transport ? transport.Category : "invalid_response";
+            var category = exception switch
+            {
+                OpenAITransportException transport => transport.Category,
+                OpenAIResponseTopologyException topology => TopologyCategory(topology.Failure),
+                _ => "invalid_response"
+            };
             var safeMessage = exception is OpenAITransportException
                 ? exception.Message
                 : "OpenAI returned an invalid structured clarification response.";
@@ -138,18 +141,15 @@ public sealed class OpenAIClarificationEngine(
                 startedAt,
                 timeProvider.GetUtcNow(),
                 false,
-                response?.ResponseId,
-                response?.InputTokens,
-                response?.CachedInputTokens,
-                response?.OutputTokens,
-                response?.ReasoningTokens,
-                response is null ? null : costCalculator.Calculate(
-                    pricingSnapshot,
-                    response.InputTokens,
-                    response.CachedInputTokens,
-                    response.OutputTokens).TotalCostUsd,
+                OpenAIProviderIdentifier.Normalize(response?.ResponseId),
+                response?.UsageAvailable == true ? response.InputTokens : null,
+                response?.UsageAvailable == true ? response.CachedInputTokens : null,
+                response?.UsageAvailable == true ? response.OutputTokens : null,
+                response?.UsageAvailable == true ? response.ReasoningTokens : null,
+                response is null ? null : TryEstimateCost(response, pricingSnapshot),
                 category,
-                response is null ? null : pricingSnapshot);
+                response is null ? null : pricingSnapshot,
+                OpenAIProviderIdentifier.Normalize(response?.ProviderRequestId));
             throw new ClarificationProviderException(safeMessage, category, failed, exception);
         }
     }
@@ -159,6 +159,7 @@ public sealed class OpenAIClarificationEngine(
         StructuredEvaluation? parsed;
         try
         {
+            StrictJsonDuplicatePropertyValidator.RejectDuplicates(json);
             parsed = JsonSerializer.Deserialize<StructuredEvaluation>(json, JsonOptions);
         }
         catch (JsonException exception)
@@ -208,6 +209,23 @@ public sealed class OpenAIClarificationEngine(
         clarificationAnswers = task.ClarificationAnswers.Select(answer => new { answer.Question, answer.Answer }),
         requirementRevisionNotes = task.RequirementRevisionNotes.Select(note => note.Correction)
     }, JsonOptions);
+
+    private decimal? TryEstimateCost(OpenAIResponseEnvelope response, ModelPricingSnapshot pricing) =>
+        response.UsageAvailable && costCalculator.TryCalculate(pricing, response.InputTokens,
+            response.CachedInputTokens, response.OutputTokens, out var breakdown)
+            ? breakdown.TotalCostUsd
+            : null;
+
+    private static string TopologyCategory(OpenAIResponseTopologyFailure failure) => failure switch
+    {
+        OpenAIResponseTopologyFailure.IncompleteMaxOutputTokens => "output_truncated",
+        OpenAIResponseTopologyFailure.IncompleteContentFilter => "content_filter",
+        OpenAIResponseTopologyFailure.Refusal => "refusal",
+        OpenAIResponseTopologyFailure.Incomplete or OpenAIResponseTopologyFailure.InvalidResponseIdentity =>
+            "incomplete_response",
+        OpenAIResponseTopologyFailure.Empty => "empty_response",
+        _ => "unexpected_output"
+    };
 
     private sealed record StructuredEvaluation(
         string? Decision,

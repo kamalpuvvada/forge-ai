@@ -29,17 +29,24 @@ public sealed record ModelCallCostResolution(
 }
 
 public sealed record ModelTaskCostResolution(
-    decimal TotalEstimatedCostUsd,
-    int UnavailableCallCount)
+    decimal? TotalEstimatedCostUsd,
+    int AvailableCallCount,
+    int UnavailableCallCount,
+    bool Overflowed)
 {
     public bool IsPartial => UnavailableCallCount > 0;
 }
 
 public sealed class ModelCostResolver(ModelCostCalculator calculator)
 {
+    public const decimal MaximumPersistedEstimatedCostUsd = 1_000_000_000m;
+
     public ModelCallCostResolution Resolve(ModelCallRecord call)
     {
         ArgumentNullException.ThrowIfNull(call);
+        if (!ModelCallUsageEvidence.IsAvailable(call))
+            return Unavailable(call.PricingSnapshot is not null);
+
         if (call.PricingSnapshot is not null)
         {
             if (TryCalculate(call.PricingSnapshot, call, out var storedBreakdown))
@@ -47,10 +54,11 @@ public sealed class ModelCostResolver(ModelCostCalculator calculator)
             return Unavailable(true);
         }
 
-        if (call.EstimatedCostUsd is not null)
+        if (call.EstimatedCostUsd is { } estimate)
         {
+            if (!IsValidPersistedEstimate(estimate)) return Unavailable(false);
             return new ModelCallCostResolution(
-                call.EstimatedCostUsd,
+                estimate,
                 ModelCostProvenance.LegacyEstimatePricingSnapshotUnavailable,
                 ValidUncachedTokens(call),
                 null,
@@ -71,7 +79,9 @@ public sealed class ModelCostResolver(ModelCostCalculator calculator)
     {
         ArgumentNullException.ThrowIfNull(calls);
         decimal total = 0;
+        var available = 0;
         var unavailable = 0;
+        var overflowed = false;
         foreach (var call in calls)
         {
             var resolved = Resolve(call);
@@ -80,10 +90,22 @@ public sealed class ModelCostResolver(ModelCostCalculator calculator)
                 unavailable++;
                 continue;
             }
-            try { total = checked(total + cost); }
-            catch (OverflowException) { unavailable++; }
+            try
+            {
+                total = checked(total + cost);
+                available++;
+            }
+            catch (OverflowException)
+            {
+                unavailable++;
+                overflowed = true;
+            }
         }
-        return new ModelTaskCostResolution(total, unavailable);
+        return new ModelTaskCostResolution(
+            overflowed || available == 0 && unavailable > 0 ? null : total,
+            available,
+            unavailable,
+            overflowed);
     }
 
     private ModelCallCostResolution FromBreakdown(
@@ -103,21 +125,16 @@ public sealed class ModelCostResolver(ModelCostCalculator calculator)
         breakdown = null!;
         if (call.InputTokens is not { } input || call.CachedInputTokens is not { } cached || call.OutputTokens is not { } output)
             return false;
-        try
-        {
-            breakdown = calculator.Calculate(pricing, input, cached, output);
-            return true;
-        }
-        catch (Exception exception) when (exception is ArgumentOutOfRangeException or OverflowException)
-        {
-            return false;
-        }
+        return calculator.TryCalculate(pricing, input, cached, output, out breakdown);
     }
 
     private static int? ValidUncachedTokens(ModelCallRecord call) =>
         call.InputTokens is { } input && call.CachedInputTokens is { } cached && input >= 0 && cached >= 0 && cached <= input
             ? input - cached
             : null;
+
+    private static bool IsValidPersistedEstimate(decimal estimate) =>
+        estimate >= 0 && estimate <= MaximumPersistedEstimatedCostUsd;
 
     private static ModelCallCostResolution Unavailable(bool hasStoredSnapshot) => new(
         null,

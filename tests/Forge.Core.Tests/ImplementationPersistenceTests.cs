@@ -24,7 +24,11 @@ public sealed class ImplementationPersistenceTests : IDisposable
         task.BeginImplementation(workspace, lease, Now.AddMinutes(1));
         await repository.SaveAsync(task);
         task.RecordModelCall(new ModelCallRecord(Guid.NewGuid(), ModelCallStage.Implementation, "OpenAI", "future-model", "medium",
-            Now, Now, true, "response", 1, 0, 1, 0, .01m, null), Now);
+            Now, Now, false, null, null, null, null, null, null, "implementation_rate_limit",
+            new ModelPricingSnapshot(5m, .5m, 30m), null), Now);
+        task.RecordModelCall(new ModelCallRecord(Guid.NewGuid(), ModelCallStage.Implementation, "OpenAI", "future-model", "medium",
+            Now, Now, true, "response", 1, 0, 1, 0, .01m, null,
+            new ModelPricingSnapshot(5m, .5m, 30m), "provider-request"), Now);
         task.StoreImplementationResult(Result(workspace), lease.AttemptId, lease.OwnerId, Now.AddMinutes(2));
         await repository.SaveAsync(task);
 
@@ -34,7 +38,9 @@ public sealed class ImplementationPersistenceTests : IDisposable
         Assert.Equal(workspace.Token, loaded?.ImplementationWorkspace?.Token);
         Assert.Equal(workspace.Branch, loaded?.ImplementationResult?.Branch);
         Assert.Equal("diff --git a/src/App.cs b/src/App.cs", Assert.Single(loaded!.ImplementationResult!.ChangedFiles).DiffPreview);
-        Assert.Contains(loaded.ModelCalls, call => call.Stage == ModelCallStage.Implementation);
+        Assert.Equal(2, loaded.ModelCalls.Count(call => call.Stage == ModelCallStage.Implementation));
+        Assert.Contains(loaded.ModelCalls, call => call.FailureCategory == "implementation_rate_limit");
+        Assert.Contains(loaded.ModelCalls, call => call.ProviderRequestId == "provider-request");
         var revision = Assert.Single(loaded.ImplementationRevisions);
         Assert.Equal(revision.RevisionId, loaded.ActiveImplementationRevisionId);
         Assert.Equal(ImplementationReviewState.Current, revision.ReviewState);

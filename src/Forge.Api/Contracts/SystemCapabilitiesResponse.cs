@@ -22,4 +22,10 @@ public sealed record SystemCapabilitiesResponse(
     bool ImplementationCorrectionAvailable,
     bool ValidationAvailable,
     bool ReviewAvailable,
-    bool PullRequestCreationAvailable);
+    bool PullRequestCreationAvailable,
+    bool FakeImplementationAvailable,
+    bool OpenAiImplementationAvailable,
+    bool SilentFallbackSupported,
+    bool CommitAvailable,
+    bool PushAvailable,
+    bool DeliveryPullRequestAvailable);

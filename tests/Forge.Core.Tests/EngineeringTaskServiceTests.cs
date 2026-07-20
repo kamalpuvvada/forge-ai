@@ -6,6 +6,28 @@ namespace Forge.Core.Tests;
 public sealed class EngineeringTaskServiceTests
 {
     [Fact]
+    public async Task Incomplete_implementation_configuration_fails_before_repository_or_workspace_inspection()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var task = ReviewTask(now);
+        task.ApproveImplementationPlan(now);
+        var repository = new InMemoryRepository();
+        await repository.SaveAsync(task);
+        var workspace = new InspectionCountingWorkspaceManager();
+        var service = new EngineeringTaskService(repository,
+            new ScriptedEngine(ClarificationEvaluation.Summarize("unused")), TimeProvider.System,
+            implementationEngine: new ConfigurationRejectingImplementationEngine(),
+            implementationWorkspaceManager: workspace);
+
+        var failure = await Assert.ThrowsAsync<ImplementationException>(() =>
+            service.GenerateImplementationAsync(task.Id));
+
+        Assert.Equal("implementation_configuration", failure.Category);
+        Assert.Equal(0, workspace.InspectionCount);
+        Assert.Equal(WorkflowStatus.PlanApproved, (await repository.GetAsync(task.Id))?.Status);
+    }
+
+    [Fact]
     public async Task Recent_history_service_enforces_the_fixed_maximum()
     {
         var repository = new InMemoryRepository();
@@ -529,6 +551,41 @@ public sealed class EngineeringTaskServiceTests
                 now, now, true, "test-response", 10, 0, 10, 0, 0m, null);
             return new PlanningEvaluation(candidate, call);
         }
+    }
+
+    private sealed class ConfigurationRejectingImplementationEngine : IImplementationEngine
+    {
+        public void EnsureConfigured() => throw new ImplementationException(
+            "implementation_configuration", "OpenAI implementation configuration is incomplete.");
+
+        public Task<ImplementationEvaluation> GenerateAsync(ImplementationContext context,
+            CancellationToken cancellationToken = default) => throw new InvalidOperationException("Must not dispatch.");
+    }
+
+    private sealed class InspectionCountingWorkspaceManager : IImplementationWorkspaceManager
+    {
+        public int InspectionCount { get; private set; }
+        public Task<ImplementationInspection> InspectAsync(string repositoryPath, RepositorySnapshot snapshot,
+            ImplementationPlan plan, ImplementationLimits limits, CancellationToken cancellationToken = default)
+        {
+            InspectionCount++;
+            throw new InvalidOperationException("Must not inspect.");
+        }
+
+        public Task<ImplementationReservation> ReserveAsync(Guid taskId, string repositoryPath,
+            RepositorySnapshot snapshot, ImplementationPlan plan, CancellationToken cancellationToken = default) =>
+            throw new InvalidOperationException();
+        public Task<PreparedImplementationWorkspace> PrepareAsync(string repositoryPath, ImplementationWorkspace workspace,
+            ImplementationPlan plan, ImplementationLimits limits, ActiveCheckoutSignature activeCheckout,
+            CancellationToken cancellationToken = default) => throw new InvalidOperationException();
+        public Task<ImplementationResult> ApplyAsync(string repositoryPath, PreparedImplementationWorkspace prepared,
+            ImplementationOutput output, ImplementationLimits limits, DateTimeOffset completedAt,
+            CancellationToken cancellationToken = default) => throw new InvalidOperationException();
+        public Task<bool> IsAvailableAsync(string repositoryPath, ImplementationWorkspace workspace,
+            ImplementationPlan plan, ImplementationResult? result, CancellationToken cancellationToken = default) =>
+            Task.FromResult(false);
+        public Task VerifyActiveCheckoutAsync(string repositoryPath, ImplementationPlan plan,
+            ActiveCheckoutSignature expected, CancellationToken cancellationToken = default) => Task.CompletedTask;
     }
 
     private sealed class InMemoryRepository : IEngineeringTaskRepository

@@ -1,8 +1,8 @@
 # Forge AI
 
-Forge AI is a trustworthy, explainable, and cost-aware software-engineering workflow. The current slice clarifies and approves requirements, creates an evidence-backed implementation plan through either Fake or OpenAI mode, then exercises safe implementation and human diff review with a deterministic Fake adapter.
+Forge AI is a trustworthy, explainable, and cost-aware software-engineering workflow. The current slice clarifies and approves requirements, creates an evidence-backed implementation plan through either Fake or OpenAI mode, then generates structured implementation operations through the configured Fake or OpenAI adapter for isolated human diff review.
 
-Fake implementation changes only a task-specific linked worktree outside the selected active checkout. Validation execution, AI implementation generation, correction/rejection, commit, push, and pull-request creation remain explicitly unavailable.
+Accepted implementation operations change only a task-specific linked worktree outside the selected active checkout. Validation execution, correction/rejection, commit, push, and pull-request creation remain explicitly unavailable.
 
 ## Prerequisites
 
@@ -61,11 +61,11 @@ The deterministic clarification adapter asks up to three development questions. 
 
 Default limits are 5,000 discovered files, 256 KB per text file, 20 MB of considered text, 12 evidence files, and 60,000 evidence characters. Generated/minified/binary content, common build/dependency folders, and likely secret files such as `.env`, private keys, and credential files are excluded. Obvious sensitive key/value lines are replaced with `[REDACTED]`; this is a conservative safeguard, not a guarantee that a repository contains no secrets.
 
-Evidence ranking gives strong multiword phrases more weight than generic terms, diversifies across frontend/API/core/infrastructure/test layers, boosts related contracts and tests, and lowers generic documentation and unrelated clarification code. This is requirement-driven rather than feature-keyword hardcoding. Evidence selection supplies bounded read-only context; it does not automatically determine mutation scope. High-confidence approved or corrected `only` path lists instead become authoritative affected-file allowlists, while unrelated selected evidence may remain available solely as context. Explicit exclusions, exact action counts, test-change prohibitions, and repository-validation-command prohibitions are recognized only in bounded directive forms and are enforced deterministically. Plans support up to ten affected files, eight ordered steps, eight proposed validation commands, and twelve compact requirement-coverage mappings. Both planners cite evidence IDs, distinguish test implementation from test execution, and label validation commands as proposals. Explicit plan approval is still required before isolated Fake implementation can begin.
+Evidence ranking gives strong multiword phrases more weight than generic terms, diversifies across frontend/API/core/infrastructure/test layers, boosts related contracts and tests, and lowers generic documentation and unrelated clarification code. This is requirement-driven rather than feature-keyword hardcoding. Evidence selection supplies bounded read-only context; it does not automatically determine mutation scope. High-confidence approved or corrected `only` path lists instead become authoritative affected-file allowlists, while unrelated selected evidence may remain available solely as context. Explicit exclusions, exact action counts, test-change prohibitions, and repository-validation-command prohibitions are recognized only in bounded directive forms and are enforced deterministically. Plans support up to ten affected files, eight ordered steps, eight proposed validation commands, and twelve compact requirement-coverage mappings. Both planners cite evidence IDs, distinguish test implementation from test execution, and label validation commands as proposals. Explicit plan approval is still required before isolated implementation can begin.
 
-## Safe Fake implementation and diff review
+## Safe implementation and diff review
 
-`Generate implementation` is available only for an approved plan in Fake mode. Forge rechecks that the selected path is the exact root of a clean, non-bare Git worktree at the approved commit and rejects in-progress Git operations. A read-only preflight first captures the exact bounded source contexts, generates the exact deterministic Fake output once, and validates all operations, transformed per-file/total sizes, no-op rules, and sensitive content while the task is still `PlanApproved`. Only successful preflight can persist a lease and let preparation reserve the deterministic `forge/task-{taskId:N}` branch and create a linked sparse worktree beneath the configurable `Forge:Implementation:WorktreeRoot`; preparation byte-for-byte rechecks the source contexts before creating owned Git artifacts and after materialization. The active checkout's HEAD, branch, complete index/status, and bounded hashes of every tracked regular working-tree file are captured; sparse indexes, malformed or truncated stage metadata, nonzero stages, assume-unchanged/skip-worktree entries, symlinks, and an insufficient fingerprint budget fail closed. Constructing the Git runner only normalizes and validates configuration in memory. The Forge-owned root, empty hooks directory, and isolated Git home are created and revalidated only immediately before an operational Git command. Every Git command then uses the startup-resolved absolute executable, a sanitized non-interactive environment, and fixed configuration that disables fsmonitor, hooks, submodule recursion, external diff/textconv, paging, credentials, and automatic maintenance.
+`Generate implementation` is available only for an approved plan. Forge rechecks that the selected path is the exact root of a clean, non-bare Git worktree at the approved commit and rejects in-progress Git operations. A genuinely read-only inspection captures the exact bounded source contexts without creating the worktree root, task directory, branch, ref, lock, hooks directory, isolated Git home, workspace token, or lease. Fake mode then produces its deterministic output locally. OpenAI mode sends only the approved requirement, complete approved plan, base SHA, exact mutating paths/actions, bounded complete source text, source hashes/byte counts/context identities, directly cited evidence, and bounded evidence-backed convention notes. Repository and requirement text are labelled untrusted. Mandatory content is never truncated; over-budget or sensitive context fails before dispatch. Only a complete strictly parsed and deterministically validated proposal may reserve the deterministic `forge/task-{taskId:N}` branch and create a linked sparse worktree beneath `Forge:Implementation:WorktreeRoot`.
 
 Only approved affected paths are materialized. Shared path/file safety rejects absolute and traversal paths, `.git`, reparse points, symlinks, gitlinks, likely secrets, binary/generated/dependency files, executable Git filters, undeclared files, action mismatches, stale hashes, no-op changes, and configured size-limit violations. The Fake engine returns structured create/modify/delete operations and labelled mechanical markers; it never returns or runs shell commands and records no model call. Forge validates the complete operation set before the first write, applies it only in the isolated worktree, and derives bounded unified diffs locally with external diff, text conversion, hooks, submodule recursion, and LFS smudging disabled.
 
@@ -88,23 +88,40 @@ $env:Forge__AI__Mode = 'OpenAI'
 dotnet run --project .\src\Forge.Api --launch-profile http
 ```
 
-The clarification model is `gpt-5.6-terra` with `low` reasoning and an 800-token output limit. The planning model is `gpt-5.6-sol` with `medium` reasoning and a 6,000-token output allowance, which includes visible output and reasoning tokens. OpenAI planning sends only approved requirement context, repository totals/stack/project/test metadata, and bounded redacted evidence; it excludes the absolute root, unrestricted file contents, and the complete repository file list. Clear the current shell values when finished:
+The clarification model is `gpt-5.6-terra` with `low` reasoning and an 800-token output limit. Planning uses `gpt-5.6-sol`, `medium`, and 6,000 tokens. Implementation uses `gpt-5.6-sol`, `high`, a 32,000-token limit, and a 180-second logical deadline by default. Implementation requests use strict structured output with separate create/modify/delete arrays, `store:false`, background/streaming disabled, truncation disabled, and an empty tools collection. The provider receives no Git, filesystem, shell, function, computer, web/file-search, code-interpreter, background, or multi-agent capability. One bounded retry is allowed only for explicit 429, 502, or 503 responses, or when transport can prove failure occurred before request dispatch. Ambiguous connection failures never retry: avoiding a duplicate billable request takes priority over availability. Every physical request is recorded. API use is billed separately from ChatGPT and Codex. Clear the current shell values when finished:
 
 ```powershell
 Remove-Item Env:OPENAI_API_KEY -ErrorAction SilentlyContinue
 Remove-Item Env:Forge__AI__Mode -ErrorAction SilentlyContinue
 ```
 
-This implementation task did **not** make a live or billable OpenAI request.
+Live Responses API compatibility was demonstrated by one explicitly authorized, disposable, gated implementation smoke test using the configured `gpt-5.6-sol` model. The strict structured proposal returned exactly one approved modify operation, deterministic validation accepted it, and the disposable repository's active checkout remained clean. This proves protocol compatibility for the small approved scenario only; broader model-quality evaluation remains outstanding. The smoke test ran no target build or test command and performed no staging, commit, push, pull-request, or other delivery action. OpenAI API billing for this test was separate from ChatGPT and Codex.
+
+### Separately gated live implementation smoke test
+
+The `Forge.LiveOpenAI.Tests` project is operator-only, excluded from `ForgeAI.slnx`, and not referenced by either standard test project. Default solution restore/build/test commands therefore cannot discover or execute its provider test, even when a key and both flags are present. The smoke test creates a unique disposable Git repository and SQLite database, calls only the OpenAI implementation engine, verifies the proposal, confirms the disposable checkout stayed clean, and deletes its temporary directory. It refuses transport unless the API key, both explicit gates, the dedicated project target, and the Category filter are all present. Run only after separately approving billable validation:
+
+```powershell
+$env:FORGE_ENABLE_LIVE_OPENAI_TEST = 'true'
+$env:FORGE_LIVE_TEST_EXPLICIT_FILTER = 'true'
+$env:OPENAI_API_KEY = '<environment only>'
+dotnet test `
+  .\tests\Forge.LiveOpenAI.Tests\Forge.LiveOpenAI.Tests.csproj `
+  --filter "Category=LiveOpenAIImplementation"
+Remove-Item Env:FORGE_ENABLE_LIVE_OPENAI_TEST, Env:FORGE_LIVE_TEST_EXPLICIT_FILTER -ErrorAction SilentlyContinue
+```
+
+An API key alone, flags alone, a direct project invocation without the exact filter, or a filter without both flags cannot dispatch this smoke test. The explicitly authorized live smoke completed successfully; normal solution commands remain physically unable to discover it.
 
 ## AI boundary and failure behavior
 
 - `IClarificationEngine.EvaluateAsync` is asynchronous and cancellation-aware.
 - `IPlanningEngine.CreatePlanAsync` is asynchronous and cancellation-aware and returns a plan plus optional model-call telemetry.
-- `IImplementationEngine.GenerateAsync` is an asynchronous structured-operation boundary. This slice registers only `FakeImplementationEngine`; OpenAI implementation configuration is reported unavailable and never falls back to Fake.
+- `IImplementationEngine.GenerateAsync` is an asynchronous structured-operation boundary. Exactly one configured Fake or OpenAI engine is registered; OpenAI never falls back to Fake.
 - Every evaluation returns exactly one decision: ask one question or provide a summary. One question means one atomic decision dimension.
 - The OpenAI adapter uses official `OpenAI` 2.12.0 and the Responses API.
-- Strict JSON Schema structured output is used for clarification and planning; domain validation independently enforces evidence IDs, existing/create path truth, sequential steps, safe relative paths, proposal-only validation language, and explicit approved/corrected scope constraints before a candidate plan can be persisted.
+- Strict JSON Schema structured output is used for clarification, planning, and OpenAI implementation. Domain validation remains authoritative.
+- All three OpenAI stages share one strict topology policy: completed status, one valid response ID, one assistant message, one output text, reasoning-only auxiliary items, and no refusal, tool, unknown, or duplicate output. Duplicate JSON properties are rejected recursively before deserialization.
 - Planning sends the original and approved requirements once, answers, correction notes, compact snapshot metadata, and selected excerpts. Absolute roots, full files, raw responses, secrets, and hidden reasoning are excluded. `previous_response_id` is not used.
 - Fake mode records no model usage.
 - OpenAI mode never falls back to Fake mode. Configuration, authentication, timeout, rate-limit, malformed-output, and provider failures return safe Problem Details.
@@ -114,7 +131,7 @@ This implementation task did **not** make a live or billable OpenAI request.
 
 ## Token and estimated-cost telemetry
 
-Forge stores call identity, clarification/planning stage, provider/model, reasoning effort, timestamps, outcome, response ID when available, nullable input/cached/output/reasoning tokens, safe failure category, and a nullable estimated USD cost. A stored zero estimate is therefore distinct from a missing estimate. Newly priced calls also retain the exact input, cached-input, and output rates used for their estimate as a per-call pricing snapshot.
+Forge stores call identity, clarification/planning stage, provider/model, reasoning effort, timestamps, outcome, response ID when available, nullable input/cached/output/reasoning tokens, safe failure category, and a nullable estimated USD cost. Usage is available only when required input/output counters are correctly typed, nonnegative bounded integers; partial or malformed usage is reported as unavailable, never coerced to zero. A stored zero estimate is therefore distinct from a missing estimate. Newly priced calls also retain the exact input, cached-input, and output rates used for their estimate as a per-call pricing snapshot. Selected implementation pricing must be nonnegative and no more than $100,000 per million tokens; output tokens are bounded to 100,000 and timeout to 600 seconds. Invalid configuration fails before provider use, while any unexpected post-dispatch cost overflow preserves the call with unavailable estimated cost.
 
 Costs are estimates based on configurable per-million-token rates. Cached input is not charged twice:
 
@@ -127,7 +144,7 @@ estimate = uncached input × input rate
 
 The SDK output-token total already includes reasoning tokens, so reasoning tokens are a breakdown and are not added again.
 
-Cost display is resolved consistently in the task API and PDF export. A valid stored pricing snapshot is authoritative; a legacy stored estimate is preserved when its snapshot is unavailable; an unpriced legacy call may be re-estimated from current model pricing only when all usage is valid; otherwise its cost is unavailable. Totals exclude unavailable or overflowed additions and identify themselves as partial. The task PDF aggregates only its bounded rendered-call subset and explicitly reports omitted calls. All monetary values are estimates, not invoices.
+Cost display is resolved consistently in the task API and PDF exports. Required input/output usage evidence must be valid before any stored estimate or pricing snapshot can produce an available cost; a stale legacy numeric estimate with unavailable usage remains readable in persistence but is projected as cost unavailable. A valid stored pricing snapshot is authoritative; a valid bounded legacy estimate is preserved when its snapshot is unavailable; an unpriced legacy call may be re-estimated from current model pricing only when all usage is valid. Task API usage aggregates are `Complete`, `Partial`, or `Unavailable`. Complete aggregates retain numeric totals, while partial and unavailable aggregates return null totals rather than presenting known subtotals as complete usage. A provider-reported valid zero remains numeric zero. Aggregate cost is likewise unavailable when any included call lacks usage or pricing. PDFs label bounded known cost as an available subtotal, report partial or unavailable cost explicitly, and identify omitted calls. All monetary values are estimates, not invoices.
 
 | Model | Input / 1M | Cached input / 1M | Output / 1M |
 |---|---:|---:|---:|
@@ -146,13 +163,13 @@ Cost display is resolved consistently in the task API and PDF export. A valid st
 - `POST /api/tasks/{id}/repository-analysis`
 - `POST /api/tasks/{id}/plan`
 - `POST /api/tasks/{id}/plan-approval`
-- `POST /api/tasks/{id}/implementation` (Fake mode; clean approved Git state required)
+- `POST /api/tasks/{id}/implementation` (configured Fake/OpenAI mode; clean approved Git state required)
 - `POST /api/tasks/{id}/implementation-approval` (exact persisted-review approval; no Git or workspace access)
 - `GET /api/tasks/{id}/export/pdf`
 - `GET /api/tasks/{id}/export/plan-pdf`
 - `GET /api/system/capabilities`
 
-The capabilities endpoint reports implementation generation and implementation approval separately. Correction, validation, commit/push, and delivery pull-request creation remain unavailable. It returns only safe mode/model/feature availability and never returns the API key or a secret-derived value.
+The capabilities endpoint reports the active implementation provider/model/effort, Fake and OpenAI availability, and implementation approval separately. Silent fallback, correction, validation, commit/push, and delivery pull-request creation remain false. It returns only safe mode/model/feature availability and never returns the API key or a secret-derived value.
 
 The PDF endpoint reads the persisted task without changing it and returns `application/pdf` as an attachment named `forge-task-{taskId}.pdf`. It is a workflow-stage-aware audit export: earlier reports retain requirement, clarification, and bounded revision history; planned tasks add bounded repository-analysis evidence and the complete persisted plan; implementation attempts add persisted phase/failure state; and implementation-review reports add persisted hashes, byte/line and addition/deletion counts, truncation metadata, and bounded diff previews. Completion-time active-checkout evidence is labelled separately from export-time workspace observation. Export uses a dedicated non-mutating projection that checks only persisted identity consistency and filesystem presence: it does not acquire locks, run Git, reconcile worktrees, or reverify the active checkout. Plan commands remain proposals labelled `NOT EXECUTED`; they are never presented as execution or external-validation evidence. Persisted historical requirement summaries are preserved, followed by an explicit note that their development note describes summary-generation time. Absolute paths, workspace tokens (including task-branch suffixes), repository/worktree identities, provider payloads, global configuration, keys, and connection details are redacted. Export-local character, line, page, and collection budgets produce explicit omission notices. The frontend prevents overlapping downloads, reports safe failures, and always revokes its temporary object URL.
 
@@ -185,9 +202,9 @@ Remove-Item -LiteralPath .\src\Forge.Api\data\forge.db-wal -Force -ErrorAction S
 - Redaction covers obvious sensitive key names but cannot guarantee that every secret pattern is detected.
 - Git evidence uses tracked files returned by `git ls-files`; ignored and untracked content is not selected.
 - Known-fact/assumption/gap arrays are validated at the provider boundary but are not yet first-class UI context.
-- Authentication, multi-user isolation, production migrations, hosted deployment, and provider retry policy are not implemented.
+- Authentication, multi-user isolation, production migrations, and hosted deployment are not implemented.
 - Fake changes are mechanical workflow fixtures, not semantically correct AI implementation.
 - Worktree cleanup, implementation correction/rejection, validation execution, commit/push, and pull-request creation are not implemented. `ImplementationApproved` covers persisted review evidence only, and retained worktrees and branches require deliberate future lifecycle tooling.
-- OpenAI implementation generation is configuration-only and unavailable; no implementation schema is sent to a provider in this slice.
+- OpenAI implementation is available only when explicitly configured; its strict schema grants no tools and all returned operations remain untrusted until local validation succeeds.
 
 See [product vision](docs/product-vision.md), [architecture](docs/architecture.md), [decision log](docs/decision-log.md), and [Build Week checklist](docs/build-week-checklist.md).

@@ -84,6 +84,14 @@
 **Reason:** Model reasoning can connect bounded cross-layer evidence while deterministic validation prevents invented paths and unsupported claims from becoming workflow facts.
 **Trade-off:** Insufficient or malformed output fails visibly with no repair, retry, or Fake fallback.
 
+## 2026-07-20: Prefer duplicate-billing safety and one strict Responses topology
+
+**Decision:** Retry statusless transport failures only when failure before dispatch is proven; treat ambiguous failures as non-retryable. Require valid response identity and one shared strict topology across clarification, planning, and implementation. Partial usage is unavailable, duplicate JSON properties are rejected, and cost arithmetic cannot erase post-dispatch telemetry.
+
+**Reason:** A connection failure can occur after the provider accepted a billable request. Conservative retry, strict response identity, and fail-soft telemetry preserve an honest audit record without risking silent duplicate charges.
+
+**Trade-off:** Some transient ambiguous failures require a user-triggered new attempt instead of automatic recovery.
+
 ## 015 — Approval is not implementation
 
 **Decision:** Explicit plan approval ends at `PlanApproved`; legacy `Implementing` rows from the plan-only slice migrate to that state.
@@ -101,3 +109,15 @@
 **Decision:** Store a bounded authoritative implementation-revision ledger and require task row version, active revision ID, approved-plan fingerprint, base commit, canonical result fingerprint, and verified unchanged-checkout completion evidence before transitioning to `ImplementationApproved`. Bind every approval command ID globally in SQLite to its complete semantic request, task result row, and immutable timestamp in the same transaction. Route approval through a persistence-only dependency graph, and project tokenized implementation branches through one safe display formatter.
 **Reason:** A human decision must identify the exact review that was accepted and remain auditable without mutating or even observing the physical workspace during approval.
 **Trade-off:** The active implementation fields are temporarily duplicated as a compatibility projection and must validate exactly against revision 1. Approval does not prove that the retained worktree is still available; a future validation or delivery command must reverify it.
+
+## 018 — OpenAI proposes bounded operations before workspace reservation
+
+**Decision:** Inspect approved sources read-only, send one bounded untrusted-data context to a tool-free strict-schema OpenAI implementation engine, validate the complete proposal deterministically, and only then reserve the isolated branch/worktree. Retry at most once for narrowly proven transient outcomes and record every physical request.
+**Reason:** Provider reasoning can author real replacements without granting filesystem or command authority, while deterministic scope/content checks and delayed reservation preserve the active checkout and keep failed attempts artifact-free.
+**Trade-off:** Complete replacements and conservative 32/64 KiB source/output budgets exclude large files; a provider failure is billable and must be explicitly retried rather than repaired or silently replaced by Fake output.
+
+## 019 — Validate implementation compatibility through one disposable gated smoke
+
+**Decision:** Record the successful explicitly authorized `gpt-5.6-sol` Responses API smoke as compatibility evidence for the strict OpenAI implementation boundary. The disposable test accepted exactly one approved modify operation, passed deterministic validation, and left its active checkout clean.
+**Reason:** A real gated request demonstrates that the configured model, Responses transport, strict schema, and local validation interoperate without granting repository or command authority. OpenAI API billing is separate from ChatGPT and Codex.
+**Trade-off:** This evidence covers only one small approved scenario and is not broad model-quality testing. It ran no target validation command and performed no staging, commit, push, pull-request, or delivery action.

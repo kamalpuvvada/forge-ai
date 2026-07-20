@@ -1,67 +1,25 @@
-using System.Text.RegularExpressions;
 using Forge.Core;
 
 namespace Forge.Infrastructure;
 
 public sealed class RepositoryFileSafetyPolicy
 {
-    private static readonly HashSet<string> ExcludedDirectories = new(StringComparer.OrdinalIgnoreCase)
-    {
-        ".git", ".vs", ".idea", "node_modules", "bin", "obj", "dist", "build",
-        "coverage", "TestResults", "packages", "vendor", ".next", ".nuget", "bower_components"
-    };
-
-    private static readonly HashSet<string> TextExtensions = new(StringComparer.OrdinalIgnoreCase)
-    {
-        ".cs", ".csproj", ".sln", ".slnx", ".json", ".jsonc", ".ts", ".tsx", ".js", ".jsx",
-        ".md", ".txt", ".xml", ".yml", ".yaml", ".toml", ".props", ".targets", ".config",
-        ".css", ".scss", ".html", ".htm", ".sql", ".ps1", ".sh", ".cmd", ".bat"
-    };
-
-    private static readonly HashSet<string> BinaryExtensions = new(StringComparer.OrdinalIgnoreCase)
-    {
-        ".dll", ".exe", ".pdb", ".zip", ".7z", ".rar", ".png", ".jpg", ".jpeg", ".gif",
-        ".webp", ".ico", ".pdf", ".woff", ".woff2", ".ttf", ".eot", ".mp3", ".mp4",
-        ".mov", ".avi", ".db", ".sqlite", ".sqlite3"
-    };
-
     public bool IsExcludedPath(string relativePath) =>
-        relativePath.Split('/', '\\').Any(ExcludedDirectories.Contains);
+        ImplementationEligibilityPolicy.IsExcludedPath(relativePath);
 
     public bool IsBinaryOrUnsupported(string relativePath)
     {
-        var extension = Path.GetExtension(relativePath);
-        return BinaryExtensions.Contains(extension) || !TextExtensions.Contains(extension) && !IsSpecialTextFile(relativePath);
+        return ImplementationEligibilityPolicy.IsBinaryOrUnsupported(relativePath);
     }
 
     public bool IsSecretFile(string relativePath)
     {
-        var name = Path.GetFileName(relativePath);
-        return name.Equals(".env", StringComparison.OrdinalIgnoreCase) ||
-               name.StartsWith(".env.", StringComparison.OrdinalIgnoreCase) ||
-               name.Equals(".npmrc", StringComparison.OrdinalIgnoreCase) ||
-               name.Equals(".pypirc", StringComparison.OrdinalIgnoreCase) ||
-               name.Equals(".netrc", StringComparison.OrdinalIgnoreCase) ||
-               name.Equals("credentials", StringComparison.OrdinalIgnoreCase) ||
-               name.StartsWith("id_rsa", StringComparison.OrdinalIgnoreCase) ||
-               name.StartsWith("id_ed25519", StringComparison.OrdinalIgnoreCase) ||
-               name.Equals("secrets.json", StringComparison.OrdinalIgnoreCase) ||
-               Regex.IsMatch(name, @"(?i)(credential|private[-_. ]?key)") ||
-               new[] { ".pem", ".key", ".pfx", ".p12" }.Contains(Path.GetExtension(name), StringComparer.OrdinalIgnoreCase);
+        return ImplementationEligibilityPolicy.IsSecretFile(relativePath);
     }
 
     public bool IsGeneratedFile(string relativePath)
     {
-        var name = Path.GetFileName(relativePath);
-        return name.Contains(".min.", StringComparison.OrdinalIgnoreCase) ||
-               name.Equals("package-lock.json", StringComparison.OrdinalIgnoreCase) ||
-               name.Equals("pnpm-lock.yaml", StringComparison.OrdinalIgnoreCase) ||
-               name.Equals("yarn.lock", StringComparison.OrdinalIgnoreCase) ||
-               name.Equals("packages.lock.json", StringComparison.OrdinalIgnoreCase) ||
-               name.EndsWith(".map", StringComparison.OrdinalIgnoreCase) ||
-               name.EndsWith(".g.cs", StringComparison.OrdinalIgnoreCase) ||
-               name.EndsWith(".designer.cs", StringComparison.OrdinalIgnoreCase) ||
-               name.EndsWith(".generated.cs", StringComparison.OrdinalIgnoreCase);
+        return ImplementationEligibilityPolicy.IsGeneratedFile(relativePath);
     }
 
     public bool ContainsSensitiveValues(string content) =>
@@ -107,11 +65,6 @@ public sealed class RepositoryFileSafetyPolicy
             current = Path.GetDirectoryName(current);
         }
     }
-
-    private static bool IsSpecialTextFile(string relativePath) =>
-        Path.GetFileName(relativePath).Equals("Dockerfile", StringComparison.OrdinalIgnoreCase) ||
-        Path.GetFileName(relativePath).Equals("AGENTS.md", StringComparison.OrdinalIgnoreCase) ||
-        Path.GetFileName(relativePath).Equals(".editorconfig", StringComparison.OrdinalIgnoreCase);
 
     private static ImplementationException Unsafe(string message) =>
         new("implementation_unsafe_path", message);

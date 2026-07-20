@@ -114,7 +114,7 @@ public sealed class TaskPdfExporter(
 
         var total = ResolveBoundedTotal(task.ModelCalls, displayedCalls);
         writer.Section("Task cost estimate");
-        writer.Field("Available estimated total", total.TotalEstimatedCostUsd is { } estimated
+        writer.Field("Available estimated subtotal", total.TotalEstimatedCostUsd is { } estimated
             ? FormatCost(estimated)
             : "unavailable");
         writer.Body(task.ModelCalls.Count == 0
@@ -127,28 +127,13 @@ public sealed class TaskPdfExporter(
 
     private BoundedTaskCost ResolveBoundedTotal(IReadOnlyList<ModelCallRecord> calls, int displayedCalls)
     {
-        decimal total = 0;
-        var unavailable = 0;
-        var overflowed = false;
-        for (var index = 0; index < displayedCalls; index++)
-        {
-            var cost = costResolver.Resolve(calls[index]).EstimatedCostUsd;
-            if (cost is null or < 0)
-            {
-                unavailable++;
-                continue;
-            }
-            try
-            {
-                total = checked(total + cost.Value);
-            }
-            catch (OverflowException)
-            {
-                overflowed = true;
-            }
-        }
-        return new BoundedTaskCost(overflowed ? null : total, unavailable,
-            calls.Count - displayedCalls, overflowed);
+        var resolved = costResolver.ResolveTotal(calls.Take(displayedCalls));
+        return new BoundedTaskCost(
+            resolved.TotalEstimatedCostUsd,
+            resolved.AvailableCallCount,
+            resolved.UnavailableCallCount,
+            calls.Count - displayedCalls,
+            resolved.Overflowed);
     }
 
     private static string CostSummary(BoundedTaskCost total)
@@ -160,6 +145,8 @@ public sealed class TaskPdfExporter(
                 : string.Empty;
             return "The bounded estimated total is unavailable because its numeric range was exceeded." + omitted;
         }
+        if (total.AvailableCallCount == 0 && total.UnavailableCallCount > 0)
+            return "Estimated cost is unavailable for all displayed model calls.";
         if (total.UnavailableCallCount > 0 || total.OmittedCallCount > 0)
             return $"This is a partial estimate. {total.UnavailableCallCount} displayed model call(s) had unavailable cost; " +
                    $"{total.OmittedCallCount} additional model call(s) were omitted by the report limit.";
@@ -168,6 +155,7 @@ public sealed class TaskPdfExporter(
 
     private sealed record BoundedTaskCost(
         decimal? TotalEstimatedCostUsd,
+        int AvailableCallCount,
         int UnavailableCallCount,
         int OmittedCallCount,
         bool Overflowed);
@@ -424,8 +412,13 @@ public sealed class TaskPdfExporter(
             writer.Body("APPROVED PERSISTED IMPLEMENTATION REVIEW — validation was not run and no files were staged, committed, pushed, or submitted as a pull request.");
         else if (!result.ActiveCheckoutVerified)
             writer.Body("NOT ELIGIBLE FOR APPROVAL — Forge could not verify that the active checkout remained unchanged when implementation completed.");
-        writer.Field("Source", result.Source.ToString());
+        writer.Field("Implementation source", result.Source.ToString());
         writer.Field("Model", result.Model ?? "none (deterministic Fake implementation)");
+        if (result.Source == ImplementationSource.OpenAI)
+        {
+            writer.Body("Provider output was treated as untrusted until strict parsing and deterministic validation completed.");
+            writer.Field("Deterministic operation validation", "accepted");
+        }
         writer.Field("Base commit SHA", result.BaseCommitSha);
         writer.Field("Isolated task branch", ImplementationBranchDisplay.Format(result.Branch));
         writer.Field("Completed at", FormatTimestamp(result.CompletedAt));
@@ -705,13 +698,22 @@ public sealed class TaskPdfExporter(
     private void WriteCall(FlowWriter writer, ModelCallRecord call, int number)
     {
         var resolved = costResolver.Resolve(call);
+        var usageAvailable = ModelCallUsageEvidence.IsAvailable(call);
         writer.Subsection($"Call {number}: {call.Stage} / {call.Model}");
         writer.Field("Provider", call.Provider);
+        writer.Field("Reasoning effort", call.ReasoningEffort);
+        writer.Field("Started at", FormatTimestamp(call.StartedAt));
+        writer.Field("Completed at", FormatTimestamp(call.CompletedAt));
+        writer.Field("Client call ID", call.Id.ToString("D"));
+        writer.Field("Provider request ID", call.ProviderRequestId ?? "unavailable");
+        writer.Field("Provider response ID", call.ProviderResponseId ?? "unavailable");
         writer.Field("Result", call.Succeeded ? "succeeded" : $"failed ({call.FailureCategory ?? "unspecified"})");
-        writer.Field("Total input tokens", FormatTokens(call.InputTokens));
-        writer.Field("Cached-input tokens", FormatTokens(call.CachedInputTokens));
+        if (!usageAvailable) writer.Body("Usage unavailable");
+        writer.Field("Total input tokens", FormatTokens(usageAvailable ? call.InputTokens : null));
+        writer.Field("Cached-input tokens", FormatTokens(usageAvailable ? call.CachedInputTokens : null));
         writer.Field("Uncached-input tokens", FormatTokens(resolved.UncachedInputTokens));
-        writer.Field("Output tokens", FormatTokens(call.OutputTokens));
+        writer.Field("Output tokens", FormatTokens(usageAvailable ? call.OutputTokens : null));
+        writer.Field("Reasoning tokens", FormatTokens(usageAvailable ? call.ReasoningTokens : null));
         writer.Field("Estimated cost", resolved.EstimatedCostUsd is { } cost ? FormatCost(cost) : "unavailable");
         writer.Field("Pricing provenance", resolved.ProvenanceLabel);
         if (call.PricingSnapshot is { } snapshot)
@@ -766,7 +768,8 @@ public sealed class TaskPdfExporter(
 
     private static string Recorded(bool value) => value ? "recorded" : "not recorded";
     private static string RecordedAt(DateTimeOffset? value) => value is { } timestamp ? FormatTimestamp(timestamp) : "not recorded";
-    private static string FormatTimestamp(DateTimeOffset value) => value.ToUniversalTime().ToString("O", CultureInfo.InvariantCulture);
+    private static string FormatTimestamp(DateTimeOffset value) =>
+        value.ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", CultureInfo.InvariantCulture);
     private static string FormatTokens(int? value) => value?.ToString("N0", CultureInfo.InvariantCulture) ?? "unavailable";
     private static string FormatNumber(long value) => value.ToString("N0", CultureInfo.InvariantCulture);
     private static string FormatCost(decimal value) => $"${value.ToString("0.00000000", CultureInfo.InvariantCulture)} USD";

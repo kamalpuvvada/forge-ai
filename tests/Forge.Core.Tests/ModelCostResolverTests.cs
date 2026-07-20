@@ -73,6 +73,24 @@ public sealed class ModelCostResolverTests
     }
 
     [Fact]
+    public void Legacy_zero_estimate_is_unavailable_without_required_usage_evidence()
+    {
+        var resolved = Resolver().Resolve(Call(null, null, null, 0m));
+
+        Assert.Equal(ModelCostProvenance.CostUnavailable, resolved.Provenance);
+        Assert.Null(resolved.EstimatedCostUsd);
+    }
+
+    [Fact]
+    public void Legacy_nonzero_estimate_is_unavailable_without_required_usage_evidence()
+    {
+        var resolved = Resolver().Resolve(Call(null, null, null, 12.34m));
+
+        Assert.Equal(ModelCostProvenance.CostUnavailable, resolved.Provenance);
+        Assert.Null(resolved.EstimatedCostUsd);
+    }
+
+    [Fact]
     public void Missing_estimate_is_reestimated_with_current_model_pricing()
     {
         var resolved = Resolver().Resolve(Call(1_000, 250, 500, null));
@@ -101,12 +119,13 @@ public sealed class ModelCostResolverTests
         ]);
 
         Assert.Equal(0.018m, total.TotalEstimatedCostUsd);
+        Assert.Equal(1, total.AvailableCallCount);
         Assert.Equal(1, total.UnavailableCallCount);
         Assert.True(total.IsPartial);
     }
 
     [Fact]
-    public void Total_treats_decimal_overflow_and_negative_legacy_values_as_unavailable()
+    public void Total_rejects_out_of_range_and_negative_legacy_values_without_overflow()
     {
         var total = Resolver().ResolveTotal([
             Call(1, 0, 1, decimal.MaxValue),
@@ -114,9 +133,11 @@ public sealed class ModelCostResolverTests
             Call(1, 0, 1, -1m)
         ]);
 
-        Assert.Equal(decimal.MaxValue, total.TotalEstimatedCostUsd);
-        Assert.Equal(2, total.UnavailableCallCount);
+        Assert.Null(total.TotalEstimatedCostUsd);
+        Assert.Equal(0, total.AvailableCallCount);
+        Assert.Equal(3, total.UnavailableCallCount);
         Assert.True(total.IsPartial);
+        Assert.False(total.Overflowed);
     }
 
     private static ModelCostCalculator Calculator() => new(new Dictionary<string, ModelPricing>(StringComparer.OrdinalIgnoreCase)

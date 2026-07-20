@@ -33,7 +33,8 @@ public sealed class ImplementationPlanPdfExporter(ModelCostResolver costResolver
         writer.Field("Task ID", task.Id.ToString());
         writer.Field("Workflow status", task.Status.ToString());
         writer.Field("Plan approval status", approvalLabel);
-        writer.Field("Plan timestamp", (task.PlanCreatedAt ?? plan.CreatedAt).ToString("O", CultureInfo.InvariantCulture));
+        writer.Field("Plan timestamp", (task.PlanCreatedAt ?? plan.CreatedAt).ToUniversalTime()
+            .ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", CultureInfo.InvariantCulture));
         writer.Field("Plan source", plan.Source.ToString());
         writer.Field("Planning model", plan.PlanningModel ?? "none (deterministic Fake plan)");
 
@@ -96,6 +97,7 @@ public sealed class ImplementationPlanPdfExporter(ModelCostResolver costResolver
         {
             for (var index = 0; index < planningCalls.Length; index++)
                 WriteCall(writer, planningCalls[index], index + 1);
+            WriteCostSummary(writer, costResolver.ResolveTotal(planningCalls));
         }
 
         writer.Body("All monetary values are estimates, not invoices.");
@@ -105,12 +107,14 @@ public sealed class ImplementationPlanPdfExporter(ModelCostResolver costResolver
     private void WriteCall(FlowWriter writer, ModelCallRecord call, int number)
     {
         var resolved = costResolver.Resolve(call);
+        var usageAvailable = ModelCallUsageEvidence.IsAvailable(call);
         writer.Subsection($"Planning call {number}: {call.Model}");
         writer.Field("Result", call.Succeeded ? "succeeded" : $"failed ({call.FailureCategory ?? "unspecified"})");
-        writer.Field("Input tokens", FormatTokens(call.InputTokens));
-        writer.Field("Cached-input tokens", FormatTokens(call.CachedInputTokens));
+        if (!usageAvailable) writer.Body("Usage unavailable");
+        writer.Field("Input tokens", FormatTokens(usageAvailable ? call.InputTokens : null));
+        writer.Field("Cached-input tokens", FormatTokens(usageAvailable ? call.CachedInputTokens : null));
         writer.Field("Uncached-input tokens", FormatTokens(resolved.UncachedInputTokens));
-        writer.Field("Output tokens", FormatTokens(call.OutputTokens));
+        writer.Field("Output tokens", FormatTokens(usageAvailable ? call.OutputTokens : null));
         writer.Field("Estimated cost", resolved.EstimatedCostUsd is { } cost
             ? $"${cost.ToString("0.00000000", CultureInfo.InvariantCulture)} USD"
             : "unavailable");
@@ -121,6 +125,21 @@ public sealed class ImplementationPlanPdfExporter(ModelCostResolver costResolver
             writer.Field("Stored cached-input rate", FormatRate(snapshot.CachedInputPerMillionUsd));
             writer.Field("Stored output rate", FormatRate(snapshot.OutputPerMillionUsd));
         }
+    }
+
+    private static void WriteCostSummary(FlowWriter writer, ModelTaskCostResolution total)
+    {
+        writer.Field("Available estimated subtotal", total.TotalEstimatedCostUsd is { } estimate
+            ? $"${estimate.ToString("0.00000000", CultureInfo.InvariantCulture)} USD"
+            : "unavailable");
+        if (total.Overflowed)
+            writer.Body("The available estimated subtotal is unavailable because its numeric range was exceeded.");
+        else if (total.AvailableCallCount == 0)
+            writer.Body("Estimated cost is unavailable for all planning model calls.");
+        else if (total.UnavailableCallCount > 0)
+            writer.Body($"This is a partial estimate. {total.UnavailableCallCount} planning model call(s) had unavailable cost and were excluded from the available subtotal.");
+        else
+            writer.Body("All planning model calls have an available estimated cost.");
     }
 
     private static void WriteCollection<T>(FlowWriter writer, IReadOnlyList<T> values, Action<T, int> write)

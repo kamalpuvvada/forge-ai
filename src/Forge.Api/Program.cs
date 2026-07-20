@@ -22,6 +22,7 @@ var configuredDataSource = builder.Configuration.GetValue<string>("Forge:Databas
 var databasePath = Path.GetFullPath(configuredDataSource, builder.Environment.ContentRootPath);
 var connectionString = $"Data Source={databasePath}";
 var aiOptions = builder.Configuration.GetSection("Forge:AI").Get<ForgeAiOptions>() ?? new ForgeAiOptions();
+aiOptions.ValidateSyntax();
 var analysisLimits = builder.Configuration.GetSection("Forge:RepositoryAnalysis").Get<RepositoryAnalysisLimits>() ?? new RepositoryAnalysisLimits();
 var implementationLimits = builder.Configuration.GetSection("Forge:Implementation:Limits").Get<ImplementationLimits>() ?? new ImplementationLimits();
 var workspaceOptions = builder.Configuration.GetSection("Forge:Implementation").Get<ImplementationWorkspaceOptions>() ?? new ImplementationWorkspaceOptions();
@@ -44,6 +45,8 @@ builder.Services.AddSingleton(new ImplementationProcessIdentity(Guid.NewGuid()))
 builder.Services.AddSingleton(new OpenAIConfigurationState(!string.IsNullOrWhiteSpace(apiKey)));
 builder.Services.AddSingleton(new ModelCostCalculator(aiOptions.Pricing));
 builder.Services.AddSingleton<ModelCostResolver>();
+if (!string.IsNullOrWhiteSpace(apiKey))
+    builder.Services.AddSingleton<IOpenAIResponsesGateway>(new SdkOpenAIResponsesGateway(apiKey));
 builder.Services.AddSingleton<IEngineeringTaskPdfExporter, TaskPdfExporter>();
 builder.Services.AddSingleton<IImplementationPlanPdfExporter, ImplementationPlanPdfExporter>();
 builder.Services.AddSingleton<IClarificationEngine>(services => aiOptions.Mode switch
@@ -51,7 +54,7 @@ builder.Services.AddSingleton<IClarificationEngine>(services => aiOptions.Mode s
     ForgeAiModes.Fake => new FakeClarificationEngine(),
     ForgeAiModes.OpenAI => new OpenAIClarificationEngine(
         aiOptions,
-        string.IsNullOrWhiteSpace(apiKey) ? null : new SdkOpenAIResponsesGateway(apiKey),
+        services.GetService<IOpenAIResponsesGateway>(),
         services.GetRequiredService<ModelCostCalculator>(),
         services.GetRequiredService<TimeProvider>()),
     _ => throw new InvalidOperationException($"Unsupported Forge AI mode '{aiOptions.Mode}'. Use 'Fake' or 'OpenAI'.")
@@ -61,13 +64,21 @@ builder.Services.AddSingleton<IPlanningEngine>(services => aiOptions.Mode switch
     ForgeAiModes.Fake => new FakePlanningEngine(),
     ForgeAiModes.OpenAI => new OpenAIPlanningEngine(
         aiOptions,
-        string.IsNullOrWhiteSpace(apiKey) ? null : new SdkOpenAIResponsesGateway(apiKey),
+        services.GetService<IOpenAIResponsesGateway>(),
         services.GetRequiredService<ModelCostCalculator>(),
         services.GetRequiredService<TimeProvider>()),
     _ => throw new InvalidOperationException($"Unsupported Forge AI mode '{aiOptions.Mode}'. Use 'Fake' or 'OpenAI'.")
 });
-if (string.Equals(aiOptions.Mode, ForgeAiModes.Fake, StringComparison.OrdinalIgnoreCase))
-    builder.Services.AddSingleton<IImplementationEngine, FakeImplementationEngine>();
+builder.Services.AddSingleton<IImplementationEngine>(services => aiOptions.Mode switch
+{
+    ForgeAiModes.Fake => new FakeImplementationEngine(),
+    ForgeAiModes.OpenAI => new OpenAIImplementationEngine(
+        aiOptions,
+        services.GetService<IOpenAIResponsesGateway>(),
+        services.GetRequiredService<ModelCostCalculator>(),
+        services.GetRequiredService<TimeProvider>()),
+    _ => throw new InvalidOperationException($"Unsupported Forge AI mode '{aiOptions.Mode}'. Use 'Fake' or 'OpenAI'.")
+});
 builder.Services.AddSingleton(services => new SqliteEngineeringTaskRepository(
     connectionString, implementationLimits, services.GetRequiredService<TimeProvider>()));
 builder.Services.AddSingleton<IEngineeringTaskRepository>(services =>

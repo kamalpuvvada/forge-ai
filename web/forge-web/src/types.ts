@@ -18,6 +18,7 @@ export interface ModelCall {
   completedAt: string
   succeeded: boolean
   providerResponseId: string | null
+  usageAvailable?: boolean
   inputTokens: number | null
   cachedInputTokens: number | null
   uncachedInputTokens: number | null
@@ -28,13 +29,17 @@ export interface ModelCall {
   hasStoredPricingSnapshot: boolean
   storedPricingSnapshot: { inputPerMillionUsd: number; cachedInputPerMillionUsd: number; outputPerMillionUsd: number } | null
   failureCategory: string | null
+  providerRequestId: string | null
 }
 export interface ModelTelemetry {
   totalCalls: number
-  totalInputTokens: number
-  totalCachedInputTokens: number
-  totalOutputTokens: number
-  totalEstimatedCostUsd: number
+  usageAvailability: 'Complete' | 'Partial' | 'Unavailable'
+  usageUnavailableCallCount: number
+  totalInputTokens: number | null
+  totalCachedInputTokens: number | null
+  totalOutputTokens: number | null
+  totalReasoningTokens: number | null
+  totalEstimatedCostUsd: number | null
   costUnavailableCallCount: number
   isPartialEstimate: boolean
   calls: ModelCall[]
@@ -148,4 +153,10 @@ export interface SystemCapabilities {
   validationAvailable: boolean
   reviewAvailable: boolean
   pullRequestCreationAvailable: boolean
+  fakeImplementationAvailable: boolean
+  openAiImplementationAvailable: boolean
+  silentFallbackSupported: boolean
+  commitAvailable: boolean
+  pushAvailable: boolean
+  deliveryPullRequestAvailable: boolean
 }

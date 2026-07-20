@@ -244,6 +244,31 @@ public sealed class ImplementationServiceRecoveryTests : IDisposable
     }
 
     [Fact]
+    public async Task Provider_failure_persists_all_physical_calls_and_leaves_no_implementation_state()
+    {
+        var inner = await SeedAsync();
+        var task = (await inner.ListRecentAsync(1)).Single();
+        var calls = new[]
+        {
+            ImplementationCall(false, "implementation_rate_limit"),
+            ImplementationCall(false, "implementation_provider_error")
+        };
+
+        var failure = await Assert.ThrowsAsync<ImplementationException>(() =>
+            Service(new FailOnSaveRepository(inner), new DeterministicWorkspaceManager(),
+                new ProviderFailingEngine(calls)).GenerateImplementationAsync(task.Id));
+        var persisted = await inner.GetAsync(task.Id);
+
+        Assert.Equal("implementation_provider_error", failure.Category);
+        Assert.Equal(WorkflowStatus.PlanApproved, persisted?.Status);
+        Assert.Equal(2, persisted?.ModelCalls.Count(call => call.Stage == ModelCallStage.Implementation));
+        Assert.Null(persisted?.ImplementationWorkspace);
+        Assert.Null(persisted?.ImplementationLease);
+        Assert.Empty(persisted?.ImplementationRevisions ?? []);
+        Assert.Null(persisted?.ImplementationResult);
+    }
+
+    [Fact]
     public async Task Cancellation_before_workspace_reservation_leaves_the_approved_task_untouched()
     {
         var inner = await SeedAsync();
@@ -597,6 +622,19 @@ public sealed class ImplementationServiceRecoveryTests : IDisposable
         public override DateTimeOffset GetUtcNow() => now;
     }
 
+    private static ModelCallRecord ImplementationCall(bool succeeded, string? category) => new(
+        Guid.NewGuid(), ModelCallStage.Implementation, "OpenAI", "gpt-5.6-sol", "high",
+        Now, Now.AddSeconds(1), succeeded, null, null, null, null, null, null, category,
+        new ModelPricingSnapshot(5m, .5m, 30m));
+
+    private sealed class ProviderFailingEngine(IReadOnlyList<ModelCallRecord> calls) : IImplementationEngine
+    {
+        public Task<ImplementationEvaluation> GenerateAsync(ImplementationContext context,
+            CancellationToken cancellationToken = default) => Task.FromException<ImplementationEvaluation>(
+            new ImplementationProviderException("OpenAI could not complete the implementation request.",
+                "implementation_provider_error", calls));
+    }
+
     private sealed class DeterministicWorkspaceManager : IImplementationWorkspaceManager
     {
         private static readonly string Token = new('a', 32);
@@ -611,6 +649,20 @@ public sealed class ImplementationServiceRecoveryTests : IDisposable
         public IReadOnlyList<ImplementationFileContext>? PreflightFiles { get; init; }
         public int PrepareCalls { get; private set; }
         private int resultVerifications;
+        private int activeCheckoutVerifications;
+
+        public Task<ImplementationInspection> InspectAsync(string repositoryPath, RepositorySnapshot snapshot,
+            ImplementationPlan plan, ImplementationLimits limits, CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            const string original = "public class App { }\n";
+            var files = PreflightFiles ??
+                [new ImplementationFileContext("src/App.cs", PlannedFileAction.Modify, original,
+                    ImplementationOutputValidator.Hash(original))];
+            return Task.FromResult(new ImplementationInspection(
+                new ActiveCheckoutSignature("main", new string('b', 40), "status", "index"),
+                files, new string('1', 64), new string('2', 64)));
+        }
 
         public async Task<ImplementationReservation> ReserveAsync(Guid taskId, string repositoryPath,
             RepositorySnapshot snapshot, ImplementationPlan plan, CancellationToken cancellationToken = default)
@@ -683,7 +735,8 @@ public sealed class ImplementationServiceRecoveryTests : IDisposable
         }
 
         public Task VerifyActiveCheckoutAsync(string repositoryPath, ImplementationPlan plan,
-            ActiveCheckoutSignature expected, CancellationToken cancellationToken = default) => FailActiveCheckoutVerification
+            ActiveCheckoutSignature expected, CancellationToken cancellationToken = default) =>
+            FailActiveCheckoutVerification && Interlocked.Increment(ref activeCheckoutVerifications) > 2
             ? Task.FromException(new ImplementationException("implementation_active_checkout_changed",
                 "The active checkout postcondition could not be verified.", true))
             : Task.CompletedTask;

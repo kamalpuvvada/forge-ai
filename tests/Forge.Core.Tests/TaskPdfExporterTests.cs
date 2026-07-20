@@ -35,6 +35,10 @@ public sealed class TaskPdfExporterTests
         Assert.Contains("cost unavailable", text);
         Assert.Contains("partial estimate", text);
         Assert.Contains("estimates, not invoices", text);
+        Assert.Contains("Reasoning effort: low", text);
+        Assert.Contains("Provider request ID: request-1", text);
+        Assert.Contains("Provider response ID: response-1", text);
+        Assert.Contains("Reasoning tokens: 300", text);
         Assert.DoesNotContain(task.Repository, text, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("987654.321", text, StringComparison.Ordinal);
     }
@@ -48,7 +52,7 @@ public sealed class TaskPdfExporterTests
         using var document = PdfDocument.Open(bytes);
         var text = string.Join('\n', document.GetPages().Select(page => page.Text));
 
-        Assert.Contains("Available estimated total: $0.00000000 USD", text);
+        Assert.Contains("Available estimated subtotal: $0.00000000 USD", text);
         Assert.Contains("No model calls were recorded for this task.", text);
         Assert.DoesNotContain("All recorded model calls have an available estimated cost.", text);
     }
@@ -101,7 +105,7 @@ public sealed class TaskPdfExporterTests
         var text = Extract(Exporter().Export(task));
 
         Assert.Contains("Report metadata", text);
-        Assert.Contains("Exported-at UTC: 2026-07-18T12:00:00.0000000+00:00", text);
+        Assert.Contains("Exported-at UTC: 2026-07-18T12:00:00Z", text);
         Assert.Contains("Requirement summary generated: not recorded", text);
         Assert.Contains("Repository analysed: not recorded", text);
         Assert.Contains("Plan created: not recorded", text);
@@ -153,7 +157,7 @@ public sealed class TaskPdfExporterTests
         Assert.Contains(new string('a', 40), text);
         Assert.Contains(ImplementationBranchDisplay.SafeLabel, text);
         Assert.DoesNotContain("forge/task-0123456789abcdef0123456789abcdef", text, StringComparison.Ordinal);
-        Assert.Contains("Source: DeterministicFake", text);
+        Assert.Contains("Implementation source: DeterministicFake", text);
         foreach (var path in new[] { "src/GreetingService.cs", "config/settings.json", "README.md" })
             Assert.Contains(path, text);
         foreach (var hash in new[] { new string('3', 64), new string('4', 64), new string('5', 64),
@@ -186,6 +190,111 @@ public sealed class TaskPdfExporterTests
         Assert.DoesNotContain(@"C:\unrelated\worktree", text, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("COMPLETE-EVIDENCE-EXCERPT-MARKER", text);
         Assert.DoesNotContain("System.InvalidOperationException", text);
+    }
+
+    [Fact]
+    public void OpenAI_implementation_pdf_records_provider_audit_and_validation_without_private_context()
+    {
+        var source = ImplementedAuditTask();
+        source.RecordModelCall(new ModelCallRecord(
+            Guid.Parse("11111111-1111-4111-8111-111111111111"), ModelCallStage.Implementation,
+            "OpenAI", "gpt-5.6-sol", "high", Now, Now.AddSeconds(4), true, "response-safe",
+            100, 20, 50, 10, 0.002m, null, new ModelPricingSnapshot(5m, .5m, 30m), "request-safe"), Now);
+        var result = source.ImplementationResult! with
+        {
+            Source = ImplementationSource.OpenAI,
+            Model = "gpt-5.6-sol",
+            Summary = "OpenAI proposed the approved bounded operations.",
+            Warnings = []
+        };
+        var task = CopyImplementationState(source, result, source.ImplementationWorkspace, null);
+
+        var text = Extract(Exporter().Export(task));
+
+        Assert.Contains("Implementation source: OpenAI", text);
+        Assert.Contains("Provider output was treated as untrusted", text);
+        Assert.Contains("Deterministic operation validation: accepted", text);
+        Assert.Contains("Call 1: Implementation / gpt-5.6-sol", text);
+        Assert.Contains("Client call ID: 11111111-1111-4111-8111-111111111111", text);
+        Assert.Contains("Provider request ID: request-safe", text);
+        Assert.Contains("Provider response ID: response-safe", text);
+        Assert.DoesNotContain("contextFingerprint", text, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("sourceContextIdentity", text, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("rationale", text, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void Missing_required_usage_is_explicitly_unavailable_in_pdf_without_zero_cost()
+    {
+        var task = EngineeringTask.Create("C:/repository", "Export truthful unavailable usage.", Now);
+        task.RecordModelCall(new ModelCallRecord(
+            Guid.NewGuid(), ModelCallStage.Implementation, "OpenAI", "gpt-5.6-sol", "high",
+            Now, Now.AddSeconds(2), false, null, null, null, null, null, 0m,
+            "implementation_provider_error"), Now);
+
+        var text = Extract(Exporter().Export(task));
+
+        Assert.Contains("Usage unavailable", text, StringComparison.Ordinal);
+        Assert.Contains("Estimated cost: unavailable", text, StringComparison.Ordinal);
+        Assert.Contains("Available estimated subtotal: unavailable", text, StringComparison.Ordinal);
+        Assert.Contains("Estimated cost is unavailable for all displayed model calls.", text, StringComparison.Ordinal);
+        Assert.DoesNotContain("Estimated cost: $0", text, StringComparison.Ordinal);
+        Assert.DoesNotContain("Available estimated subtotal: $0", text, StringComparison.Ordinal);
+        Assert.DoesNotContain("0.000000", text, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Legacy_unavailable_nonzero_estimate_is_not_rendered_in_task_pdf()
+    {
+        var task = EngineeringTask.Create("C:/repository", "Ignore a stale legacy estimate.", Now);
+        task.RecordModelCall(new ModelCallRecord(
+            Guid.NewGuid(), ModelCallStage.Planning, "OpenAI", "legacy-model", "medium",
+            Now, Now.AddSeconds(1), false, null, null, null, null, null, 123.456789m,
+            "provider_error"), Now);
+
+        var text = Extract(Exporter().Export(task));
+
+        Assert.Contains("Usage unavailable", text);
+        Assert.Contains("Estimated cost: unavailable", text);
+        Assert.Contains("Available estimated subtotal: unavailable", text);
+        Assert.DoesNotContain("123.456789", text, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Valid_explicit_zero_usage_and_cost_remain_numeric_in_task_pdf()
+    {
+        var task = EngineeringTask.Create("C:/repository", "Render provider-confirmed zero usage.", Now);
+        task.RecordModelCall(new ModelCallRecord(
+            Guid.NewGuid(), ModelCallStage.Planning, "OpenAI", "legacy-model", "medium",
+            Now, Now.AddSeconds(1), true, "response", 0, 0, 0, 0, 0m, null), Now);
+
+        var text = Extract(Exporter().Export(task));
+
+        Assert.DoesNotContain("Usage unavailable", text);
+        Assert.Contains("Total input tokens: 0", text);
+        Assert.Contains("Output tokens: 0", text);
+        Assert.Contains("Estimated cost: $0.00000000 USD", text);
+        Assert.Contains("Available estimated subtotal: $0.00000000 USD", text);
+        Assert.Contains("All recorded model calls have an available estimated cost.", text);
+    }
+
+    [Fact]
+    public void Partial_task_pdf_excludes_legacy_unavailable_zero_from_available_subtotal()
+    {
+        var task = EngineeringTask.Create("C:/repository", "Render a truthful partial subtotal.", Now);
+        task.RecordModelCall(new ModelCallRecord(
+            Guid.NewGuid(), ModelCallStage.Planning, "OpenAI", "legacy-model", "medium",
+            Now, Now.AddSeconds(1), true, "response", 10, 0, 5, 0, 1.25m, null), Now);
+        task.RecordModelCall(new ModelCallRecord(
+            Guid.NewGuid(), ModelCallStage.Planning, "OpenAI", "legacy-model", "medium",
+            Now, Now.AddSeconds(2), false, null, null, null, null, null, 0m, "provider_error"), Now);
+
+        var text = Extract(Exporter().Export(task));
+
+        Assert.Contains("Available estimated subtotal: $1.25000000 USD", text);
+        Assert.Contains("This is a partial estimate. 1 displayed model call(s) had unavailable cost", text);
+        Assert.Contains("Usage unavailable", text);
+        Assert.DoesNotContain("Available estimated subtotal: $0", text);
     }
 
     [Fact]
@@ -224,7 +333,7 @@ public sealed class TaskPdfExporterTests
         Assert.Contains("Workflow status: ImplementationApproved", text);
         Assert.Contains("Implementation revision 1 — CURRENT / APPROVED", text);
         Assert.Contains("Review disposition: Approved", text);
-        Assert.Contains($"Approved at: {Now.AddMinutes(7):O}", text);
+        Assert.Contains("Approved at: 2026-07-18T12:07:00Z", text);
         Assert.Contains(approved.ResultFingerprint!, text);
         Assert.Contains("approval applies to the exact persisted review evidence", text);
         Assert.Contains("validation was not run", text, StringComparison.OrdinalIgnoreCase);
@@ -698,7 +807,7 @@ public sealed class TaskPdfExporterTests
     }
 
     [Fact]
-    public void Model_call_aggregation_is_bounded_partial_and_decimal_overflow_safe()
+    public void Model_call_aggregation_is_bounded_partial_and_rejects_out_of_range_estimates()
     {
         var source = EngineeringTask.Create("C:/safe", "Export bounded model costs.", Now);
         var calls = Enumerable.Range(1, 105).Select(index => new ModelCallRecord(
@@ -717,9 +826,8 @@ public sealed class TaskPdfExporterTests
         Assert.DoesNotContain("Call 101:", text);
         Assert.Contains("legacy estimate \u2014 pricing snapshot unavailable", text);
         Assert.Contains("cost unavailable", text);
-        Assert.Contains("Available estimated total: unavailable", text);
-        Assert.Contains("bounded estimated total is unavailable because its numeric range was exceeded", text);
-        Assert.Contains("5 additional model call(s) were omitted by the report limit", text);
+        Assert.Contains("Available estimated subtotal: $97.00000000 USD", text);
+        Assert.Contains("This is a partial estimate. 3 displayed model call(s) had unavailable cost", text);
     }
 
     [Fact]
@@ -1031,7 +1139,7 @@ public sealed class TaskPdfExporterTests
         task.RecordModelCall(new ModelCallRecord(
             Guid.NewGuid(), ModelCallStage.Clarification, "OpenAI", "current-model", "low",
             Now, Now, true, "response-1", 1_000, 250, 500, 300, 999m, null,
-            new ModelPricingSnapshot(10m, 2m, 20m)), Now);
+            new ModelPricingSnapshot(10m, 2m, 20m), "request-1"), Now);
         task.RecordModelCall(new ModelCallRecord(
             Guid.NewGuid(), ModelCallStage.Planning, "OpenAI", "legacy-model", "medium",
             Now, Now, false, "response-2", 100, 0, 10, 5, 0m, "invalid_plan"), Now);

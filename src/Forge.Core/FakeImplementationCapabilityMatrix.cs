@@ -47,16 +47,6 @@ public static class FakeImplementationCapabilityMatrix
             [".json"] = FakeImplementationContentStyle.JsonObject
         };
 
-    private static readonly HashSet<string> RejectedNames = new(StringComparer.OrdinalIgnoreCase)
-    {
-        "package-lock.json", "packages.lock.json", "pnpm-lock.yaml", "yarn.lock"
-    };
-    private static readonly HashSet<string> RejectedDirectories = new(StringComparer.OrdinalIgnoreCase)
-    {
-        ".git", ".vs", ".idea", "node_modules", "bin", "obj", "dist", "build", "coverage",
-        "TestResults", "packages", "vendor", ".next", ".nuget", "bower_components"
-    };
-
     public static void ValidatePlan(ImplementationPlan plan)
     {
         ArgumentNullException.ThrowIfNull(plan);
@@ -66,23 +56,14 @@ public static class FakeImplementationCapabilityMatrix
 
     public static FakeImplementationContentStyle GetStyle(string path, PlannedFileAction action)
     {
-        if (!RepositoryPathRules.IsSafeRelativePath(path, 300))
-            throw Unsupported(path);
+        try { ImplementationEligibilityPolicy.ValidatePath(path, action); }
+        catch (ImplementationException) { throw Unsupported(path); }
         var name = Path.GetFileName(path);
-        if (RejectedNames.Contains(name) || path.Split('/', '\\').Any(RejectedDirectories.Contains) ||
-            name.Equals(".env", StringComparison.OrdinalIgnoreCase) ||
-            name.StartsWith(".env.", StringComparison.OrdinalIgnoreCase) ||
-            name.Contains(".min.", StringComparison.OrdinalIgnoreCase) ||
-            name.EndsWith(".map", StringComparison.OrdinalIgnoreCase) ||
-            name.EndsWith(".g.cs", StringComparison.OrdinalIgnoreCase) ||
-            name.EndsWith(".designer.cs", StringComparison.OrdinalIgnoreCase) ||
-            name.EndsWith(".generated.cs", StringComparison.OrdinalIgnoreCase)) throw Unsupported(path);
         if (name.Equals("Dockerfile", StringComparison.OrdinalIgnoreCase))
             return FakeImplementationContentStyle.HashLine;
         if (name.Equals(".editorconfig", StringComparison.OrdinalIgnoreCase))
             return FakeImplementationContentStyle.HashLine;
         if (!Styles.TryGetValue(Path.GetExtension(path), out var style)) throw Unsupported(path);
-        if (!Enum.IsDefined(action) || action == PlannedFileAction.Inspect) throw Unsupported(path);
         return style;
     }
 

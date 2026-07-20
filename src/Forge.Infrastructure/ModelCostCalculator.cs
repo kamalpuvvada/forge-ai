@@ -33,6 +33,27 @@ public sealed class ModelCostCalculator(IReadOnlyDictionary<string, ModelPricing
         return Calculate(snapshot, inputTokens, cachedInputTokens, outputTokens).TotalCostUsd;
     }
 
+    public bool TryCalculate(
+        ModelPricingSnapshot rates,
+        int? inputTokens,
+        int? cachedInputTokens,
+        int? outputTokens,
+        out ModelCostBreakdown breakdown)
+    {
+        breakdown = null!;
+        if (inputTokens is not { } input || cachedInputTokens is not { } cached || outputTokens is not { } output)
+            return false;
+        try
+        {
+            breakdown = Calculate(rates, input, cached, output);
+            return true;
+        }
+        catch (Exception exception) when (exception is ArgumentOutOfRangeException or OverflowException)
+        {
+            return false;
+        }
+    }
+
     public ModelCostBreakdown Calculate(
         ModelPricingSnapshot rates,
         int inputTokens,
@@ -42,8 +63,10 @@ public sealed class ModelCostCalculator(IReadOnlyDictionary<string, ModelPricing
         ArgumentNullException.ThrowIfNull(rates);
         if (inputTokens < 0 || cachedInputTokens < 0 || outputTokens < 0 || cachedInputTokens > inputTokens)
             throw new ArgumentOutOfRangeException(nameof(inputTokens), "Token counts must be non-negative and cached input cannot exceed total input.");
-        if (rates.InputPerMillionUsd < 0 || rates.CachedInputPerMillionUsd < 0 || rates.OutputPerMillionUsd < 0)
-            throw new ArgumentOutOfRangeException(nameof(rates), "Pricing rates must be non-negative.");
+        if (rates.InputPerMillionUsd is < 0 or > ForgeAiOptions.MaximumPricePerMillionUsd ||
+            rates.CachedInputPerMillionUsd is < 0 or > ForgeAiOptions.MaximumPricePerMillionUsd ||
+            rates.OutputPerMillionUsd is < 0 or > ForgeAiOptions.MaximumPricePerMillionUsd)
+            throw new ArgumentOutOfRangeException(nameof(rates), "Pricing rates are outside the supported range.");
 
         var uncachedInput = inputTokens - cachedInputTokens;
         var uncachedCost = Round(uncachedInput * rates.InputPerMillionUsd / 1_000_000m);

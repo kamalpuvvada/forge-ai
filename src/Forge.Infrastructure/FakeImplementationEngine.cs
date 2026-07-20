@@ -25,7 +25,9 @@ public sealed class FakeImplementationEngine : IImplementationEngine
             ],
             operations,
             ImplementationSource.DeterministicFake,
-            null);
+            null,
+            null,
+            context.ContextFingerprint);
         return Task.FromResult(new ImplementationEvaluation(output));
     }
 
@@ -54,7 +56,9 @@ public sealed class FakeImplementationEngine : IImplementationEngine
                 ImplementationOperationAction.Create => "Create an explicitly labelled deterministic Fake placeholder.",
                 ImplementationOperationAction.Modify => "Add an explicitly labelled deterministic Fake marker.",
                 _ => "Delete the explicitly approved target in the isolated worktree."
-            });
+            },
+            file.OriginalUtf8Bytes,
+            file.SourceContextIdentity);
     }
 
     private static string CreatePlaceholder(string path)
