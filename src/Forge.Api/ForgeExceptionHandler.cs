@@ -96,6 +96,12 @@ public sealed class ForgeExceptionHandler(
         {
             "implementation_configuration" or "implementation_workspace_configuration" =>
                 (503, "Implementation unavailable", safe.Message, safe.Category),
+            "implementation_rate_limit" or "implementation_timeout" =>
+                (503, "AI implementation temporarily unavailable", safe.Message, safe.Category),
+            "implementation_authentication" or "implementation_permission" or
+                "implementation_model_unavailable" or "implementation_provider_error" or
+                "implementation_invalid_request" =>
+                (502, "AI implementation failure", safe.Message, safe.Category),
             "implementation_repository_not_git" or "implementation_repository_dirty" or
                 "implementation_base_changed" or "implementation_repository_state" or
                 "implementation_workspace_conflict" or "implementation_active_checkout_changed" or

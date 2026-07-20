@@ -8,6 +8,9 @@ public static class ForgeAiModes
 
 public sealed class ForgeAiOptions
 {
+    public const int MaximumImplementationOutputTokens = 100_000;
+    public const int MaximumImplementationTimeoutSeconds = 600;
+    public const decimal MaximumPricePerMillionUsd = 100_000m;
     private static readonly HashSet<string> SupportedReasoningEfforts = new(StringComparer.OrdinalIgnoreCase)
     {
         "none", "minimal", "low", "medium", "high", "xhigh", "max"
@@ -21,8 +24,9 @@ public sealed class ForgeAiOptions
     public string PlanningReasoningEffort { get; set; } = "medium";
     public int PlanningMaxOutputTokens { get; set; } = 6000;
     public string ImplementationModel { get; set; } = "gpt-5.6-sol";
-    public string ImplementationReasoningEffort { get; set; } = "medium";
-    public int ImplementationMaxOutputTokens { get; set; } = 20_000;
+    public string ImplementationReasoningEffort { get; set; } = "high";
+    public int ImplementationMaxOutputTokens { get; set; } = 32_000;
+    public int ImplementationTimeoutSeconds { get; set; } = 180;
     public Dictionary<string, ModelPricing> Pricing { get; set; } = DefaultPricing();
 
     public bool IsClarificationConfigurationComplete(bool hasApiKey) =>
@@ -30,17 +34,47 @@ public sealed class ForgeAiOptions
         !string.IsNullOrWhiteSpace(ClarificationModel) &&
         SupportedReasoningEfforts.Contains(ClarificationReasoningEffort) &&
         ClarificationMaxOutputTokens > 0 &&
-        Pricing.ContainsKey(ClarificationModel);
+        Pricing is not null && Pricing.ContainsKey(ClarificationModel);
 
     public bool IsPlanningConfigurationComplete(bool hasApiKey) =>
         hasApiKey &&
         !string.IsNullOrWhiteSpace(PlanningModel) &&
         SupportedReasoningEfforts.Contains(PlanningReasoningEffort) &&
         PlanningMaxOutputTokens > 0 &&
-        Pricing.ContainsKey(PlanningModel);
+        Pricing is not null && Pricing.ContainsKey(PlanningModel);
 
     public bool IsOpenAiConfigurationComplete(bool hasApiKey) =>
-        IsClarificationConfigurationComplete(hasApiKey) && IsPlanningConfigurationComplete(hasApiKey);
+        IsClarificationConfigurationComplete(hasApiKey) && IsPlanningConfigurationComplete(hasApiKey) &&
+        IsImplementationConfigurationComplete(hasApiKey);
+
+    public bool IsImplementationConfigurationComplete(bool hasApiKey) =>
+        hasApiKey &&
+        !string.IsNullOrWhiteSpace(ImplementationModel) &&
+        ImplementationModel.Length <= 160 &&
+        SupportedReasoningEfforts.Contains(ImplementationReasoningEffort) &&
+        ImplementationMaxOutputTokens is > 0 and <= MaximumImplementationOutputTokens &&
+        ImplementationTimeoutSeconds is > 0 and <= MaximumImplementationTimeoutSeconds &&
+        Pricing is not null && Pricing.TryGetValue(ImplementationModel, out var pricing) && IsValidPricing(pricing);
+
+    public void ValidateSyntax()
+    {
+        if (!string.Equals(Mode, ForgeAiModes.Fake, StringComparison.OrdinalIgnoreCase) &&
+            !string.Equals(Mode, ForgeAiModes.OpenAI, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException("Forge AI mode configuration is invalid.");
+        if (string.IsNullOrWhiteSpace(ImplementationModel) || ImplementationModel.Length > 160 ||
+            !SupportedReasoningEfforts.Contains(ImplementationReasoningEffort) ||
+            ImplementationMaxOutputTokens is <= 0 or > MaximumImplementationOutputTokens ||
+            ImplementationTimeoutSeconds is <= 0 or > MaximumImplementationTimeoutSeconds ||
+            Pricing is null || !Pricing.TryGetValue(ImplementationModel, out var pricing) || !IsValidPricing(pricing))
+            throw new InvalidOperationException("Forge OpenAI implementation configuration is syntactically invalid.");
+    }
+
+    internal static bool IsValidPricing(ModelPricing? pricing) => pricing is not null &&
+        IsValidRate(pricing.InputPerMillionUsd) &&
+        IsValidRate(pricing.CachedInputPerMillionUsd) &&
+        IsValidRate(pricing.OutputPerMillionUsd);
+
+    private static bool IsValidRate(decimal rate) => rate is >= 0 and <= MaximumPricePerMillionUsd;
 
     public static Dictionary<string, ModelPricing> DefaultPricing() => new(StringComparer.OrdinalIgnoreCase)
     {

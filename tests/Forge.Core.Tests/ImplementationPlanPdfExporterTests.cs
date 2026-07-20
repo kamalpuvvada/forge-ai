@@ -55,6 +55,55 @@ public sealed class ImplementationPlanPdfExporterTests
     }
 
     [Fact]
+    public void Legacy_unavailable_zero_and_nonzero_estimates_are_not_rendered_in_plan_pdf()
+    {
+        var task = PlannedTask(recordDefaultCall: false);
+        task.RecordModelCall(LegacyPlanningCall(null, null, null, 0m), Now);
+        task.RecordModelCall(LegacyPlanningCall(null, null, null, 123.456789m), Now);
+
+        var text = Extract(Exporter().Export(task));
+
+        Assert.Contains("Usage unavailable", text);
+        Assert.Contains("Estimated cost: unavailable", text);
+        Assert.Contains("Available estimated subtotal: unavailable", text);
+        Assert.Contains("Estimated cost is unavailable for all planning model calls.", text);
+        Assert.DoesNotContain("$0", text, StringComparison.Ordinal);
+        Assert.DoesNotContain("0.000000", text, StringComparison.Ordinal);
+        Assert.DoesNotContain("123.456789", text, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Valid_explicit_zero_usage_and_cost_remain_numeric_in_plan_pdf()
+    {
+        var task = PlannedTask(recordDefaultCall: false);
+        task.RecordModelCall(LegacyPlanningCall(0, 0, 0, 0m), Now);
+
+        var text = Extract(Exporter().Export(task));
+
+        Assert.DoesNotContain("Usage unavailable", text);
+        Assert.Contains("Input tokens: 0", text);
+        Assert.Contains("Output tokens: 0", text);
+        Assert.Contains("Estimated cost: $0.00000000 USD", text);
+        Assert.Contains("Available estimated subtotal: $0.00000000 USD", text);
+        Assert.Contains("All planning model calls have an available estimated cost.", text);
+    }
+
+    [Fact]
+    public void Partial_plan_pdf_excludes_legacy_unavailable_zero_from_available_subtotal()
+    {
+        var task = PlannedTask(recordDefaultCall: false);
+        task.RecordModelCall(LegacyPlanningCall(10, 0, 5, 1.25m), Now);
+        task.RecordModelCall(LegacyPlanningCall(null, null, null, 0m), Now);
+
+        var text = Extract(Exporter().Export(task));
+
+        Assert.Contains("Available estimated subtotal: $1.25000000 USD", text);
+        Assert.Contains("This is a partial estimate. 1 planning model call(s) had unavailable cost", text);
+        Assert.Contains("Usage unavailable", text);
+        Assert.DoesNotContain("Available estimated subtotal: $0", text);
+    }
+
+    [Fact]
     public void Approved_pdf_uses_exact_approved_label()
     {
         var task = PlannedTask();
@@ -134,7 +183,7 @@ public sealed class ImplementationPlanPdfExporterTests
     private static ImplementationPlanPdfExporter Exporter() => new(new ModelCostResolver(
         new ModelCostCalculator(new Dictionary<string, ModelPricing>())));
 
-    private static EngineeringTask PlannedTask()
+    private static EngineeringTask PlannedTask(bool recordDefaultCall = true)
     {
         var task = EngineeringTask.Create(@"C:\sensitive\repository-root", "Original requirement secret marker", Now);
         task.ApplyClarificationEvaluation(ClarificationEvaluation.Summarize("Approved plan PDF requirement"), Now);
@@ -157,11 +206,16 @@ public sealed class ImplementationPlanPdfExporterTests
             Summary = "Complete implementation plan export.", Source = PlanningSource.OpenAI, PlanningModel = "planning-model"
         };
         task.StoreImplementationPlan(plan, Now, TimeSpan.FromMinutes(30));
-        task.RecordModelCall(new ModelCallRecord(Guid.NewGuid(), ModelCallStage.Planning, "OpenAI", "planning-model", "medium",
-            Now, Now.AddSeconds(2), true, "provider-response-secret", 1_000, 250, 500, 100, 999m, null,
-            new ModelPricingSnapshot(10m, 2m, 20m)), Now);
+        if (recordDefaultCall)
+            task.RecordModelCall(new ModelCallRecord(Guid.NewGuid(), ModelCallStage.Planning, "OpenAI", "planning-model", "medium",
+                Now, Now.AddSeconds(2), true, "provider-response-secret", 1_000, 250, 500, 100, 999m, null,
+                new ModelPricingSnapshot(10m, 2m, 20m)), Now);
         return task;
     }
+
+    private static ModelCallRecord LegacyPlanningCall(int? input, int? cached, int? output, decimal? estimate) => new(
+        Guid.NewGuid(), ModelCallStage.Planning, "OpenAI", "legacy-model", "medium",
+        Now, Now.AddSeconds(1), true, "response", input, cached, output, null, estimate, null);
 
     private static string Extract(byte[] bytes)
     {

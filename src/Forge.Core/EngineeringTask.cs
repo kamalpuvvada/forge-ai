@@ -270,7 +270,7 @@ public sealed class EngineeringTask
         EnsureStatus(WorkflowStatus.AwaitingPlanApproval);
         if (ImplementationPlan is null)
             throw new WorkflowException("An implementation plan is required before approval.");
-        FakeImplementationCapabilityMatrix.ValidatePlan(ImplementationPlan);
+        ImplementationEligibilityPolicy.ValidatePlan(ImplementationPlan);
         PlanApprovedAt = now;
         Status = WorkflowStatus.PlanApproved;
         UpdatedAt = now;

@@ -254,6 +254,13 @@ public sealed class ImplementationWorkflowTests
         AssertInvalid(modify with { OriginalContentSha256 = new string('0', 64) });
         AssertInvalid(modify with { Content = files[0].OriginalContent });
         AssertInvalid(modify with { Path = "../App.cs" });
+        var createWithExistingBytes = output with
+        {
+            Operations = output.Operations.Select((item, index) =>
+                index == 1 ? item with { ExpectedOriginalUtf8Bytes = 1 } : item).ToArray()
+        };
+        Assert.Throws<ImplementationException>(() => ImplementationOutputValidator.Validate(
+            plan, files, createWithExistingBytes, new ImplementationLimits()));
 
         var inspectPlan = plan with { AffectedFiles = [.. plan.AffectedFiles, new PlannedFileChange("src/Inspect.cs", PlannedFileAction.Inspect, "Inspect.", ["E1"], .5m)] };
         var inspectOutput = output with { Operations = [.. output.Operations, new ImplementationOperation("src/Inspect.cs", ImplementationOperationAction.Modify, "hash", "changed", "No.")] };

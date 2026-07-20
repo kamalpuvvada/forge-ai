@@ -10,10 +10,8 @@ public sealed class OpenAIClarificationEngineTests
     [Fact]
     public async Task Valid_ask_structured_response_maps_usage_and_estimated_cost()
     {
-        var gateway = new StubGateway(new OpenAIResponseEnvelope(
-            "resp_123",
-            """{"decision":"ask","question":"Who can access it?","questionFocus":"access_permissions","summary":null,"knownFacts":["Audit log requested"],"assumptions":[],"unresolvedGaps":["Access"]}""",
-            1000, 400, 200, 50));
+        var output = """{"decision":"ask","question":"Who can access it?","questionFocus":"access_permissions","summary":null,"knownFacts":["Audit log requested"],"assumptions":[],"unresolvedGaps":["Access"]}""";
+        var gateway = new StubGateway(Envelope(output, "resp_123", 1000, 400, 200, 50));
         var engine = CreateEngine(gateway);
 
         var result = await engine.EvaluateAsync(NewTask());
@@ -122,6 +120,32 @@ public sealed class OpenAIClarificationEngineTests
     }
 
     [Fact]
+    public async Task Every_adversarial_response_topology_is_rejected_with_failed_telemetry()
+    {
+        var json = """{"decision":"summarize","question":null,"questionFocus":null,"summary":"Implement audit logging.","knownFacts":[],"assumptions":[],"unresolvedGaps":[]}""";
+        var cases = new[]
+        {
+            Envelope(json) with { Status = OpenAIResponseStatus.Incomplete },
+            Envelope(json, items: [new(OpenAIResponseOutputItemKind.Tool, null, []), Message(json)]),
+            Envelope(json, items: [new(OpenAIResponseOutputItemKind.Message, "assistant",
+                [new(OpenAIResponseContentKind.Refusal, "no"), new(OpenAIResponseContentKind.OutputText, json)])]),
+            Envelope(json, items: [Message(json), Message(json)]),
+            Envelope(json, items: [new(OpenAIResponseOutputItemKind.Message, "assistant",
+                [new(OpenAIResponseContentKind.OutputText, json), new(OpenAIResponseContentKind.OutputText, json)])]),
+            Envelope(json, items: [new(OpenAIResponseOutputItemKind.Unknown, null, []), Message(json)]),
+            Envelope(json) with { ResponseId = "" }
+        };
+
+        foreach (var envelope in cases)
+        {
+            var exception = await Assert.ThrowsAsync<ClarificationProviderException>(() =>
+                CreateEngine(new StubGateway(envelope)).EvaluateAsync(NewTask()));
+            Assert.False(exception.FailedCall.Succeeded);
+            Assert.NotNull(exception.FailedCall.FailureCategory);
+        }
+    }
+
+    [Fact]
     public void Estimated_cost_uses_uncached_cached_and_output_rates()
     {
         var calculator = new ModelCostCalculator(ForgeAiOptions.DefaultPricing());
@@ -135,7 +159,19 @@ public sealed class OpenAIClarificationEngineTests
     }
 
     private static EngineeringTask NewTask() => EngineeringTask.Create("C:/repo", "Add audit logging", Now);
-    private static OpenAIResponseEnvelope Envelope(string output) => new("resp_test", output, 10, 0, 5, 1);
+    private static OpenAIResponseOutputItem Message(string output) => new(OpenAIResponseOutputItemKind.Message,
+        "assistant", [new(OpenAIResponseContentKind.OutputText, output)]);
+
+    private static OpenAIResponseEnvelope Envelope(
+        string output,
+        string responseId = "resp_test",
+        int input = 10,
+        int? cached = 0,
+        int outputTokens = 5,
+        int? reasoning = 1,
+        IReadOnlyList<OpenAIResponseOutputItem>? items = null) =>
+        new(responseId, output, input, cached, outputTokens, reasoning,
+            OutputItems: items ?? [new(OpenAIResponseOutputItemKind.Reasoning, null, []), Message(output)]);
 
     private sealed class StubGateway(OpenAIResponseEnvelope envelope) : IOpenAIResponsesGateway
     {

@@ -39,6 +39,7 @@ public sealed record ModelCallResponse(
     DateTimeOffset CompletedAt,
     bool Succeeded,
     string? ProviderResponseId,
+    bool UsageAvailable,
     int? InputTokens,
     int? CachedInputTokens,
     int? UncachedInputTokens,
@@ -48,19 +49,30 @@ public sealed record ModelCallResponse(
     string PricingProvenance,
     bool HasStoredPricingSnapshot,
     ModelPricingSnapshotResponse? StoredPricingSnapshot,
-    string? FailureCategory);
+    string? FailureCategory,
+    string? ProviderRequestId);
 
 public sealed record ModelPricingSnapshotResponse(
     decimal InputPerMillionUsd,
     decimal CachedInputPerMillionUsd,
     decimal OutputPerMillionUsd);
 
+public enum ModelUsageAvailability
+{
+    Complete,
+    Partial,
+    Unavailable
+}
+
 public sealed record ModelTelemetryResponse(
     int TotalCalls,
-    int TotalInputTokens,
-    int TotalCachedInputTokens,
-    int TotalOutputTokens,
-    decimal TotalEstimatedCostUsd,
+    ModelUsageAvailability UsageAvailability,
+    int UsageUnavailableCallCount,
+    long? TotalInputTokens,
+    long? TotalCachedInputTokens,
+    long? TotalOutputTokens,
+    long? TotalReasoningTokens,
+    decimal? TotalEstimatedCostUsd,
     int CostUnavailableCallCount,
     bool IsPartialEstimate,
     IReadOnlyList<ModelCallResponse> Calls);
@@ -220,6 +232,7 @@ public sealed record EngineeringTaskResponse(
         var calls = task.ModelCalls.Select(call =>
         {
             var resolved = costResolver.Resolve(call);
+            var usageAvailable = ModelCallUsageEvidence.IsAvailable(call);
             var snapshot = call.PricingSnapshot is null ? null : new ModelPricingSnapshotResponse(
                 call.PricingSnapshot.InputPerMillionUsd,
                 call.PricingSnapshot.CachedInputPerMillionUsd,
@@ -227,19 +240,43 @@ public sealed record EngineeringTaskResponse(
             return new ModelCallResponse(
                 call.Id, call.Stage, call.Provider, call.Model, call.ReasoningEffort,
                 call.StartedAt, call.CompletedAt, call.Succeeded, call.ProviderResponseId,
-                call.InputTokens, call.CachedInputTokens, resolved.UncachedInputTokens, call.OutputTokens,
-                call.ReasoningTokens, resolved.EstimatedCostUsd, resolved.ProvenanceLabel,
-                resolved.HasStoredPricingSnapshot, snapshot, call.FailureCategory);
+                usageAvailable,
+                usageAvailable ? call.InputTokens : null,
+                usageAvailable ? call.CachedInputTokens : null,
+                usageAvailable ? resolved.UncachedInputTokens : null,
+                usageAvailable ? call.OutputTokens : null,
+                usageAvailable ? call.ReasoningTokens : null,
+                usageAvailable ? resolved.EstimatedCostUsd : null,
+                usageAvailable ? resolved.ProvenanceLabel : "cost unavailable",
+                resolved.HasStoredPricingSnapshot, snapshot, call.FailureCategory, call.ProviderRequestId);
         }).ToList();
-        var totalCost = costResolver.ResolveTotal(task.ModelCalls);
+        var validUsageCalls = task.ModelCalls.Where(ModelCallUsageEvidence.IsAvailable).ToArray();
+        var totalCost = costResolver.ResolveTotal(validUsageCalls);
+        var usageUnavailableCallCount = calls.Count(call => !call.UsageAvailable);
+        var costUnavailableCallCount = usageUnavailableCallCount + totalCost.UnavailableCallCount;
+        var usageAvailability = calls.Count == 0 || usageUnavailableCallCount == 0
+            ? ModelUsageAvailability.Complete
+            : usageUnavailableCallCount == calls.Count
+                ? ModelUsageAvailability.Unavailable
+                : ModelUsageAvailability.Partial;
+        var completeUsage = usageAvailability == ModelUsageAvailability.Complete;
         var telemetry = new ModelTelemetryResponse(
             calls.Count,
-            calls.Sum(call => call.InputTokens ?? 0),
-            calls.Sum(call => call.CachedInputTokens ?? 0),
-            calls.Sum(call => call.OutputTokens ?? 0),
-            totalCost.TotalEstimatedCostUsd,
-            totalCost.UnavailableCallCount,
-            totalCost.IsPartial,
+            usageAvailability,
+            usageUnavailableCallCount,
+            completeUsage ? calls.Sum(call => (long)call.InputTokens!.Value) : null,
+            completeUsage && calls.All(call => call.CachedInputTokens is not null)
+                ? calls.Sum(call => (long)call.CachedInputTokens!.Value)
+                : null,
+            completeUsage ? calls.Sum(call => (long)call.OutputTokens!.Value) : null,
+            completeUsage && calls.All(call => call.ReasoningTokens is not null)
+                ? calls.Sum(call => (long)call.ReasoningTokens!.Value)
+                : null,
+            completeUsage && costUnavailableCallCount == 0
+                ? totalCost.TotalEstimatedCostUsd
+                : null,
+            costUnavailableCallCount,
+            costUnavailableCallCount > 0,
             calls);
 
         var snapshot = task.RepositorySnapshot is null ? null : new RepositorySnapshotResponse(
@@ -394,4 +431,5 @@ public sealed record EngineeringTaskResponse(
 
     private static string SafeImplementationText(string value, string fallback) =>
         SensitiveContentDetector.ContainsSensitiveValue(value) ? fallback : value;
+
 }

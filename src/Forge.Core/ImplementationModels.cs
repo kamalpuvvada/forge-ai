@@ -117,34 +117,53 @@ public sealed record ImplementationFileContext(
     string Path,
     PlannedFileAction PlannedAction,
     string? OriginalContent,
-    string? OriginalContentSha256);
+    string? OriginalContentSha256,
+    int OriginalUtf8Bytes = 0,
+    string SourceContextIdentity = "");
 
 public sealed record ImplementationContext(
     string ApprovedRequirementSummary,
     ImplementationPlan ApprovedPlan,
     IReadOnlyList<ImplementationFileContext> Files,
-    DateTimeOffset CreatedAt);
+    DateTimeOffset CreatedAt,
+    string PlanFingerprint = "",
+    string BaseCommitSha = "",
+    IReadOnlyList<EvidenceItem>? Evidence = null,
+    IReadOnlyList<string>? ProjectConventions = null,
+    int OmittedOptionalContextCount = 0,
+    string ContextFingerprint = "");
 
 public sealed record ImplementationOperation(
     string Path,
     ImplementationOperationAction Action,
     string? OriginalContentSha256,
     string? Content,
-    string Summary);
+    string Summary,
+    int ExpectedOriginalUtf8Bytes = 0,
+    string SourceContextIdentity = "");
 
 public sealed record ImplementationOutput(
     string Summary,
     IReadOnlyList<string> Warnings,
     IReadOnlyList<ImplementationOperation> Operations,
     ImplementationSource Source,
-    string? Model);
+    string? Model,
+    string? ReasoningEffort = null,
+    string ContextFingerprint = "");
 
 public sealed record ImplementationEvaluation(
     ImplementationOutput Output,
-    ModelCallRecord? ModelCall = null);
+    IReadOnlyList<ModelCallRecord> ModelCalls)
+{
+    public ImplementationEvaluation(ImplementationOutput output) : this(output, []) { }
+    public ImplementationEvaluation(ImplementationOutput output, ModelCallRecord modelCall) : this(output, [modelCall]) { }
+    public ModelCallRecord? ModelCall => ModelCalls.Count == 1 ? ModelCalls[0] : null;
+}
 
 public interface IImplementationEngine
 {
+    void EnsureConfigured() { }
+
     Task<ImplementationEvaluation> GenerateAsync(
         ImplementationContext context,
         CancellationToken cancellationToken = default);
@@ -247,6 +266,12 @@ public sealed record ImplementationReservation(
     ActiveCheckoutSignature ActiveCheckout,
     IReadOnlyList<ImplementationFileContext>? Files = null);
 
+public sealed record ImplementationInspection(
+    ActiveCheckoutSignature ActiveCheckout,
+    IReadOnlyList<ImplementationFileContext> Files,
+    string RepositoryIdentity,
+    string GitCommonDirectoryIdentity);
+
 public sealed record PreparedImplementationWorkspace(
     ImplementationWorkspace Workspace,
     ActiveCheckoutSignature ActiveCheckout,
@@ -260,6 +285,23 @@ public interface IImplementationWorkspaceLock : IAsyncDisposable
 
 public interface IImplementationWorkspaceManager
 {
+    Task<ImplementationInspection> InspectAsync(
+        string repositoryPath,
+        RepositorySnapshot snapshot,
+        ImplementationPlan plan,
+        ImplementationLimits limits,
+        CancellationToken cancellationToken = default);
+
+    Task<ImplementationReservation> ReserveAsync(
+        Guid taskId,
+        string repositoryPath,
+        RepositorySnapshot snapshot,
+        ImplementationPlan plan,
+        ImplementationLimits limits,
+        ImplementationInspection inspection,
+        CancellationToken cancellationToken = default) =>
+        ReserveAsync(taskId, repositoryPath, snapshot, plan, limits, cancellationToken);
+
     Task<ImplementationReservation> ReserveAsync(
         Guid taskId,
         string repositoryPath,
@@ -337,6 +379,16 @@ public sealed class ImplementationException(
 {
     public string Category { get; } = category;
     public bool RecoveryRequired { get; } = recoveryRequired;
+}
+
+public sealed class ImplementationProviderException(
+    string safeMessage,
+    string category,
+    IReadOnlyList<ModelCallRecord> modelCalls,
+    Exception? innerException = null) : Exception(safeMessage, innerException)
+{
+    public string Category { get; } = category;
+    public IReadOnlyList<ModelCallRecord> ModelCalls { get; } = modelCalls;
 }
 
 public sealed class TaskConcurrencyException(string safeMessage) : Exception(safeMessage);

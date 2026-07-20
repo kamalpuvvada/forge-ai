@@ -24,7 +24,7 @@ Trust is part of the workflow rather than a disclaimer. Requirement approval, ev
 4. The approved task becomes ready for evidence-backed planning.
 5. The complete competition story will then show repository retrieval, an approved plan, implementation, tests, review, repairs, a pull-request summary, and per-run usage/cost.
 
-The current vertical slice demonstrates approved requirements/planning, safe deterministic Fake implementation in a task-specific linked worktree, bounded human diff review, and exact human approval of a persisted review whose completion evidence verified the active checkout unchanged. Repository-wide atomic command binding prevents approval command reuse across tasks. `ImplementationApproved` does not claim semantic AI implementation, validation, current workspace integrity, staging, commit, push, or pull-request creation.
+The current vertical slice demonstrates approved requirements/planning, deterministic Fake or strict-schema OpenAI implementation proposals, isolated task-specific worktree mutation only after complete local validation, bounded human diff review, and exact human approval of a persisted review whose completion evidence verified the active checkout unchanged. Repository-wide atomic command binding prevents approval command reuse across tasks. `ImplementationApproved` does not claim validation, current workspace integrity, staging, commit, push, or pull-request creation.
 
 ## Three-day non-goals
 

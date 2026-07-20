@@ -113,15 +113,45 @@ public sealed class OpenAIPlanningEngineTests
     [Fact]
     public async Task Completed_response_with_malformed_json_remains_invalid_plan_response()
     {
+        const string malformed = "{not-json";
         var exception = await Assert.ThrowsAsync<PlanningProviderException>(() =>
-            CreateEngine(new CapturingGateway(new OpenAIResponseEnvelope(
-                "resp_malformed", "{not-json", 30, 0, 10, 0, OpenAIResponseStatus.Completed)))
+            CreateEngine(new CapturingGateway(Envelope(malformed) with
+            {
+                ResponseId = "resp_malformed", InputTokens = 30, CachedInputTokens = 0,
+                OutputTokens = 10, ReasoningTokens = 0
+            }))
                 .CreatePlanAsync(Context()));
 
         Assert.Equal("invalid_plan_response", exception.Category);
         Assert.Equal("resp_malformed", exception.FailedCall.ProviderResponseId);
         Assert.NotNull(exception.FailedCall.EstimatedCostUsd);
         Assert.NotNull(exception.FailedCall.PricingSnapshot);
+    }
+
+    [Fact]
+    public async Task Every_adversarial_response_topology_is_rejected_with_failed_planning_telemetry()
+    {
+        var json = ValidJson();
+        var cases = new[]
+        {
+            Envelope(json) with { Status = OpenAIResponseStatus.Incomplete },
+            Envelope(json, [new(OpenAIResponseOutputItemKind.Tool, null, []), Message(json)]),
+            Envelope(json, [new(OpenAIResponseOutputItemKind.Message, "assistant",
+                [new(OpenAIResponseContentKind.Refusal, "no"), new(OpenAIResponseContentKind.OutputText, json)])]),
+            Envelope(json, [Message(json), Message(json)]),
+            Envelope(json, [new(OpenAIResponseOutputItemKind.Message, "assistant",
+                [new(OpenAIResponseContentKind.OutputText, json), new(OpenAIResponseContentKind.OutputText, json)])]),
+            Envelope(json, [new(OpenAIResponseOutputItemKind.Unknown, null, []), Message(json)]),
+            Envelope(json) with { ResponseId = "" }
+        };
+
+        foreach (var envelope in cases)
+        {
+            var exception = await Assert.ThrowsAsync<PlanningProviderException>(() =>
+                CreateEngine(new CapturingGateway(envelope)).CreatePlanAsync(Context()));
+            Assert.False(exception.FailedCall.Succeeded);
+            Assert.NotNull(exception.FailedCall.FailureCategory);
+        }
     }
 
     [Theory]
@@ -349,7 +379,14 @@ public sealed class OpenAIPlanningEngineTests
         return new PlanningContext(original, "Add a bounded report export", [], [], snapshot, [evidence], Now);
     }
 
-    private static OpenAIResponseEnvelope Envelope(string output) => new("resp_plan", output, 1000, 200, 100, 25);
+    private static OpenAIResponseOutputItem Message(string output) => new(OpenAIResponseOutputItemKind.Message,
+        "assistant", [new(OpenAIResponseContentKind.OutputText, output)]);
+
+    private static OpenAIResponseEnvelope Envelope(
+        string output,
+        IReadOnlyList<OpenAIResponseOutputItem>? items = null) =>
+        new("resp_plan", output, 1000, 200, 100, 25,
+            OutputItems: items ?? [new(OpenAIResponseOutputItemKind.Reasoning, null, []), Message(output)]);
 
     private static string ValidJson() => """
         {"title":"Plan report export","objective":"Add bounded report export behavior.","repositoryUnderstanding":"Evidence E1 identifies the application surface.","affectedFiles":[{"path":"src/App.cs","action":"modify","purpose":"Expose report export behavior backed by E1 without a new dependency.","evidenceIds":["E1"],"confidence":0.9}],"orderedSteps":[{"order":1,"description":"Add the report export behavior.","affectedPaths":["src/App.cs"],"evidenceIds":["E1"],"expectedResult":"The report export behavior is represented."}],"proposedValidationCommands":["dotnet test ForgeAI.slnx"],"risks":["Output size needs a bound."],"assumptions":["The current API shape remains stable."],"unresolvedQuestions":[],"requirementCoverage":[{"requirement":"Provide bounded report export behavior.","affectedPaths":["src/App.cs"],"stepOrders":[1]}],"summary":"A focused evidence-backed export plan."}

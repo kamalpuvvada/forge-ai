@@ -170,6 +170,9 @@ public sealed class ImplementationRuntimeStatusTests
     private sealed class AvailableWorkspaceManager : IImplementationWorkspaceManager
     {
         public bool Available { get; init; } = true;
+        public Task<ImplementationInspection> InspectAsync(string repositoryPath, RepositorySnapshot snapshot,
+            ImplementationPlan plan, ImplementationLimits limits, CancellationToken cancellationToken = default) =>
+            throw new NotSupportedException();
         public Task<ImplementationReservation> ReserveAsync(Guid taskId, string repositoryPath, RepositorySnapshot snapshot,
             ImplementationPlan plan, CancellationToken cancellationToken = default) => throw new NotSupportedException();
         public Task<PreparedImplementationWorkspace> PrepareAsync(string repositoryPath, ImplementationWorkspace workspace,

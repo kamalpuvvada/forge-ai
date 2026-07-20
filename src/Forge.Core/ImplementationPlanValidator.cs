@@ -202,14 +202,8 @@ public static class ImplementationPlanValidator
         if (MentionsSnapshotPathWithoutEvidence(plan.RepositoryUnderstanding, snapshotPaths, evidenceIds))
             throw Invalid("Repository understanding claims about existing files must cite evidence IDs.");
 
-        try
-        {
-            FakeImplementationCapabilityMatrix.ValidatePlan(plan);
-        }
-        catch (ImplementationException exception) when (exception.Category == "implementation_terminal_incompatibility")
-        {
-            throw Invalid(exception.Message);
-        }
+        try { ImplementationEligibilityPolicy.ValidatePlan(plan, MaximumAffectedFiles); }
+        catch (ImplementationException exception) { throw Invalid(exception.Message); }
     }
 
     private static void ValidateRequiredField(

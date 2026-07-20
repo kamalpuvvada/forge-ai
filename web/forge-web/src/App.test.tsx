@@ -5,7 +5,7 @@ import { act } from 'react'
 import { createRoot } from 'react-dom/client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { taskUrl } from './taskNavigation'
-import type { EngineeringTask, EngineeringTaskSummary, ImplementationPlan, SystemCapabilities, WorkflowStatus } from './types'
+import type { EngineeringTask, EngineeringTaskSummary, ImplementationPlan, ModelCall, SystemCapabilities, WorkflowStatus } from './types'
 
 const apiModule = vi.hoisted(() => {
   class MockForgeApiError extends Error {
@@ -83,6 +83,12 @@ const capabilities: SystemCapabilities = {
   validationAvailable: false,
   reviewAvailable: true,
   pullRequestCreationAvailable: false,
+  fakeImplementationAvailable: true,
+  openAiImplementationAvailable: false,
+  silentFallbackSupported: false,
+  commitAvailable: false,
+  pushAvailable: false,
+  deliveryPullRequestAvailable: false,
 }
 
 describe('App task navigation hardening', () => {
@@ -211,12 +217,14 @@ describe('App task navigation hardening', () => {
     expect(findButton(rendered.container, 'Generate implementation')).toBeTruthy()
   })
 
-  it('explains the Fake-only boundary without an implementation action in OpenAI mode', async () => {
+  it('explains incomplete OpenAI configuration without exposing an implementation action', async () => {
     forgeApi.getCapabilities.mockResolvedValue({
       ...capabilities,
       aiMode: 'OpenAI',
-      implementationProvider: null,
+      implementationProvider: 'OpenAI',
       implementationConfigured: false,
+      fakeImplementationAvailable: false,
+      openAiImplementationAvailable: false,
     })
     forgeApi.getTask.mockResolvedValue(buildTask(firstId, 'PlanApproved', {
       implementationPlan: buildPlan(),
@@ -228,9 +236,185 @@ describe('App task navigation hardening', () => {
 
     expect(Array.from(rendered.container.querySelectorAll('button')).some(button =>
       button.textContent?.includes('Generate implementation'))).toBe(false)
-    expect(rendered.container.textContent).toContain('available only when Forge is configured in deterministic Fake mode')
+    expect(rendered.container.textContent).toContain('unavailable until the active provider configuration is complete')
     expect(findButton(rendered.container, 'Download approved plan')).toBeTruthy()
     expect(findButton(rendered.container, 'Download task report PDF')).toBeTruthy()
+  })
+
+  it('renders OpenAI billing, pre-worktree validation, and persisted implementation telemetry truthfully', async () => {
+    forgeApi.getCapabilities.mockResolvedValue({
+      ...capabilities,
+      aiMode: 'OpenAI',
+      implementationProvider: 'OpenAI',
+      implementationModel: 'gpt-5.6-sol',
+      implementationReasoningEffort: 'high',
+      fakeImplementationAvailable: false,
+      openAiImplementationAvailable: true,
+    })
+    const approved = buildTask(firstId, 'PlanApproved', {
+      implementationPlan: buildPlan(),
+      planApprovedAt: '2026-07-18T12:05:00.000Z',
+    })
+    const reviewed = buildImplementationReviewTask(firstId)
+    reviewed.implementationResult = {
+      ...reviewed.implementationResult!, source: 'OpenAI', model: 'gpt-5.6-sol', isDeterministicFake: false,
+      summary: 'OpenAI proposed the approved bounded changes.', warnings: [],
+    }
+    reviewed.telemetry = {
+      totalCalls: 2, usageAvailability: 'Complete', usageUnavailableCallCount: 0,
+      totalInputTokens: 100, totalCachedInputTokens: 20, totalOutputTokens: 50, totalReasoningTokens: 10,
+      totalEstimatedCostUsd: 0.002, costUnavailableCallCount: 0, isPartialEstimate: false,
+      calls: [0, 1].map((index) => ({
+        id: `${index + 1}1111111-1111-4111-8111-111111111111`, stage: 'Implementation', provider: 'OpenAI',
+        model: 'gpt-5.6-sol', reasoningEffort: 'high', startedAt: '2026-07-18T12:06:00.000Z',
+        completedAt: '2026-07-18T12:07:00.000Z', succeeded: index === 1, providerResponseId: index === 1 ? 'response' : null,
+        providerRequestId: index === 1 ? 'request' : null, inputTokens: 50, cachedInputTokens: 10,
+        uncachedInputTokens: 40, outputTokens: 25, reasoningTokens: 5, estimatedCostUsd: 0.001,
+        pricingProvenance: 'stored pricing snapshot', hasStoredPricingSnapshot: true,
+        storedPricingSnapshot: { inputPerMillionUsd: 5, cachedInputPerMillionUsd: .5, outputPerMillionUsd: 30 },
+        failureCategory: index === 0 ? 'implementation_rate_limit' : null,
+      })),
+    }
+    forgeApi.getTask.mockResolvedValue(approved)
+    forgeApi.generateImplementation.mockResolvedValue(reviewed)
+
+    await navigate(taskUrl(firstId))
+    const rendered = await renderApp()
+    expect(rendered.container.textContent).toContain('OpenAI implementation proposal')
+    expect(rendered.container.textContent).toContain('separately billed API usage')
+    expect(rendered.container.textContent).toContain('No worktree exists until that validation succeeds')
+
+    await click(findButton(rendered.container, 'Generate implementation'))
+    await expectText(rendered.container, 'Deterministic proposal validation: accepted')
+    expect(rendered.container.textContent).toContain('OpenAI · gpt-5.6-sol')
+    expect(rendered.container.textContent).toContain('Physical calls2')
+    expect(rendered.container.textContent).toContain('INPUT TOKENS100')
+    expect(rendered.container.textContent).toContain('OUTPUT TOKENS50')
+    expect(rendered.container.textContent).toContain('configured estimate')
+    expect(rendered.container.textContent).not.toContain('MECHANICAL WORKFLOW DEMONSTRATION')
+  })
+
+  it('renders unavailable usage without implying zero tokens or zero cost', async () => {
+    const reviewed = buildImplementationReviewTask(firstId)
+    reviewed.telemetry = {
+      totalCalls: 1, usageAvailability: 'Unavailable', usageUnavailableCallCount: 1,
+      totalInputTokens: null, totalCachedInputTokens: null, totalOutputTokens: null, totalReasoningTokens: null,
+      totalEstimatedCostUsd: null, costUnavailableCallCount: 1, isPartialEstimate: true,
+      calls: [{
+        id: '11111111-1111-4111-8111-111111111111', stage: 'Implementation', provider: 'OpenAI',
+        model: 'gpt-5.6-sol', reasoningEffort: 'high', startedAt: '2026-07-18T12:06:00.000Z',
+        completedAt: '2026-07-18T12:07:00.000Z', succeeded: false, providerResponseId: null,
+        providerRequestId: null, usageAvailable: false, inputTokens: null, cachedInputTokens: null,
+        uncachedInputTokens: null, outputTokens: null, reasoningTokens: null, estimatedCostUsd: null,
+        pricingProvenance: 'cost unavailable', hasStoredPricingSnapshot: true,
+        storedPricingSnapshot: { inputPerMillionUsd: 5, cachedInputPerMillionUsd: .5, outputPerMillionUsd: 30 },
+        failureCategory: 'implementation_provider_error',
+      }],
+    }
+    forgeApi.getTask.mockResolvedValue(reviewed)
+
+    await navigate(taskUrl(firstId))
+    const rendered = await renderApp()
+
+    expect(rendered.container.textContent).toContain('Usage unavailable')
+    expect(rendered.container.textContent).toContain('Cost unavailable')
+    expect(rendered.container.textContent).not.toContain('Configured est. $0')
+    expect(rendered.container.textContent).not.toContain('INPUT TOKENS')
+    expect(rendered.container.textContent).not.toContain('OUTPUT TOKENS')
+    expect(rendered.container.textContent).not.toContain('$0')
+  })
+
+  it('labels mixed usage as partial without presenting known subtotals as totals', async () => {
+    const reviewed = buildImplementationReviewTask(firstId)
+    reviewed.telemetry = {
+      totalCalls: 2, usageAvailability: 'Partial', usageUnavailableCallCount: 1,
+      totalInputTokens: null, totalCachedInputTokens: null, totalOutputTokens: null, totalReasoningTokens: null,
+      totalEstimatedCostUsd: null, costUnavailableCallCount: 1, isPartialEstimate: true,
+      calls: [buildModelCall('Implementation'), buildModelCall('Implementation', {
+        id: '22222222-2222-4222-8222-222222222222', succeeded: false, providerResponseId: null,
+        usageAvailable: false, inputTokens: null, cachedInputTokens: null, uncachedInputTokens: null,
+        outputTokens: null, reasoningTokens: null, estimatedCostUsd: null,
+        failureCategory: 'implementation_provider_error',
+      })],
+    }
+    forgeApi.getTask.mockResolvedValue(reviewed)
+
+    await navigate(taskUrl(firstId))
+    const rendered = await renderApp()
+    const text = rendered.container.textContent ?? ''
+
+    expect(text).toContain('Partial usage — aggregate totals unavailable because some calls lack telemetry')
+    expect(text).not.toContain('INPUT TOKENS')
+    expect(text).not.toContain('OUTPUT TOKENS')
+    expect(text).toContain('Cost unavailable')
+  })
+
+  it('renders complete aggregate usage and preserves explicit provider-reported zero', async () => {
+    const reviewed = buildImplementationReviewTask(firstId)
+    reviewed.telemetry = {
+      totalCalls: 1, usageAvailability: 'Complete', usageUnavailableCallCount: 0,
+      totalInputTokens: 0, totalCachedInputTokens: 0, totalOutputTokens: 0, totalReasoningTokens: 0,
+      totalEstimatedCostUsd: 0, costUnavailableCallCount: 0, isPartialEstimate: false,
+      calls: [buildModelCall('Implementation', {
+        usageAvailable: true, inputTokens: 0, cachedInputTokens: 0, uncachedInputTokens: 0,
+        outputTokens: 0, reasoningTokens: 0, estimatedCostUsd: 0,
+      })],
+    }
+    forgeApi.getTask.mockResolvedValue(reviewed)
+
+    await navigate(taskUrl(firstId))
+    const rendered = await renderApp()
+    const text = rendered.container.textContent ?? ''
+
+    expect(text).toContain('INPUT TOKENS0')
+    expect(text).toContain('OUTPUT TOKENS0')
+    expect(text).toContain('Configured est. $0.000000')
+    expect(text).not.toContain('Usage unavailable')
+  })
+
+  it('does not convert unavailable planning output usage to zero', async () => {
+    const planning = buildTask(firstId, 'Planning')
+    planning.telemetry = {
+      totalCalls: 1, usageAvailability: 'Unavailable', usageUnavailableCallCount: 1,
+      totalInputTokens: null, totalCachedInputTokens: null, totalOutputTokens: null, totalReasoningTokens: null,
+      totalEstimatedCostUsd: null, costUnavailableCallCount: 1, isPartialEstimate: true,
+      calls: [buildModelCall('Planning', {
+        succeeded: false, providerResponseId: null, usageAvailable: false, inputTokens: null,
+        cachedInputTokens: null, uncachedInputTokens: null, outputTokens: null, reasoningTokens: null,
+        estimatedCostUsd: null, failureCategory: 'output_truncated',
+      })],
+    }
+    forgeApi.getTask.mockResolvedValue(planning)
+
+    await navigate(taskUrl(firstId))
+    const rendered = await renderApp()
+    const text = rendered.container.textContent ?? ''
+
+    expect(text).toContain('Output token usage unavailable')
+    expect(text).not.toContain('0 output tokens')
+  })
+
+  it('does not convert unavailable clarification usage to zero', async () => {
+    const clarifying = buildTask(firstId, 'Clarifying', { currentPendingQuestion: 'Which format?' })
+    clarifying.telemetry = {
+      totalCalls: 1, usageAvailability: 'Unavailable', usageUnavailableCallCount: 1,
+      totalInputTokens: null, totalCachedInputTokens: null, totalOutputTokens: null, totalReasoningTokens: null,
+      totalEstimatedCostUsd: null, costUnavailableCallCount: 1, isPartialEstimate: true,
+      calls: [buildModelCall('Clarification', {
+        succeeded: false, providerResponseId: null, usageAvailable: false, inputTokens: null,
+        cachedInputTokens: null, uncachedInputTokens: null, outputTokens: null, reasoningTokens: null,
+        estimatedCostUsd: null, failureCategory: 'provider_error',
+      })],
+    }
+    forgeApi.getTask.mockResolvedValue(clarifying)
+
+    await navigate(taskUrl(firstId))
+    const rendered = await renderApp()
+    const text = rendered.container.textContent ?? ''
+
+    expect(text).toContain('Usage unavailable')
+    expect(text).not.toContain('0 output tokens')
+    expect(text).not.toContain('OUTPUT TOKENS0')
   })
 
   it('generates Fake implementation review and renders truthful bounded diff metadata', async () => {
@@ -911,6 +1095,19 @@ function deferred<T>() {
   return { promise, resolve, reject }
 }
 
+function buildModelCall(stage: ModelCall['stage'], overrides: Partial<ModelCall> = {}): ModelCall {
+  return {
+    id: '11111111-1111-4111-8111-111111111111', stage, provider: 'OpenAI', model: 'gpt-5.6-sol',
+    reasoningEffort: 'high', startedAt: '2026-07-18T12:06:00.000Z', completedAt: '2026-07-18T12:07:00.000Z',
+    succeeded: true, providerResponseId: 'response-safe', providerRequestId: 'request-safe', usageAvailable: true,
+    inputTokens: 100, cachedInputTokens: 20, uncachedInputTokens: 80, outputTokens: 30, reasoningTokens: 5,
+    estimatedCostUsd: 0.001, pricingProvenance: 'stored pricing snapshot', hasStoredPricingSnapshot: true,
+    storedPricingSnapshot: { inputPerMillionUsd: 5, cachedInputPerMillionUsd: .5, outputPerMillionUsd: 30 },
+    failureCategory: null,
+    ...overrides,
+  }
+}
+
 function buildTask(id: string, status: WorkflowStatus, overrides: Partial<EngineeringTask> = {}): EngineeringTask {
   const now = '2026-07-18T12:00:00.000Z'
   return {
@@ -949,9 +1146,12 @@ function buildTask(id: string, status: WorkflowStatus, overrides: Partial<Engine
     implementationRevisions: [],
     telemetry: {
       totalCalls: 0,
+      usageAvailability: 'Complete',
+      usageUnavailableCallCount: 0,
       totalInputTokens: 0,
       totalCachedInputTokens: 0,
       totalOutputTokens: 0,
+      totalReasoningTokens: 0,
       totalEstimatedCostUsd: 0,
       costUnavailableCallCount: 0,
       isPartialEstimate: false,

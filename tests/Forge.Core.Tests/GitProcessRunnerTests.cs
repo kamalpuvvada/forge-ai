@@ -25,7 +25,12 @@ public sealed class GitProcessRunnerTests : IDisposable
 
         Assert.False(Directory.Exists(safetyRoot));
 
-        var result = await runner.RunAsync(root, ["status", "--short"]);
+        var readOnly = await runner.RunAsync(root, ["status", "--short"]);
+
+        Assert.Equal(0, readOnly.ExitCode);
+        Assert.False(Directory.Exists(safetyRoot));
+
+        var result = await runner.RunAsync(root, ["status", "--short"], commandKind: GitCommandKind.Mutating);
 
         Assert.Equal(0, result.ExitCode);
         Assert.True(Directory.Exists(safetyRoot));
@@ -74,7 +79,7 @@ public sealed class GitProcessRunnerTests : IDisposable
         {
             var runner = Runner(owned, fileSystem);
             var exception = await Assert.ThrowsAsync<ImplementationException>(() =>
-                runner.RunAsync(root, ["status", "--short"]));
+                runner.RunAsync(root, ["status", "--short"], commandKind: GitCommandKind.Mutating));
             Assert.Equal("implementation_workspace_configuration", exception.Category);
             Assert.False(Directory.Exists(Path.Combine(owned, ".empty-hooks")));
             Assert.False(Directory.Exists(Path.Combine(owned, ".git-home")));
@@ -94,7 +99,7 @@ public sealed class GitProcessRunnerTests : IDisposable
         var runner = Runner(owned, fileSystem);
 
         var exception = await Assert.ThrowsAsync<ImplementationException>(() =>
-            runner.RunAsync(root, ["status", "--short"]));
+            runner.RunAsync(root, ["status", "--short"], commandKind: GitCommandKind.Mutating));
 
         Assert.Equal("implementation_workspace_configuration", exception.Category);
         Assert.True(Directory.Exists(owned));
@@ -120,7 +125,7 @@ public sealed class GitProcessRunnerTests : IDisposable
             var runner = Runner(owned, new PhysicalSafeDirectoryFileSystem());
 
             var rejection = await Assert.ThrowsAsync<ImplementationException>(() =>
-                runner.RunAsync(root, ["status", "--short"]));
+                runner.RunAsync(root, ["status", "--short"], commandKind: GitCommandKind.Mutating));
 
             Assert.Equal("implementation_workspace_configuration", rejection.Category);
             Assert.False(Directory.Exists(Path.Combine(target, "owned")));

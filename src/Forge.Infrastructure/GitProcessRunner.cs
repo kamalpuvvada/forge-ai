@@ -166,7 +166,7 @@ public sealed class GitProcessRunner : IGitProcessRunner
         ArgumentException.ThrowIfNullOrWhiteSpace(workingDirectory);
         ArgumentNullException.ThrowIfNull(arguments);
         cancellationToken.ThrowIfCancellationRequested();
-        InitializeOperationalDirectories();
+        if (commandKind == GitCommandKind.Mutating) InitializeOperationalDirectories();
 
         var startInfo = new ProcessStartInfo(executablePath)
         {
@@ -190,7 +190,7 @@ public sealed class GitProcessRunner : IGitProcessRunner
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeout.Token);
         try
         {
-            ValidateOperationalDirectories();
+            if (commandKind == GitCommandKind.Mutating) ValidateOperationalDirectories();
             process = Process.Start(startInfo)
                 ?? throw new ImplementationException("git_unavailable", "Git could not be started safely.");
             outputTask = ReadBoundedAsync(process.StandardOutput,

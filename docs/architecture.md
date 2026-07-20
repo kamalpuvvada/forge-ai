@@ -3,7 +3,7 @@
 ## Components and dependency direction
 
 - **Forge.Core** owns the aggregate, approval gates, repository/evidence/plan contracts, workflow invariants, and application service. It has no project dependencies.
-- **Forge.Infrastructure** implements SQLite, clarification/planning adapters, safe repository discovery, and isolated Git worktree/Fake implementation adapters.
+- **Forge.Infrastructure** implements SQLite, clarification/planning/implementation adapters, safe repository discovery, and isolated Git worktree mutation.
 - **Forge.Api** composes modes and workflow services, exposes REST DTOs and safe capabilities, and maps exceptions to Problem Details.
 - **forge-web** renders clarification, evidence, plans, approvals, bounded implementation diffs, capabilities, and telemetry through REST.
 
@@ -75,7 +75,7 @@ Evidence selection deterministically scores strong phrases, paths, lightweight C
 
 ## Isolated implementation boundary
 
-The initial implementation boundary is deterministic Fake mode only. `IImplementationEngine` returns bounded structured create/modify/delete operations, never commands or patches. Before any lease, task state transition, ownership ref, branch, or worktree, a read-only reservation preflight returns the exact bounded file contexts, the Fake engine generates the exact output once, and the domain validator checks exact one-to-one coverage, actions, original hashes, undeclared/duplicate paths, create/modify/delete content, no-op rules, sensitive content, and transformed per-file/total limits. That validated output is reused rather than regenerated. Inspect-only plan paths may be context but cannot become operations.
+`IImplementationEngine` returns bounded structured create/modify/delete operations, never commands or patches. Before any lease, task state transition, ownership ref, branch, or worktree, read-only inspection returns exact bounded mutating-file contexts. The configured Fake or OpenAI engine generates one logical proposal, and the domain validator checks exact one-to-one coverage, actions, original hashes and UTF-8 byte counts, source identities, undeclared/duplicate paths, create/modify/delete content, no-op rules, sensitive content, and per-file/total limits. That validated output is reused rather than regenerated. Inspect-only plan paths may be materialized as read-only context but are never sent as implementation operations.
 
 `IImplementationWorkspaceManager` revalidates a clean exact Git root and approved HEAD, captures active HEAD/branch/index/status plus bounded hashes of all tracked regular working-tree bytes, then byte-for-byte compares paths, actions, source hashes, and source content with the preflight both before owned Git artifacts and after sparse materialization. It creates a deterministic task branch and linked sparse worktree outside the repository, disables hooks/submodules/fsmonitor/external diff/LFS smudge, rejects executable filters, symlinks/gitlinks/reparse points, malformed/truncated/abnormal/sparse index states, and materializes only approved paths. All source content dependencies and filesystem targets are contained, size-bounded, and secret-scanned before reservation or the first atomic write. Local fixed-argument Git diff supplies complete hashes/counts and bounded previews with explicit truncation; result/operation free text, safe failures, source/generated content, and diffs share the high-confidence detector with credential-labelled entropy detection. No repository command, build, test, lint, stage, commit, push, or provider request occurs.
 
@@ -108,6 +108,16 @@ The normalized gateway preserves `ResponseResult.Status` and `IncompleteStatusDe
 
 The developer instruction prefix is stable. Each turn reconstructs one compact JSON context containing only the repository identifier, original requirement, previous question/answer pairs, and correction notes. Repository content is never implied. `previous_response_id` is intentionally unused.
 
+### OpenAI implementation boundary
+
+OpenAI implementation uses the same singleton normalized Responses gateway as clarification and planning, with a separate `OpenAIImplementationEngine`. Read-only Git inspection finishes before transport and creates no Forge-owned directory or Git artifact. A canonical context fingerprint binds the approved requirement, complete plan fingerprint, approved base SHA, every complete source body/hash/UTF-8 byte count and per-operation identity, directly cited evidence, complete included convention notes, and the deterministic omission count.
+
+The strict root schema requires `contextFingerprint`, `summary`, `warnings`, `creates`, `modifies`, and `deletes`; action-dependent fields are required only within their containing array and no provider command or patch field exists. The normalized response must be completed and contain exactly one assistant message with exactly one `output_text`; opaque reasoning items are ignored, while refusals, tools, unknown items, extra messages, or extra text parts fail closed. The engine caps raw structured output at 128 KiB, generated content at 32 KiB per file and 64 KiB total, and operations at ten. Core then independently verifies exact approved coverage, action, path, original hash/size, context identity, absence/presence, no-op, file class, content, and sensitive-value rules before any workspace reservation.
+
+At most two physical requests belong to one logical attempt. Transport failures carry explicit dispatch certainty: `DefinitelyBeforeRequestDispatch`, `DispatchMayHaveOccurred`, or `ResponseReceived`. Only explicit 429, 502, 503 responses and failures proven definitely before dispatch can retry. Unknown `HttpRequestException`, resets, interrupted response bodies, stream failures, timeouts, and cancellations do not retry; duplicate-billing avoidance takes priority over availability. Each physical request receives a fresh client request ID and produces its own persisted model-call record. Usage is available only when required input/output counters are valid bounded nonnegative integers; optional cached/reasoning counters remain null when absent. Pre-transport failures record no call. A provider or proposal failure leaves the task `PlanApproved` with no branch, ref, worktree, lease, revision, or review.
+
+Clarification, planning, and implementation share one response-topology validator. It requires completed status, a bounded safe provider response ID, zero or more ignored reasoning items, exactly one assistant message and output-text item, and no refusal, tool, second message/text, or unknown item. Each stage then performs its own strict JSON/domain validation. A recursive ordinal `Utf8JsonReader` pass rejects duplicate properties before deserialization. Pricing, implementation output-token bounds, timeout, and reasoning effort are validated before provider use; post-dispatch cost arithmetic is fail-soft so telemetry survives with unavailable cost.
+
 ```mermaid
 sequenceDiagram
     actor Developer
@@ -129,7 +139,11 @@ sequenceDiagram
 
 ## Telemetry and estimated cost
 
-Each real provider attempt records call ID, clarification, planning, or future implementation stage, provider, model, reasoning effort, timestamps, success, response ID, input/cached/output/reasoning tokens, estimated cost, and a non-sensitive failure category. Failed planning attempts are persisted before their safe error is returned. Fake mode produces no model-call record.
+Each real provider attempt records call ID, clarification, planning, or implementation stage, provider, model, reasoning effort, timestamps, success, safe provider request/response IDs when available, nullable input/cached/output/reasoning tokens, estimated cost, stored pricing, and a non-sensitive failure category. Failed planning and dispatched implementation attempts are persisted before their safe error is returned. Fake mode produces no model-call record.
+
+Task-level usage aggregates expose an explicit `Complete`, `Partial`, or `Unavailable` state. Numeric usage and cost totals are returned only for complete telemetry; partial and unavailable sets retain complete per-call evidence but expose null aggregates so a known subtotal cannot be mistaken for the entire operation. Optional cached-input and reasoning counters may remain null without invalidating otherwise complete required input/output usage. A valid provider-reported zero is preserved as zero and remains distinct from unavailable usage.
+
+`ModelCallUsageEvidence` is the shared validity policy used by API projection and cost resolution. `ModelCostResolver` refuses stored estimates, pricing snapshots, and current-price recalculation when required usage is unavailable or optional counters are invalid. Readable legacy records are not rewritten: stale numeric estimates remain persisted but project as unavailable. Valid nonnegative legacy estimates are accepted only within the documented $1 billion per-call safety bound. Both PDF exporters consume this resolver and label mixed-call known cost as an available subtotal.
 
 The estimate subtracts cached tokens from total input, prices uncached and cached input separately, then adds output pricing. Output already contains reasoning tokens, so reasoning usage is not double-counted. Rates are bound from `Forge:AI:Pricing`.
 
@@ -151,8 +165,8 @@ Task-report PDF export is a workflow-stage-aware, read-only audit projection. It
 
 An MVC exception filter handles only `EngineeringTaskNotFoundException` before it reaches `ExceptionHandlerMiddleware`, returning the established 404 Problem Details contract with trace ID and an Information-level event without a stack. The central handler retains a safe fallback for that typed exception and continues to log genuine unexpected failures at Error. Generic `KeyNotFoundException` is not mapped to a user-facing 404, so unrelated dictionary defects remain visible as server failures. Provider exception bodies and logs never include credentials or raw responses.
 
-`GET /api/system/capabilities` reports clarification, planning, and implementation readiness independently. Fake mode reports isolated target modification and human diff review available; validation and pull-request creation remain false. OpenAI implementation remains unavailable even when clarification/planning are configured. No capability exposes a key, absolute workspace, or secret-derived data.
+`GET /api/system/capabilities` reports clarification, planning, and implementation readiness independently, including the active implementation provider/model/effort and explicit Fake/OpenAI availability. Validation, correction, commit, push, silent fallback, and pull-request creation remain false. No capability exposes a key, prompt, context identity, absolute workspace, or secret-derived data.
 
 ## Current boundaries
 
-Semantic AI implementation, implementation correction/rejection, worktree cleanup or quota management, validation execution, commit/push, pull-request creation, authentication, production migrations, and provider retry policy are not part of this slice.
+Implementation correction/rejection, worktree cleanup or quota management, validation execution, commit/push, pull-request creation, authentication, and production migrations are not part of this slice.

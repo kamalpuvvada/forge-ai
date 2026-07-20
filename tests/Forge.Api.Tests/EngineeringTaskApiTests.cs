@@ -1229,6 +1229,12 @@ public sealed class EngineeringTaskApiTests : IClassFixture<FakeModeFactory>
         Assert.True(capabilities.GetProperty("planningConfigured").GetBoolean());
         Assert.Equal("Deterministic Fake", capabilities.GetProperty("implementationProvider").GetString());
         Assert.True(capabilities.GetProperty("implementationConfigured").GetBoolean());
+        Assert.True(capabilities.GetProperty("fakeImplementationAvailable").GetBoolean());
+        Assert.False(capabilities.GetProperty("openAiImplementationAvailable").GetBoolean());
+        Assert.False(capabilities.GetProperty("silentFallbackSupported").GetBoolean());
+        Assert.False(capabilities.GetProperty("commitAvailable").GetBoolean());
+        Assert.False(capabilities.GetProperty("pushAvailable").GetBoolean());
+        Assert.False(capabilities.GetProperty("deliveryPullRequestAvailable").GetBoolean());
         Assert.True(capabilities.GetProperty("targetModificationAvailable").GetBoolean());
         Assert.True(capabilities.GetProperty("implementationApprovalAvailable").GetBoolean());
         Assert.False(capabilities.GetProperty("implementationCorrectionAvailable").GetBoolean());
@@ -1360,6 +1366,9 @@ public sealed class EngineeringTaskApiTests : IClassFixture<FakeModeFactory>
         Assert.Equal("OpenAI", capabilities.GetProperty("planningProvider").GetString());
         Assert.False(capabilities.GetProperty("clarificationConfigured").GetBoolean());
         Assert.False(capabilities.GetProperty("planningConfigured").GetBoolean());
+        Assert.Equal("OpenAI", capabilities.GetProperty("implementationProvider").GetString());
+        Assert.False(capabilities.GetProperty("implementationConfigured").GetBoolean());
+        Assert.False(capabilities.GetProperty("openAiImplementationAvailable").GetBoolean());
         Assert.False(capabilities.GetProperty("planningAvailable").GetBoolean());
         Assert.False(capabilities.GetProperty("aiConfigured").GetBoolean());
     }
@@ -1378,6 +1387,10 @@ public sealed class EngineeringTaskApiTests : IClassFixture<FakeModeFactory>
         Assert.True(capabilities.ClarificationConfigured);
         Assert.True(capabilities.PlanningConfigured);
         Assert.True(capabilities.PlanningAvailable);
+        Assert.Equal("OpenAI", capabilities.ImplementationProvider);
+        Assert.True(capabilities.OpenAiImplementationAvailable);
+        Assert.True(capabilities.ImplementationConfigured);
+        Assert.False(capabilities.SilentFallbackSupported);
     }
 
     [Fact]
@@ -1388,10 +1401,13 @@ public sealed class EngineeringTaskApiTests : IClassFixture<FakeModeFactory>
         var snapshot = new ModelPricingSnapshot(10m, 2m, 20m);
         task.RecordModelCall(new ModelCallRecord(
             Guid.NewGuid(), ModelCallStage.Planning, "OpenAI", "model", "medium",
-            now, now, true, "response", 100, 25, 50, 40, 999m, null, snapshot), now);
+            now, now, true, "response", 100, 25, 50, 40, 999m, null, snapshot, "request-safe"), now);
         task.RecordModelCall(new ModelCallRecord(
             Guid.NewGuid(), ModelCallStage.Clarification, "OpenAI", "legacy-model", "low",
             now, now, true, "legacy-response", 0, 0, 0, 0, 0m, null), now);
+        task.RecordModelCall(new ModelCallRecord(
+            Guid.NewGuid(), ModelCallStage.Implementation, "OpenAI", "model", "high",
+            now, now, false, null, null, null, null, null, 0m, "provider_error", snapshot), now);
         var calculator = new ModelCostCalculator(new Dictionary<string, ModelPricing>
         {
             ["model"] = new(100m, 100m, 100m)
@@ -1401,13 +1417,125 @@ public sealed class EngineeringTaskApiTests : IClassFixture<FakeModeFactory>
 
         var call = Assert.Single(response.Telemetry.Calls, item => item.ProviderResponseId == "response");
         var legacyCall = Assert.Single(response.Telemetry.Calls, item => item.ProviderResponseId == "legacy-response");
+        var unavailable = Assert.Single(response.Telemetry.Calls, item => item.Stage == ModelCallStage.Implementation);
         Assert.Equal(75, call.UncachedInputTokens);
+        Assert.Equal("request-safe", call.ProviderRequestId);
         Assert.Equal("stored pricing snapshot", call.PricingProvenance);
         Assert.Equal("legacy estimate \u2014 pricing snapshot unavailable", legacyCall.PricingProvenance);
         Assert.Equal(0.0018m, call.EstimatedCostUsd);
         Assert.Equal(snapshot.InputPerMillionUsd, call.StoredPricingSnapshot?.InputPerMillionUsd);
-        Assert.False(response.Telemetry.IsPartialEstimate);
-        Assert.Equal(0, response.Telemetry.CostUnavailableCallCount);
+        Assert.True(call.UsageAvailable);
+        Assert.False(unavailable.UsageAvailable);
+        Assert.Null(unavailable.InputTokens);
+        Assert.Null(unavailable.EstimatedCostUsd);
+        Assert.True(response.Telemetry.IsPartialEstimate);
+        Assert.Equal(1, response.Telemetry.CostUnavailableCallCount);
+    }
+
+    [Fact]
+    public void Task_api_aggregates_one_and_multiple_complete_usage_records()
+    {
+        var one = TelemetryFor(UsageCall(100, 20, 30, null));
+
+        Assert.Equal(ModelUsageAvailability.Complete, one.UsageAvailability);
+        Assert.Equal(0, one.UsageUnavailableCallCount);
+        Assert.Equal(100, one.TotalInputTokens);
+        Assert.Equal(20, one.TotalCachedInputTokens);
+        Assert.Equal(30, one.TotalOutputTokens);
+        Assert.Null(one.TotalReasoningTokens);
+        Assert.NotNull(one.TotalEstimatedCostUsd);
+
+        var multiple = TelemetryFor(
+            UsageCall(100, 20, 30, 5),
+            UsageCall(40, 5, 10, 2));
+
+        Assert.Equal(ModelUsageAvailability.Complete, multiple.UsageAvailability);
+        Assert.Equal(140, multiple.TotalInputTokens);
+        Assert.Equal(25, multiple.TotalCachedInputTokens);
+        Assert.Equal(40, multiple.TotalOutputTokens);
+        Assert.Equal(7, multiple.TotalReasoningTokens);
+        Assert.NotNull(multiple.TotalEstimatedCostUsd);
+    }
+
+    [Fact]
+    public void Task_api_serializes_unavailable_usage_and_cost_as_null_instead_of_zero()
+    {
+        var telemetry = TelemetryFor(UsageCall(null, null, null, null));
+        var jsonOptions = new JsonSerializerOptions(JsonSerializerDefaults.Web);
+        jsonOptions.Converters.Add(new JsonStringEnumConverter());
+        var json = JsonSerializer.SerializeToElement(telemetry, jsonOptions);
+
+        Assert.Equal(ModelUsageAvailability.Unavailable, telemetry.UsageAvailability);
+        Assert.Equal(1, telemetry.UsageUnavailableCallCount);
+        Assert.Null(telemetry.TotalInputTokens);
+        Assert.Null(telemetry.TotalCachedInputTokens);
+        Assert.Null(telemetry.TotalOutputTokens);
+        Assert.Null(telemetry.TotalReasoningTokens);
+        Assert.Null(telemetry.TotalEstimatedCostUsd);
+        Assert.Equal("Unavailable", json.GetProperty("usageAvailability").GetString());
+        Assert.Equal(JsonValueKind.Null, json.GetProperty("totalInputTokens").ValueKind);
+        Assert.Equal(JsonValueKind.Null, json.GetProperty("totalOutputTokens").ValueKind);
+        Assert.Equal(JsonValueKind.Null, json.GetProperty("totalEstimatedCostUsd").ValueKind);
+        Assert.DoesNotContain("\"totalInputTokens\":0", json.GetRawText(), StringComparison.Ordinal);
+        Assert.DoesNotContain("\"totalOutputTokens\":0", json.GetRawText(), StringComparison.Ordinal);
+        Assert.DoesNotContain("\"totalEstimatedCostUsd\":0", json.GetRawText(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Task_api_reports_all_unavailable_and_mixed_usage_without_false_totals()
+    {
+        var allUnavailable = TelemetryFor(
+            UsageCall(null, null, null, null),
+            UsageCall(null, null, null, null));
+        var mixed = TelemetryFor(
+            UsageCall(100, 20, 30, 5),
+            UsageCall(null, null, null, null));
+
+        Assert.Equal(ModelUsageAvailability.Unavailable, allUnavailable.UsageAvailability);
+        Assert.Equal(2, allUnavailable.UsageUnavailableCallCount);
+        Assert.Null(allUnavailable.TotalInputTokens);
+        Assert.Null(allUnavailable.TotalEstimatedCostUsd);
+        Assert.Equal(ModelUsageAvailability.Partial, mixed.UsageAvailability);
+        Assert.Equal(1, mixed.UsageUnavailableCallCount);
+        Assert.Null(mixed.TotalInputTokens);
+        Assert.Null(mixed.TotalCachedInputTokens);
+        Assert.Null(mixed.TotalOutputTokens);
+        Assert.Null(mixed.TotalReasoningTokens);
+        Assert.Null(mixed.TotalEstimatedCostUsd);
+    }
+
+    [Fact]
+    public void Task_api_preserves_provider_reported_zero_as_complete_usage()
+    {
+        var telemetry = TelemetryFor(UsageCall(0, 0, 0, 0));
+
+        Assert.Equal(ModelUsageAvailability.Complete, telemetry.UsageAvailability);
+        Assert.Equal(0, telemetry.UsageUnavailableCallCount);
+        Assert.Equal(0, telemetry.TotalInputTokens);
+        Assert.Equal(0, telemetry.TotalCachedInputTokens);
+        Assert.Equal(0, telemetry.TotalOutputTokens);
+        Assert.Equal(0, telemetry.TotalReasoningTokens);
+        Assert.Equal(0m, telemetry.TotalEstimatedCostUsd);
+    }
+
+    private static ModelTelemetryResponse TelemetryFor(params ModelCallRecord[] calls)
+    {
+        var task = EngineeringTask.Create("C:/repo", "Report truthful usage", DateTimeOffset.UtcNow);
+        foreach (var call in calls) task.RecordModelCall(call, call.CompletedAt);
+        var calculator = new ModelCostCalculator(new Dictionary<string, ModelPricing>
+        {
+            ["model"] = new(10m, 2m, 20m)
+        });
+        return EngineeringTaskResponse.FromDomain(task, new ModelCostResolver(calculator)).Telemetry;
+    }
+
+    private static ModelCallRecord UsageCall(int? input, int? cached, int? output, int? reasoning)
+    {
+        var now = DateTimeOffset.UtcNow;
+        return new ModelCallRecord(
+            Guid.NewGuid(), ModelCallStage.Implementation, "OpenAI", "model", "high",
+            now, now, true, "response-safe", input, cached, output, reasoning, null, null,
+            new ModelPricingSnapshot(10m, 2m, 20m), "request-safe");
     }
 
     private static string ExactManualRequirement() => """
@@ -1791,6 +1919,19 @@ public sealed class SensitiveImplementationFailureFactory : FakeModeFactory
         : IImplementationWorkspaceManager
     {
         private static readonly string Token = new('a', 32);
+
+        public Task<ImplementationInspection> InspectAsync(string repositoryPath, RepositorySnapshot snapshot,
+            ImplementationPlan plan, ImplementationLimits limits, CancellationToken cancellationToken = default)
+        {
+            var files = plan.AffectedFiles.Select(file => file.Action switch
+            {
+                PlannedFileAction.Create => new ImplementationFileContext(file.Path, file.Action, null, null),
+                _ => Context(file.Path, file.Action)
+            }).ToArray();
+            return Task.FromResult(new ImplementationInspection(
+                new ActiveCheckoutSignature("main", snapshot.FullHeadSha!, "status", "index"), files,
+                new string('1', 64), new string('2', 64)));
+        }
 
         public Task<ImplementationReservation> ReserveAsync(Guid taskId, string repositoryPath,
             RepositorySnapshot snapshot, ImplementationPlan plan, CancellationToken cancellationToken = default)

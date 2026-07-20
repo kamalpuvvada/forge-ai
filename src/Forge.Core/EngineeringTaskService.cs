@@ -367,20 +367,60 @@ public sealed class EngineeringTaskService(
             throw new WorkflowException("A complete approved plan and repository snapshot are required before implementation generation.");
 
         var limits = implementationLimits ?? new ImplementationLimits();
-        FakeImplementationCapabilityMatrix.ValidatePlan(task.ImplementationPlan);
+        implementationEngine.EnsureConfigured();
+        ImplementationEligibilityPolicy.ValidatePlan(task.ImplementationPlan, limits.MaximumApprovedOperations);
         ImplementationReservation reservation;
         IReadOnlyList<ImplementationFileContext> preflightFiles;
         ImplementationEvaluation evaluation;
+        ImplementationContext implementationContext;
         try
         {
-            reservation = await implementationWorkspaceManager.ReserveAsync(
-                task.Id, task.Repository, task.RepositorySnapshot, task.ImplementationPlan, limits, cancellationToken);
-            preflightFiles = reservation.Files ?? throw new ImplementationException(
-                "implementation_preflight_failure", "The implementation workspace did not return a complete read-only preflight.");
-            evaluation = await implementationEngine.GenerateAsync(new ImplementationContext(
+            var inspection = await implementationWorkspaceManager.InspectAsync(
+                task.Repository, task.RepositorySnapshot, task.ImplementationPlan, limits, cancellationToken);
+            await implementationWorkspaceManager.VerifyActiveCheckoutAsync(
+                task.Repository, task.ImplementationPlan, inspection.ActiveCheckout, cancellationToken);
+            preflightFiles = inspection.Files;
+            var planFingerprint = ImplementationReviewFingerprint.ComputePlan(task.ImplementationPlan);
+            var citedEvidenceIds = task.ImplementationPlan.AffectedFiles.SelectMany(file => file.EvidenceIds)
+                .Concat(task.ImplementationPlan.Steps.SelectMany(step => step.EvidenceIds))
+                .ToHashSet(StringComparer.Ordinal);
+            var evidence = task.EvidenceItems.Where(item => citedEvidenceIds.Contains(item.Id))
+                .OrderBy(item => item.Id, StringComparer.Ordinal).ToArray();
+            var (projectConventions, omittedOptionalContextCount) = BuildEvidenceBackedConventions(evidence);
+            implementationContext = new ImplementationContext(
                 task.RequirementSummary ?? throw new WorkflowException("An approved requirement summary is required."),
-                task.ImplementationPlan, preflightFiles, timeProvider.GetUtcNow()), cancellationToken);
-            ImplementationOutputValidator.Validate(task.ImplementationPlan, preflightFiles, evaluation.Output, limits);
+                task.ImplementationPlan, preflightFiles, timeProvider.GetUtcNow(),
+                planFingerprint, inspection.ActiveCheckout.HeadSha, evidence, projectConventions,
+                omittedOptionalContextCount);
+            implementationContext = implementationContext with
+            {
+                ContextFingerprint = ImplementationContextIdentity.ComputeGlobal(implementationContext)
+            };
+            evaluation = await implementationEngine.GenerateAsync(implementationContext, cancellationToken);
+            try
+            {
+                ImplementationOutputValidator.Validate(implementationContext, evaluation.Output, limits);
+            }
+            catch (ImplementationException exception) when (evaluation.Output.Source == ImplementationSource.OpenAI)
+            {
+                var rejected = evaluation.ModelCalls.Select((call, index) => index == evaluation.ModelCalls.Count - 1
+                    ? call with { Succeeded = false, FailureCategory = "implementation_validation_rejected" }
+                    : call).ToArray();
+                await RecordImplementationCallsAsync(task, rejected);
+                throw new ImplementationException("implementation_validation_rejected",
+                    "OpenAI completed the request, but Forge rejected the proposed operations.", false, exception);
+            }
+            await RecordImplementationCallsAsync(task, evaluation.ModelCalls);
+            await implementationWorkspaceManager.VerifyActiveCheckoutAsync(
+                task.Repository, task.ImplementationPlan, inspection.ActiveCheckout, cancellationToken);
+            reservation = await implementationWorkspaceManager.ReserveAsync(
+                task.Id, task.Repository, task.RepositorySnapshot, task.ImplementationPlan, limits, inspection,
+                cancellationToken);
+        }
+        catch (ImplementationProviderException exception)
+        {
+            await RecordImplementationCallsAsync(task, exception.ModelCalls);
+            throw new ImplementationException(exception.Category, exception.Message);
         }
         catch (ImplementationException exception)
         {
@@ -438,8 +478,6 @@ public sealed class EngineeringTaskService(
                 UpdatedAt = timeProvider.GetUtcNow()
             }, attemptId, ownerId, timeProvider.GetUtcNow());
             await SaveImplementationStateAsync(task, cancellationToken);
-            if (evaluation.ModelCall is not null) task.RecordModelCall(evaluation.ModelCall, timeProvider.GetUtcNow());
-
             task.UpdateImplementationWorkspace(task.ImplementationWorkspace! with
             {
                 Phase = ImplementationWorkspacePhase.MutationStarted,
@@ -622,6 +660,36 @@ public sealed class EngineeringTaskService(
             throw new ImplementationException("implementation_persistence_failure",
                 "Implementation state could not be finalized safely. Reload the task before taking further action.", false);
         }
+    }
+
+    private static (IReadOnlyList<string> Included, int Omitted) BuildEvidenceBackedConventions(
+        IReadOnlyList<EvidenceItem> evidence)
+    {
+        const int maximumUtf8Bytes = 16 * 1024;
+        var included = new List<string>();
+        var used = 0;
+        var omitted = 0;
+        foreach (var item in evidence.OrderBy(item => item.Id, StringComparer.Ordinal))
+        {
+            var value = $"{item.Id}: {item.ReasonSelected}";
+            var bytes = System.Text.Encoding.UTF8.GetByteCount(value);
+            if (used + bytes <= maximumUtf8Bytes)
+            {
+                included.Add(value);
+                used += bytes;
+            }
+            else omitted++;
+        }
+        return (included, omitted);
+    }
+
+    private async Task RecordImplementationCallsAsync(
+        EngineeringTask task,
+        IReadOnlyList<ModelCallRecord> calls)
+    {
+        if (calls.Count == 0) return;
+        foreach (var call in calls) task.RecordModelCall(call, timeProvider.GetUtcNow());
+        await SaveImplementationStateAsync(task, CancellationToken.None);
     }
 
     private async Task EvaluateAndApplyAsync(EngineeringTask task, CancellationToken cancellationToken)

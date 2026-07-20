@@ -156,18 +156,23 @@ public sealed class OpenAIPlanningEngine(
                 "forge_implementation_plan",
                 "An evidence-backed implementation plan."), cancellationToken);
 
-            if (response.Status != OpenAIResponseStatus.Completed)
-                throw CreateCompletionFailure(response, callId, startedAt, pricingSnapshot);
+            var structuredOutput = OpenAIResponseTopologyValidator.RequireSingleOutputText(response);
 
             var completedAt = timeProvider.GetUtcNow();
+            var estimatedCost = TryEstimateCost(response, pricingSnapshot);
             var call = new ModelCallRecord(
                 callId, ModelCallStage.Planning, "OpenAI", options.PlanningModel,
-                options.PlanningReasoningEffort, startedAt, completedAt, true, response.ResponseId,
-                response.InputTokens, response.CachedInputTokens, response.OutputTokens, response.ReasoningTokens,
-                costCalculator.Calculate(pricingSnapshot, response.InputTokens, response.CachedInputTokens, response.OutputTokens).TotalCostUsd,
+                options.PlanningReasoningEffort, startedAt, completedAt, true,
+                OpenAIProviderIdentifier.Normalize(response.ResponseId),
+                response.UsageAvailable ? response.InputTokens : null,
+                response.UsageAvailable ? response.CachedInputTokens : null,
+                response.UsageAvailable ? response.OutputTokens : null,
+                response.UsageAvailable ? response.ReasoningTokens : null,
+                estimatedCost,
                 null,
-                pricingSnapshot);
-            var plan = ParsePlan(response.OutputText, context, options.PlanningModel);
+                pricingSnapshot,
+                OpenAIProviderIdentifier.Normalize(response.ProviderRequestId));
+            var plan = ParsePlan(structuredOutput, context, options.PlanningModel);
             return new PlanningEvaluation(plan, call);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -183,12 +188,14 @@ public sealed class OpenAIPlanningEngine(
             var category = exception switch
             {
                 OpenAITransportException transport => transport.Category,
+                OpenAIResponseTopologyException topology => TopologyCategory(topology.Failure),
                 PlanningException { Category: "missing_direct_evidence" } => "missing_direct_evidence",
                 _ => "invalid_plan_response"
             };
             var safeMessage = exception switch
             {
                 OpenAITransportException => exception.Message,
+                OpenAIResponseTopologyException topology => TopologyMessage(topology.Failure),
                 PlanningException { Category: "invalid_plan_field" } planning => planning.Message,
                 PlanningException { Category: "missing_direct_evidence" } planning => planning.Message,
                 PlanningException when exception.Message == ImplementationPlanValidator.ValidationAlreadyPerformedMessage =>
@@ -197,48 +204,28 @@ public sealed class OpenAIPlanningEngine(
             };
             var failed = new ModelCallRecord(
                 callId, ModelCallStage.Planning, "OpenAI", options.PlanningModel,
-                options.PlanningReasoningEffort, startedAt, timeProvider.GetUtcNow(), false, response?.ResponseId,
-                response?.InputTokens, response?.CachedInputTokens, response?.OutputTokens,
-                response?.ReasoningTokens,
-                response is null ? null : costCalculator.Calculate(pricingSnapshot, response.InputTokens, response.CachedInputTokens, response.OutputTokens).TotalCostUsd,
+                options.PlanningReasoningEffort, startedAt, timeProvider.GetUtcNow(), false,
+                OpenAIProviderIdentifier.Normalize(response?.ResponseId),
+                response?.UsageAvailable == true ? response.InputTokens : null,
+                response?.UsageAvailable == true ? response.CachedInputTokens : null,
+                response?.UsageAvailable == true ? response.OutputTokens : null,
+                response?.UsageAvailable == true ? response.ReasoningTokens : null,
+                response is null ? null : TryEstimateCost(response, pricingSnapshot),
                 category,
-                response is null ? null : pricingSnapshot);
+                response is null ? null : pricingSnapshot,
+                OpenAIProviderIdentifier.Normalize(response?.ProviderRequestId));
             throw new PlanningProviderException(safeMessage, category, failed, exception);
         }
-    }
-
-    private PlanningProviderException CreateCompletionFailure(
-        OpenAIResponseEnvelope response,
-        Guid callId,
-        DateTimeOffset startedAt,
-        ModelPricingSnapshot pricingSnapshot)
-    {
-        var (category, safeMessage) = response.Status == OpenAIResponseStatus.Incomplete
-            ? response.IncompleteReason switch
-            {
-                OpenAIResponseIncompleteReason.MaxOutputTokens => (
-                    "output_truncated",
-                    "The planning response reached its output limit before the structured plan was complete."),
-                OpenAIResponseIncompleteReason.ContentFilter => (
-                    "content_filter",
-                    "The planning response was stopped by the provider's content filter."),
-                _ => ("incomplete_response", "The planning response was incomplete.")
-            }
-            : ("provider_response_incomplete", "OpenAI did not return a completed planning response.");
-        var failed = new ModelCallRecord(
-            callId, ModelCallStage.Planning, "OpenAI", options.PlanningModel,
-            options.PlanningReasoningEffort, startedAt, timeProvider.GetUtcNow(), false, response.ResponseId,
-            response.InputTokens, response.CachedInputTokens, response.OutputTokens, response.ReasoningTokens,
-            costCalculator.Calculate(pricingSnapshot, response.InputTokens, response.CachedInputTokens, response.OutputTokens).TotalCostUsd,
-            category,
-            pricingSnapshot);
-        return new PlanningProviderException(safeMessage, category, failed);
     }
 
     internal static ImplementationPlan ParsePlan(string json, PlanningContext context, string model)
     {
         StructuredPlan? parsed;
-        try { parsed = JsonSerializer.Deserialize<StructuredPlan>(json, JsonOptions); }
+        try
+        {
+            StrictJsonDuplicatePropertyValidator.RejectDuplicates(json);
+            parsed = JsonSerializer.Deserialize<StructuredPlan>(json, JsonOptions);
+        }
         catch (JsonException exception) { throw new PlanningException("invalid_plan", "Structured planning output was malformed.", exception); }
         if (parsed is null || parsed.AffectedFiles is null || parsed.OrderedSteps is null ||
             parsed.ProposedValidationCommands is null || parsed.Risks is null || parsed.Assumptions is null ||
@@ -354,6 +341,36 @@ public sealed class OpenAIPlanningEngine(
     };
 
     private static string Redact(string value) => DeterministicEvidenceSelectionService.RedactSensitiveValues(value);
+
+    private decimal? TryEstimateCost(OpenAIResponseEnvelope response, ModelPricingSnapshot pricing) =>
+        response.UsageAvailable && costCalculator.TryCalculate(pricing, response.InputTokens,
+            response.CachedInputTokens, response.OutputTokens, out var breakdown)
+            ? breakdown.TotalCostUsd
+            : null;
+
+    private static string TopologyCategory(OpenAIResponseTopologyFailure failure) => failure switch
+    {
+        OpenAIResponseTopologyFailure.IncompleteMaxOutputTokens => "output_truncated",
+        OpenAIResponseTopologyFailure.IncompleteContentFilter => "content_filter",
+        OpenAIResponseTopologyFailure.Refusal => "refusal",
+        OpenAIResponseTopologyFailure.Incomplete or OpenAIResponseTopologyFailure.InvalidResponseIdentity =>
+            "incomplete_response",
+        OpenAIResponseTopologyFailure.Empty => "empty_response",
+        _ => "unexpected_output"
+    };
+
+    private static string TopologyMessage(OpenAIResponseTopologyFailure failure) => failure switch
+    {
+        OpenAIResponseTopologyFailure.IncompleteMaxOutputTokens =>
+            "The planning response reached its output limit before the structured plan was complete.",
+        OpenAIResponseTopologyFailure.IncompleteContentFilter =>
+            "The planning response was stopped by the provider's content filter.",
+        OpenAIResponseTopologyFailure.Refusal => "OpenAI refused the planning request.",
+        OpenAIResponseTopologyFailure.Empty => "OpenAI returned no structured planning output.",
+        OpenAIResponseTopologyFailure.Incomplete or OpenAIResponseTopologyFailure.InvalidResponseIdentity =>
+            "The planning response was incomplete.",
+        _ => "OpenAI returned an unexpected planning response shape."
+    };
 
     private static string Safe(string value, string normalizedRoot)
     {

@@ -142,7 +142,7 @@ public sealed class SqlitePersistenceTests : IDisposable
     }
 
     [Fact]
-    public async Task Legacy_model_call_json_distinguishes_stored_zero_missing_estimate_and_missing_snapshot()
+    public async Task Legacy_model_call_json_preserves_readable_values_while_unavailable_usage_disqualifies_cost()
     {
         await new SqliteDatabaseInitializer(ConnectionString).InitializeAsync();
         var repository = new SqliteEngineeringTaskRepository(ConnectionString);
@@ -152,8 +152,9 @@ public sealed class SqlitePersistenceTests : IDisposable
         await repository.SaveAsync(task);
         var zeroId = Guid.NewGuid();
         var missingId = Guid.NewGuid();
+        var unavailableZeroId = Guid.NewGuid();
         var legacyCalls = $$"""
-            [{"id":"{{zeroId}}","stage":0,"provider":"OpenAI","model":"legacy","reasoningEffort":"low","startedAt":"{{now:O}}","completedAt":"{{now:O}}","succeeded":true,"providerResponseId":"zero","inputTokens":0,"cachedInputTokens":0,"outputTokens":0,"reasoningTokens":null,"estimatedCostUsd":0,"failureCategory":null},{"id":"{{missingId}}","stage":0,"provider":"OpenAI","model":"legacy","reasoningEffort":"low","startedAt":"{{now:O}}","completedAt":"{{now:O}}","succeeded":false,"providerResponseId":null,"inputTokens":null,"cachedInputTokens":null,"outputTokens":null,"reasoningTokens":null,"failureCategory":"legacy"}]
+            [{"id":"{{zeroId}}","stage":0,"provider":"OpenAI","model":"legacy","reasoningEffort":"low","startedAt":"{{now:O}}","completedAt":"{{now:O}}","succeeded":true,"providerResponseId":"zero","inputTokens":0,"cachedInputTokens":0,"outputTokens":0,"reasoningTokens":null,"estimatedCostUsd":0,"failureCategory":null},{"id":"{{missingId}}","stage":0,"provider":"OpenAI","model":"legacy","reasoningEffort":"low","startedAt":"{{now:O}}","completedAt":"{{now:O}}","succeeded":false,"providerResponseId":null,"inputTokens":null,"cachedInputTokens":null,"outputTokens":null,"reasoningTokens":null,"failureCategory":"legacy"},{"id":"{{unavailableZeroId}}","stage":0,"provider":"OpenAI","model":"legacy","reasoningEffort":"low","startedAt":"{{now:O}}","completedAt":"{{now:O}}","succeeded":false,"providerResponseId":null,"inputTokens":null,"cachedInputTokens":null,"outputTokens":null,"reasoningTokens":null,"estimatedCostUsd":0,"failureCategory":"legacy"}]
             """;
         await using (var connection = new SqliteConnection(ConnectionString))
         {
@@ -171,11 +172,16 @@ public sealed class SqlitePersistenceTests : IDisposable
         Assert.Null(loaded.ModelCalls.Single(call => call.Id == zeroId).PricingSnapshot);
         Assert.Null(loaded.ModelCalls.Single(call => call.Id == missingId).EstimatedCostUsd);
         Assert.Null(loaded.ModelCalls.Single(call => call.Id == missingId).PricingSnapshot);
+        var unavailableZero = loaded.ModelCalls.Single(call => call.Id == unavailableZeroId);
+        Assert.Equal(0m, unavailableZero.EstimatedCostUsd);
+        Assert.Null(new ModelCostResolver(new ModelCostCalculator(new Dictionary<string, ModelPricing>()))
+            .Resolve(unavailableZero).EstimatedCostUsd);
 
         await repository.SaveAsync(loaded);
         var reread = await repository.GetAsync(task.Id);
         Assert.Equal(0m, reread!.ModelCalls.Single(call => call.Id == zeroId).EstimatedCostUsd);
         Assert.Null(reread.ModelCalls.Single(call => call.Id == missingId).EstimatedCostUsd);
+        Assert.Equal(0m, reread.ModelCalls.Single(call => call.Id == unavailableZeroId).EstimatedCostUsd);
     }
 
     [Fact]

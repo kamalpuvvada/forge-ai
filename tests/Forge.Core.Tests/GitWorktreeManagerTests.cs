@@ -12,6 +12,73 @@ public sealed class GitWorktreeManagerTests : IDisposable
     private readonly string _worktrees = Path.Combine(Path.GetTempPath(), $"forge-worktrees-{Guid.NewGuid():N}");
 
     [Fact]
+    public async Task Read_only_inspection_creates_no_workspace_git_ref_branch_lock_hooks_or_git_home()
+    {
+        InitializeRepository();
+        var snapshot = Snapshot();
+        var plan = Plan(snapshot);
+        var manager = Manager();
+        var beforeHead = Git("rev-parse", "HEAD").Trim();
+        var beforeStatus = Git("status", "--porcelain=v1", "--untracked-files=all");
+
+        var inspection = await manager.InspectAsync(_root, snapshot, plan, new ImplementationLimits());
+
+        Assert.Equal(beforeHead, inspection.ActiveCheckout.HeadSha);
+        Assert.Equal(3, inspection.Files.Count);
+        Assert.All(inspection.Files, file => Assert.Matches("^[0-9a-f]{64}$", file.SourceContextIdentity));
+        Assert.False(Directory.Exists(_worktrees));
+        Assert.Equal(string.Empty, Git("branch", "--list", "forge/task-*").Trim());
+        Assert.Equal(string.Empty, Git("for-each-ref", "refs/forge/tasks").Trim());
+        Assert.Equal(beforeHead, Git("rev-parse", "HEAD").Trim());
+        Assert.Equal(beforeStatus, Git("status", "--porcelain=v1", "--untracked-files=all"));
+    }
+
+    [Fact]
+    public async Task Provider_independent_pipeline_applies_valid_OpenAI_replacements_without_Fake_markers()
+    {
+        InitializeRepository();
+        var snapshot = Snapshot();
+        var plan = Plan(snapshot);
+        var manager = Manager();
+        var inspection = await manager.InspectAsync(_root, snapshot, plan, new ImplementationLimits());
+        var context = new ImplementationContext("Implement approved files.", plan, inspection.Files,
+            DateTimeOffset.UtcNow, ImplementationReviewFingerprint.ComputePlan(plan),
+            inspection.ActiveCheckout.HeadSha, [], [], 0);
+        context = context with { ContextFingerprint = ImplementationContextIdentity.ComputeGlobal(context) };
+        var operations = inspection.Files.Select(file => file.PlannedAction switch
+        {
+            PlannedFileAction.Create => new ImplementationOperation(file.Path, ImplementationOperationAction.Create,
+                null, "# OpenAI-created review content\n", "Create the approved file.", 0, file.SourceContextIdentity),
+            PlannedFileAction.Modify => new ImplementationOperation(file.Path, ImplementationOperationAction.Modify,
+                file.OriginalContentSha256, "public class App { public int Value => 1; }\n",
+                "Modify the approved file.", file.OriginalUtf8Bytes, file.SourceContextIdentity),
+            PlannedFileAction.Delete => new ImplementationOperation(file.Path, ImplementationOperationAction.Delete,
+                file.OriginalContentSha256, null, "Delete the approved file.", file.OriginalUtf8Bytes,
+                file.SourceContextIdentity),
+            _ => throw new InvalidOperationException()
+        }).ToArray();
+        var output = new ImplementationOutput("Applied approved OpenAI replacements.", [], operations,
+            ImplementationSource.OpenAI, "gpt-5.6-sol", "high", context.ContextFingerprint);
+
+        ImplementationOutputValidator.Validate(context, output, new ImplementationLimits());
+        var reservation = await manager.ReserveAsync(Guid.NewGuid(), _root, snapshot, plan,
+            new ImplementationLimits(), inspection);
+        var prepared = await manager.PrepareAsync(_root, reservation.Workspace, plan,
+            new ImplementationLimits(), reservation.ActiveCheckout, inspection.Files);
+        await using var workspaceLock = prepared.WorkspaceLock;
+        var result = await manager.ApplyAsync(_root, prepared, output, new ImplementationLimits(), DateTimeOffset.UtcNow);
+        var workspacePath = Path.Combine(_worktrees, prepared.Workspace.Token);
+
+        Assert.Equal(ImplementationSource.OpenAI, result.Source);
+        Assert.Equal("gpt-5.6-sol", result.Model);
+        Assert.Contains("Value => 1", await File.ReadAllTextAsync(Path.Combine(workspacePath, "src", "App.cs")));
+        Assert.Contains("OpenAI-created review content", await File.ReadAllTextAsync(Path.Combine(workspacePath, "docs", "New.md")));
+        Assert.False(File.Exists(Path.Combine(workspacePath, "docs", "Delete.txt")));
+        Assert.DoesNotContain("deterministic Fake", string.Join('\n', result.ChangedFiles.Select(file => file.DiffPreview)),
+            StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public async Task Fake_flow_changes_only_isolated_worktree_and_produces_truthful_diff()
     {
         InitializeRepository();
@@ -474,7 +541,7 @@ public sealed class GitWorktreeManagerTests : IDisposable
         var exception = await Assert.ThrowsAsync<ImplementationException>(() =>
             Manager().ReserveAsync(Guid.NewGuid(), _root, snapshot, plan));
 
-        Assert.Equal("implementation_terminal_incompatibility", exception.Category);
+        Assert.Equal("implementation_unsupported_file", exception.Category);
     }
 
     [Theory]

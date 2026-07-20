@@ -125,10 +125,21 @@ public sealed class GitWorktreeManager : IImplementationWorkspaceManager
         ImplementationLimits limits,
         CancellationToken cancellationToken = default)
     {
+        var inspection = await InspectAsync(repositoryPath, snapshot, plan, limits, cancellationToken);
+        return await ReserveAsync(taskId, repositoryPath, snapshot, plan, limits, inspection, cancellationToken);
+    }
+
+    public async Task<ImplementationInspection> InspectAsync(
+        string repositoryPath,
+        RepositorySnapshot snapshot,
+        ImplementationPlan plan,
+        ImplementationLimits limits,
+        CancellationToken cancellationToken = default)
+    {
         ArgumentNullException.ThrowIfNull(snapshot);
         ArgumentNullException.ThrowIfNull(plan);
         ArgumentNullException.ThrowIfNull(limits);
-        FakeImplementationCapabilityMatrix.ValidatePlan(plan);
+        ImplementationEligibilityPolicy.ValidatePlan(plan, limits.MaximumApprovedOperations);
         if (!snapshot.IsGitRepository || string.IsNullOrWhiteSpace(snapshot.FullHeadSha))
             throw new ImplementationException("implementation_repository_not_git", "Implementation generation requires an eligible Git repository.");
         if (!string.Equals(snapshot.WorkingTreeStatus, "clean", StringComparison.Ordinal))
@@ -138,8 +149,6 @@ public sealed class GitWorktreeManager : IImplementationWorkspaceManager
         EnsureDirectoryAndAncestorsAreSafe(root, "The selected repository root is unsafe.");
         var worktreeRoot = NormalizeDirectory(options.WorktreeRoot);
         EnsureOutsideRepository(root, worktreeRoot);
-        Directory.CreateDirectory(worktreeRoot);
-        EnsureDirectoryAndAncestorsAreSafe(worktreeRoot, "The configured implementation worktree root is unsafe.");
 
         var top = (await RequireOutputAsync(root, ["rev-parse", "--show-toplevel"],
             "implementation_repository_not_git", cancellationToken)).Trim();
@@ -158,16 +167,48 @@ public sealed class GitWorktreeManager : IImplementationWorkspaceManager
             throw new ImplementationException("implementation_repository_dirty", "The selected repository must be completely clean, including untracked files.");
         if (!string.Equals(signature.HeadSha, snapshot.FullHeadSha, StringComparison.Ordinal))
             throw new ImplementationException("implementation_base_changed", "The repository HEAD changed after plan approval. Re-analyze and approve a new plan.");
-        var preflightFiles = await BuildPreflightContextsAsync(root, plan, limits, cancellationToken);
+        var planFingerprint = ImplementationReviewFingerprint.ComputePlan(plan);
+        var preflightFiles = (await BuildPreflightContextsAsync(root, plan, limits, cancellationToken))
+            .Select(file => file with
+            {
+                SourceContextIdentity = ImplementationContextIdentity.ComputeSource(
+                    signature.HeadSha, planFingerprint, file.Path, file.PlannedAction,
+                    file.OriginalContentSha256, file.OriginalUtf8Bytes)
+            }).ToArray();
+
+        var commonDirectory = await ResolveGitCommonDirectoryAsync(root, cancellationToken);
+        return new ImplementationInspection(
+            signature,
+            preflightFiles,
+            HashCanonicalPath(root),
+            HashCanonicalPath(commonDirectory));
+    }
+
+    public async Task<ImplementationReservation> ReserveAsync(
+        Guid taskId,
+        string repositoryPath,
+        RepositorySnapshot snapshot,
+        ImplementationPlan plan,
+        ImplementationLimits limits,
+        ImplementationInspection inspection,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(inspection);
+        ImplementationEligibilityPolicy.ValidatePlan(plan, limits.MaximumApprovedOperations);
+        var root = NormalizeDirectory(repositoryPath);
+        var worktreeRoot = NormalizeDirectory(options.WorktreeRoot);
+        EnsureOutsideRepository(root, worktreeRoot);
+        Directory.CreateDirectory(worktreeRoot);
+        EnsureDirectoryAndAncestorsAreSafe(worktreeRoot, "The configured implementation worktree root is unsafe.");
+        await EnsureActiveCheckoutUnchangedAsync(root, plan, limits, inspection.ActiveCheckout, cancellationToken);
+        var currentFiles = await BuildPreflightContextsAsync(root, plan, limits, cancellationToken);
+        EnsureContextsMatch(inspection.Files, currentFiles);
 
         var token = taskId.ToString("N");
         var branch = $"forge/task-{token}";
         var ownerReference = $"refs/forge/tasks/{token}";
-        var commonDirectory = await ResolveGitCommonDirectoryAsync(root, cancellationToken);
-        var repositoryIdentity = HashCanonicalPath(root);
-        var commonIdentity = HashCanonicalPath(commonDirectory);
         var workspacePath = ResolveWorkspacePath(worktreeRoot, token);
-        await VerifyOwnershipStateAsync(root, workspacePath, branch, ownerReference, signature.HeadSha,
+        await VerifyOwnershipStateAsync(root, workspacePath, branch, ownerReference, inspection.ActiveCheckout.HeadSha,
             allowUnreserved: true, cancellationToken);
 
         var branchName = await git.RunAsync(root, ["check-ref-format", "--branch", branch], cancellationToken: cancellationToken);
@@ -175,12 +216,13 @@ public sealed class GitWorktreeManager : IImplementationWorkspaceManager
             "Forge could not create a safe deterministic implementation branch name.");
         var now = DateTimeOffset.UtcNow;
         return new ImplementationReservation(
-            new ImplementationWorkspace(token, branch, signature.HeadSha,
+            new ImplementationWorkspace(token, branch, inspection.ActiveCheckout.HeadSha,
                 ImplementationWorkspacePhase.Reserved, now, now, false,
-                repositoryIdentity, commonIdentity, ownerReference,
-                signature.TrackedContentFingerprint, signature.TrackedFileCount, signature.TrackedBytes),
-            signature,
-            preflightFiles);
+                inspection.RepositoryIdentity, inspection.GitCommonDirectoryIdentity, ownerReference,
+                inspection.ActiveCheckout.TrackedContentFingerprint, inspection.ActiveCheckout.TrackedFileCount,
+                inspection.ActiveCheckout.TrackedBytes),
+            inspection.ActiveCheckout,
+            inspection.Files);
     }
 
     public Task<PreparedImplementationWorkspace> PrepareAsync(
@@ -214,7 +256,7 @@ public sealed class GitWorktreeManager : IImplementationWorkspaceManager
         ArgumentNullException.ThrowIfNull(workspace);
         ArgumentNullException.ThrowIfNull(plan);
         ArgumentNullException.ThrowIfNull(limits);
-        FakeImplementationCapabilityMatrix.ValidatePlan(plan);
+        ImplementationEligibilityPolicy.ValidatePlan(plan, limits.MaximumApprovedOperations);
         var root = NormalizeDirectory(repositoryPath);
         var worktreeRoot = NormalizeDirectory(options.WorktreeRoot);
         EnsureOutsideRepository(root, worktreeRoot);
@@ -304,10 +346,12 @@ public sealed class GitWorktreeManager : IImplementationWorkspaceManager
                 throw Recovery("The prepared isolated worktree is not clean and requires explicit recovery.");
 
             var contexts = new List<ImplementationFileContext>(plan.AffectedFiles.Count);
+            var planFingerprint = ImplementationReviewFingerprint.ComputePlan(plan);
             var totalCharacters = 0;
             foreach (var planned in plan.AffectedFiles)
             {
                 cancellationToken.ThrowIfCancellationRequested();
+                if (planned.Action == PlannedFileAction.Inspect) continue;
                 var path = RepositoryPathRules.Normalize(planned.Path);
                 fileSafety.ValidateEligiblePath(workspacePath, path, mayNotExist: planned.Action == PlannedFileAction.Create);
                 var fullPath = fileSafety.ResolveContainedPath(workspacePath, path);
@@ -315,7 +359,9 @@ public sealed class GitWorktreeManager : IImplementationWorkspaceManager
                 {
                     if (files.FileExists(fullPath) || files.DirectoryExists(fullPath))
                         throw Recovery($"Approved create path '{path}' already exists.");
-                    contexts.Add(new ImplementationFileContext(path, planned.Action, null, null));
+                    contexts.Add(new ImplementationFileContext(path, planned.Action, null, null, 0,
+                        ImplementationContextIdentity.ComputeSource(workspace.BaseCommitSha, planFingerprint,
+                            path, planned.Action, null, 0)));
                     continue;
                 }
 
@@ -327,7 +373,11 @@ public sealed class GitWorktreeManager : IImplementationWorkspaceManager
                 totalCharacters = checked(totalCharacters + content.Length);
                 if (totalCharacters > limits.MaximumTotalCurrentCharacters)
                     throw new ImplementationException("implementation_input_limit", "Approved writable content exceeds the total implementation-context limit.");
-                contexts.Add(new ImplementationFileContext(path, planned.Action, content, ImplementationOutputValidator.Hash(content)));
+                var hash = ImplementationOutputValidator.Hash(content);
+                var utf8Bytes = Encoding.UTF8.GetByteCount(content);
+                contexts.Add(new ImplementationFileContext(path, planned.Action, content, hash, utf8Bytes,
+                    ImplementationContextIdentity.ComputeSource(workspace.BaseCommitSha, planFingerprint,
+                        path, planned.Action, hash, utf8Bytes)));
             }
 
             if (preflightFiles is not null) EnsureContextsMatch(preflightFiles, contexts);
@@ -825,6 +875,7 @@ public sealed class GitWorktreeManager : IImplementationWorkspaceManager
         var totalCharacters = 0;
         foreach (var file in plan.AffectedFiles)
         {
+            if (file.Action == PlannedFileAction.Inspect) continue;
             var path = RepositoryPathRules.Normalize(file.Path);
             if (file.Action == PlannedFileAction.Create)
             {
@@ -833,13 +884,14 @@ public sealed class GitWorktreeManager : IImplementationWorkspaceManager
                 if (files.FileExists(createPath) || files.DirectoryExists(createPath))
                     throw new ImplementationException("implementation_terminal_incompatibility",
                         $"Approved create path '{path}' already exists.");
-                contexts.Add(new ImplementationFileContext(path, file.Action, null, null));
+                contexts.Add(new ImplementationFileContext(path, file.Action, null, null, 0));
                 continue;
             }
             await EnsureGitAncestorsAreRegularAsync(root, path, cancellationToken);
             await EnsureRegularTrackedFileAsync(root, path, cancellationToken);
             fileSafety.ValidateEligiblePath(root, path, mayNotExist: false);
             var content = await ReadStrictUtf8NoBomAsync(fileSafety.ResolveContainedPath(root, path), path, cancellationToken);
+            var utf8Bytes = Encoding.UTF8.GetByteCount(content);
             if (content.Length > limits.MaximumCurrentFileCharacters)
                 throw new ImplementationException("implementation_input_limit", $"Approved path '{path}' exceeds the supported writable-text limit.");
             totalCharacters = checked(totalCharacters + content.Length);
@@ -848,7 +900,7 @@ public sealed class GitWorktreeManager : IImplementationWorkspaceManager
             if (SensitiveContentDetector.ContainsSensitiveValue(content))
                 throw new ImplementationException("implementation_sensitive_content", $"Approved path '{path}' contains sensitive values and cannot be generated safely.");
             contexts.Add(new ImplementationFileContext(path, file.Action, content,
-                ImplementationOutputValidator.Hash(content)));
+                ImplementationOutputValidator.Hash(content), utf8Bytes));
         }
         return contexts;
     }
@@ -866,6 +918,7 @@ public sealed class GitWorktreeManager : IImplementationWorkspaceManager
             if (!RepositoryPathRules.Comparer.Equals(RepositoryPathRules.Normalize(left.Path), RepositoryPathRules.Normalize(right.Path)) ||
                 left.PlannedAction != right.PlannedAction ||
                 !string.Equals(left.OriginalContentSha256, right.OriginalContentSha256, StringComparison.OrdinalIgnoreCase) ||
+                left.OriginalUtf8Bytes != right.OriginalUtf8Bytes ||
                 !string.Equals(left.OriginalContent, right.OriginalContent, StringComparison.Ordinal))
                 throw Recovery("The prepared implementation context no longer matches its validated preflight.");
         }
