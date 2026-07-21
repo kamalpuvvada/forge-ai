@@ -154,4 +154,12 @@
 
 **Trade-off:** Genuine legacy version-0 tasks contain no verification artifacts and remain read-only; future versions fail until explicitly supported, ambiguous relative references are conservatively treated as repository claims, and malformed responses require reload while preserving the last valid selection and enabling no mutation. Corruption tests represent every storage and endpoint family without claiming an exhaustive Cartesian product. This detects corruption and bounded tampering within Forge's persistence trust boundary; it does not defend against a fully malicious database administrator who can rewrite all application history and code. `Complete`/`Partial` map to `UsageAvailable = true`; `Unavailable` maps to false. Forge still executes no verification or delivery command.
 
+## 024 — Permit one governed correction without replacing approved history
+
+**Decision:** Route a completed failed manual attempt through immutable Fake/OpenAI failure analysis. Only `ImplementationDefect` may produce a deterministic exact-path/action proposal. After explicit proposal approval, generate revision 2 from the original base in a separate linked worktree, keep revision 1 effective until revision-2 diff approval, then require plan 2 to cover every prior failed-result revision before a second human attempt may reach `ReadyForDelivery`.
+
+**Reason:** The Build Week submission needs a demonstrable failure-to-fix loop while preserving the active checkout, approved scope, prior implementation, and user-reported evidence as an auditable ledger.
+
+**Trade-off:** This slice supports exactly one correction and safe-stops every non-implementation classification. It does not revise requirements or plans, retry environment failures, execute validation, reject/regenerate candidates, clean worktrees, or perform delivery actions.
+
 **Low-priority engineering follow-ups:** Keep the representative corruption matrix rather than claiming a Cartesian product; consider additional Save/Pass/Fail keyboard, rapid-action, and stale-response cases; and add an explicit trigger test for `SET TaskId = TaskId`. These are engineering-depth follow-ups, not demonstrated product failures.

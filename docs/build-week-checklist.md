@@ -24,7 +24,8 @@
 - [x] Explicit backend authorization for manual Start, Save, Pass, and Fail; Start requires empty attempt history, and nonempty history requires a current pointer with no fallback
 - [x] Immutable verification-child ownership guarded on INSERT and `TaskId` UPDATE
 - [x] Structural query-bearing repository-path checks and complete fail-closed full-task/history frontend decoders
-- [ ] Automated validation and failure analysis/correction (future slices)
+- [x] Bounded failure analysis and one exact-scope correction revision with replacement regression planning
+- [ ] Automated validation execution (future slice)
 - [x] Stage-specific clarification/planning telemetry and truthful capabilities
 - [x] README setup and validation commands
 - [ ] Curated demo repository and demo data

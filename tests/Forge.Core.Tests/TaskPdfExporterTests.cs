@@ -58,6 +58,51 @@ public sealed class TaskPdfExporterTests
     }
 
     [Fact]
+    public async Task Correction_chronology_preserves_exact_em_dashes_and_exclusive_request_audit()
+    {
+        var expired = await CorrectionWorkflowTests.FailedTask();
+        var expiredCommand = CorrectionWorkflowTests.AnalysisCommand(expired);
+        expired.BeginFailureAnalysis(expiredCommand, Now, new CorrectionLimits());
+        expired.ReconcileFailureAnalysis(new ReconcileFailureAnalysisCommand(Guid.NewGuid(), expired.Id,
+            expired.RowVersion, expiredCommand.CommandId), Now.AddMinutes(6));
+        using var expiredDocument = PdfDocument.Open(Exporter().Export(expired));
+        var expiredText = string.Join('\n', expiredDocument.GetPages().Select(page => page.Text));
+        Assert.Contains("Failure-analysis generation attempt — ExpiredBeforeDispatch", expiredText);
+        Assert.Contains("yes — explicit new command required", expiredText);
+        Assert.Contains("Definitely undispatched: 0", expiredText);
+
+        var correction = await CorrectionWorkflowTests.FailedTask();
+        var analysisCommand = CorrectionWorkflowTests.AnalysisCommand(correction);
+        correction.BeginFailureAnalysis(analysisCommand, Now, new CorrectionLimits());
+        var context = CorrectionWorkflowService.CreateAnalysisContext(correction, Now);
+        var candidate = (await new FakeFailureAnalysisEngine().GenerateAsync(context,
+            new NoopVerificationObserver())).Candidate with
+        {
+            Classification = FailureClassification.ImplementationDefect,
+            AffectedApprovedOperations = [context.ApprovedOperations[0]],
+            CorrectionStrategy = "Adjust only the approved operation."
+        };
+        var analysis = CorrectionValidator.FinalizeAnalysis(context, candidate, 1, Guid.NewGuid(),
+            analysisCommand.CommandId, [], new CorrectionLimits());
+        var proposal = CorrectionValidator.CreateProposal(correction.Id, analysis,
+            correction.ImplementationRevisions[0], 1, Now.AddSeconds(1), new CorrectionLimits());
+        correction.StoreFailureAnalysis(analysis, proposal, Now.AddSeconds(1));
+        correction.CompleteFailureAnalysisAttempt(analysisCommand.CommandId, analysis.AnalysisId, Now.AddSeconds(1));
+        var approval = new ApproveCorrectionProposalCommand(Guid.NewGuid(), correction.Id, correction.RowVersion,
+            proposal.ProposalId, proposal.ProposalFingerprint, analysis.AnalysisId, analysis.AnalysisFingerprint,
+            proposal.FailedAttemptId, proposal.FailedAttemptFingerprint, proposal.PreviousApprovedRevisionId,
+            proposal.PreviousResultFingerprint, proposal.ApprovedRequirementFingerprint,
+            proposal.ApprovedPlanFingerprint, proposal.OriginalBaseCommitSha);
+        correction.ApproveCorrectionProposal(approval, Now.AddSeconds(2));
+        correction.ClaimCorrection(new GenerateCorrectionCommand(Guid.NewGuid(), correction.Id,
+            correction.RowVersion, proposal.ProposalId, proposal.ProposalFingerprint,
+            proposal.PreviousApprovedRevisionId, proposal.PreviousResultFingerprint), Now.AddSeconds(3));
+        using var correctionDocument = PdfDocument.Open(Exporter().Export(correction));
+        var correctionText = string.Join('\n', correctionDocument.GetPages().Select(page => page.Text));
+        Assert.Contains("Correction generation attempt — Prepared", correctionText);
+    }
+
+    [Fact]
     public void Verification_chronology_distinguishes_logical_physical_possible_and_undispatched_attempts()
     {
         var task = VerificationWorkflowTests.ApprovedImplementation();
@@ -1385,6 +1430,25 @@ public sealed class TaskPdfExporterTests
         return string.Join('\n', document.GetPages().Select(page => page.Text));
     }
 
+    [Fact]
+    public async Task Delivery_pdf_is_read_only_and_reports_deterministic_proposal_and_not_merged_boundary()
+    {
+        var task = await DeliveryWorkflowTests.ReadyTask();
+        var proposal = DeliveryWorkflowTests.Proposal(task);
+        task.StoreDeliveryProposal(proposal, new DateTimeOffset(2026, 7, 22, 12, 6, 0, TimeSpan.Zero));
+        var before = JsonSerializer.Serialize(task, JsonOptions);
+
+        var text = Extract(Exporter().Export(task));
+
+        Assert.Contains("GitHub delivery chronology", text, StringComparison.Ordinal);
+        Assert.Contains("No automated target validation", text, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("NOT MERGED", text, StringComparison.Ordinal);
+        Assert.Contains(proposal.DeliveryBranch, text, StringComparison.Ordinal);
+        Assert.Contains("Prepared at", text, StringComparison.Ordinal);
+        Assert.Contains("2026-07-22T12:00:00Z", text, StringComparison.Ordinal);
+        Assert.Equal(before, JsonSerializer.Serialize(task, JsonOptions));
+    }
+
     private static int CountOccurrences(string text, string value) =>
         text.Split(value, StringSplitOptions.None).Length - 1;
 
@@ -1418,6 +1482,12 @@ public sealed class TaskPdfExporterTests
     private sealed class FixedTimeProvider(DateTimeOffset now) : TimeProvider
     {
         public override DateTimeOffset GetUtcNow() => now;
+    }
+
+    private sealed class NoopVerificationObserver : IVerificationGenerationObserver
+    {
+        public Task RecordAsync(VerificationDispatchCheckpoint checkpoint, Guid logicalCallId,
+            CancellationToken cancellationToken = default) => Task.CompletedTask;
     }
 
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)

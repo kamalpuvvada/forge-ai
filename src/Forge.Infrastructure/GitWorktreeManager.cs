@@ -184,6 +184,53 @@ public sealed class GitWorktreeManager : IImplementationWorkspaceManager
             HashCanonicalPath(commonDirectory));
     }
 
+    public async Task<CorrectionSourceInspection> InspectCorrectionSourceAsync(
+        string repositoryPath,
+        RepositorySnapshot snapshot,
+        ImplementationPlan plan,
+        ImplementationWorkspace previousWorkspace,
+        ImplementationResult previousResult,
+        ImplementationLimits limits,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(previousWorkspace);
+        ArgumentNullException.ThrowIfNull(previousResult);
+        if (!await IsAvailableAsync(repositoryPath, previousWorkspace, plan, previousResult, cancellationToken))
+            throw new ImplementationException("correction_recovery_required",
+                "The effective revision worktree is missing, changed, or unavailable. Correction generation did not contact the provider.", true);
+        var inspection = await InspectAsync(repositoryPath, snapshot, plan, limits, cancellationToken);
+        if (!string.Equals(inspection.ActiveCheckout.HeadSha, previousWorkspace.BaseCommitSha, StringComparison.Ordinal) ||
+            !string.Equals(previousResult.BaseCommitSha, previousWorkspace.BaseCommitSha, StringComparison.Ordinal))
+            throw new ImplementationException("correction_recovery_required",
+                "The effective revision no longer matches the original approved base commit.", true);
+        var workspacePath = ResolveWorkspacePath(NormalizeDirectory(options.WorktreeRoot), previousWorkspace.Token);
+        var reviews = previousResult.ChangedFiles.ToDictionary(
+            item => RepositoryPathRules.Normalize(item.Path), RepositoryPathRules.Comparer);
+        var content = new Dictionary<string, string?>(RepositoryPathRules.Comparer);
+        foreach (var file in plan.AffectedFiles.Where(item => item.Action != PlannedFileAction.Inspect))
+        {
+            var path = RepositoryPathRules.Normalize(file.Path);
+            if (!reviews.TryGetValue(path, out var review))
+                throw new ImplementationException("correction_recovery_required",
+                    "The effective revision review is incomplete.", true);
+            if (file.Action == PlannedFileAction.Delete)
+            {
+                content[path] = null;
+                continue;
+            }
+            var fullPath = fileSafety.ResolveContainedPath(workspacePath, path);
+            if (!files.FileExists(fullPath))
+                throw new ImplementationException("correction_recovery_required",
+                    "An effective revision output is missing.", true);
+            var value = await ReadStrictUtf8NoBomAsync(fullPath, path, cancellationToken);
+            if (!string.Equals(ImplementationOutputValidator.Hash(value), review.NewContentSha256, StringComparison.Ordinal))
+                throw new ImplementationException("correction_recovery_required",
+                    "An effective revision output no longer matches its approved review.", true);
+            content[path] = value;
+        }
+        return new CorrectionSourceInspection(inspection, content);
+    }
+
     public async Task<ImplementationReservation> ReserveAsync(
         Guid taskId,
         string repositoryPath,
@@ -204,9 +251,44 @@ public sealed class GitWorktreeManager : IImplementationWorkspaceManager
         var currentFiles = await BuildPreflightContextsAsync(root, plan, limits, cancellationToken);
         EnsureContextsMatch(inspection.Files, currentFiles);
 
-        var token = taskId.ToString("N");
-        var branch = $"forge/task-{token}";
-        var ownerReference = $"refs/forge/tasks/{token}";
+        return await CreateReservationAsync(taskId, 1, root, worktreeRoot, inspection, cancellationToken);
+    }
+
+    public async Task<ImplementationReservation> ReserveRevisionAsync(
+        Guid taskId,
+        int revisionNumber,
+        string repositoryPath,
+        RepositorySnapshot snapshot,
+        ImplementationPlan plan,
+        ImplementationLimits limits,
+        ImplementationInspection inspection,
+        CancellationToken cancellationToken = default)
+    {
+        if (revisionNumber != 2)
+            throw new ImplementationException("correction_revision_limit", "Only correction revision 2 is supported.");
+        var root = NormalizeDirectory(repositoryPath);
+        var worktreeRoot = NormalizeDirectory(options.WorktreeRoot);
+        EnsureOutsideRepository(root, worktreeRoot);
+        Directory.CreateDirectory(worktreeRoot);
+        EnsureDirectoryAndAncestorsAreSafe(worktreeRoot, "The configured implementation worktree root is unsafe.");
+        await EnsureActiveCheckoutUnchangedAsync(root, plan, limits, inspection.ActiveCheckout, cancellationToken);
+        var currentFiles = await BuildPreflightContextsAsync(root, plan, limits, cancellationToken);
+        EnsureContextsMatch(inspection.Files, currentFiles);
+        return await CreateReservationAsync(taskId, revisionNumber, root, worktreeRoot, inspection, cancellationToken);
+    }
+
+    private async Task<ImplementationReservation> CreateReservationAsync(
+        Guid taskId, int revisionNumber, string root, string worktreeRoot,
+        ImplementationInspection inspection, CancellationToken cancellationToken)
+    {
+        var taskToken = taskId.ToString("N");
+        var token = revisionNumber == 1 ? taskToken : RevisionWorkspaceToken(taskId, revisionNumber);
+        var branch = revisionNumber == 1
+            ? $"forge/task-{taskToken}"
+            : $"forge/task-{taskToken}-revision-{revisionNumber}";
+        var ownerReference = revisionNumber == 1
+            ? $"refs/forge/tasks/{taskToken}"
+            : $"refs/forge/tasks/{taskToken}-revision-{revisionNumber}";
         var workspacePath = ResolveWorkspacePath(worktreeRoot, token);
         await VerifyOwnershipStateAsync(root, workspacePath, branch, ownerReference, inspection.ActiveCheckout.HeadSha,
             allowUnreserved: true, cancellationToken);
@@ -220,9 +302,15 @@ public sealed class GitWorktreeManager : IImplementationWorkspaceManager
                 ImplementationWorkspacePhase.Reserved, now, now, false,
                 inspection.RepositoryIdentity, inspection.GitCommonDirectoryIdentity, ownerReference,
                 inspection.ActiveCheckout.TrackedContentFingerprint, inspection.ActiveCheckout.TrackedFileCount,
-                inspection.ActiveCheckout.TrackedBytes),
+                inspection.ActiveCheckout.TrackedBytes, revisionNumber, taskToken),
             inspection.ActiveCheckout,
             inspection.Files);
+    }
+
+    private static string RevisionWorkspaceToken(Guid taskId, int revisionNumber)
+    {
+        var value = Encoding.UTF8.GetBytes($"forge-workspace-v1\n{taskId:D}\n{revisionNumber}");
+        return Convert.ToHexString(SHA256.HashData(value)).ToLowerInvariant()[..32];
     }
 
     public Task<PreparedImplementationWorkspace> PrepareAsync(
@@ -647,8 +735,7 @@ public sealed class GitWorktreeManager : IImplementationWorkspaceManager
     {
         if (string.IsNullOrWhiteSpace(workspace.RepositoryIdentity) ||
             string.IsNullOrWhiteSpace(workspace.GitCommonDirectoryIdentity) ||
-            !string.Equals(workspace.Branch, $"forge/task-{workspace.Token}", StringComparison.Ordinal) ||
-            !string.Equals(workspace.OwnershipReference, $"refs/forge/tasks/{workspace.Token}", StringComparison.Ordinal))
+            !WorkspaceNamesMatch(workspace))
             return false;
 
         var repositoryRoot = NormalizeDirectory(repositoryPath);
@@ -999,7 +1086,9 @@ public sealed class GitWorktreeManager : IImplementationWorkspaceManager
         bool allowUnreserved,
         CancellationToken cancellationToken)
     {
-        if (!ownerReference.Equals($"refs/forge/tasks/{Path.GetFileName(workspacePath)}", StringComparison.Ordinal))
+        if (!ownerReference.StartsWith("refs/forge/tasks/", StringComparison.Ordinal) ||
+            ownerReference.Contains("..", StringComparison.Ordinal) || ownerReference.Contains('\\') ||
+            branch.StartsWith("-", StringComparison.Ordinal) || branch.Contains("..", StringComparison.Ordinal))
             throw Recovery("The persisted workspace token and ownership marker do not match.");
         var owner = await ReadOptionalRefAsync(root, ownerReference, cancellationToken);
         var branchHead = await ReadOptionalRefAsync(root, $"refs/heads/{branch}", cancellationToken);
@@ -1031,6 +1120,17 @@ public sealed class GitWorktreeManager : IImplementationWorkspaceManager
             string.Equals(item.Branch, $"refs/heads/{branch}", StringComparison.Ordinal));
         if (branchRegistration is not null && !PathsEqual(branchRegistration.Path, workspacePath))
             throw Recovery("The owned implementation branch is registered at an unexpected worktree path.");
+    }
+
+    private static bool WorkspaceNamesMatch(ImplementationWorkspace workspace)
+    {
+        var taskToken = string.IsNullOrWhiteSpace(workspace.TaskToken) ? workspace.Token : workspace.TaskToken;
+        if (workspace.RevisionNumber == 1)
+            return string.Equals(workspace.Branch, $"forge/task-{taskToken}", StringComparison.Ordinal) &&
+                   string.Equals(workspace.OwnershipReference, $"refs/forge/tasks/{taskToken}", StringComparison.Ordinal);
+        return workspace.RevisionNumber == 2 &&
+               string.Equals(workspace.Branch, $"forge/task-{taskToken}-revision-2", StringComparison.Ordinal) &&
+               string.Equals(workspace.OwnershipReference, $"refs/forge/tasks/{taskToken}-revision-2", StringComparison.Ordinal);
     }
 
     private async Task<IReadOnlyList<WorktreeRegistration>> ReadWorktreeRegistrationsAsync(

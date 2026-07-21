@@ -5,7 +5,7 @@ import { createRoot } from 'react-dom/client'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { VerificationPanel } from './VerificationPanel'
 import { decodeEngineeringTask } from './api'
-import type { EngineeringTask, ManualCaseResultRevision, ManualVerificationAttempt, VerificationPlan, VerificationTestCase } from './types'
+import type { EngineeringTask, ManualCaseResultRevision, ManualVerificationAttempt, SystemCapabilities, VerificationPlan, VerificationTestCase } from './types'
 
 const plan: VerificationPlan = {
   planId: '11111111-1111-4111-8111-111111111111', planNumber: 1,
@@ -109,7 +109,14 @@ function task(status: EngineeringTask['status'], overrides: Record<string, unkno
     currentVerificationAttemptId: terminalAttempt?.attemptId ?? null,
     verificationPlans: hasPlan ? [{ ...plan, status: terminalAttempt ? 'Completed' : 'Current' }] : [],
     verificationPlanGenerationAttempts: [], manualVerificationAttempts: terminalAttempt ? [terminalAttempt] : [],
-    verificationEligibility: eligibility, ...overrides,
+    verificationEligibility: eligibility,
+    correctionEligibility: {
+      canGenerateFailureAnalysis: status === 'ManualVerificationFailed',
+      canApproveCorrection: status === 'AwaitingCorrectionApproval',
+      canGenerateCorrection: status === 'CorrectionApproved', canApproveCorrectedRevision: false,
+      canGenerateReplacementVerificationPlan: false,
+    },
+    ...overrides,
   }
   return decodeEngineeringTask(json)
 }
@@ -143,17 +150,74 @@ function failedOverrides() {
 let container: HTMLDivElement | null = null
 afterEach(() => { container?.remove(); container = null })
 
-async function render(status: EngineeringTask['status'], overrides: Record<string, unknown> = {}) {
+async function renderSelected(selected: EngineeringTask, activeAction: string | null = null,
+  capabilities: SystemCapabilities | null = null) {
   container = document.createElement('div'); document.body.append(container)
-  const props = { task: task(status, overrides), capabilities: null, busy: false, documentsBusy: false,
+  const props = { task: selected, capabilities, busy: activeAction !== null, activeAction, documentsBusy: false,
     documentError: null, onGenerate: vi.fn(), onStart: vi.fn(), onSaveCase: vi.fn(), onComplete: vi.fn(),
-    onExportPlan: vi.fn(), onExportApprovedPlan: vi.fn(), onExportTaskReport: vi.fn() }
+    onExportPlan: vi.fn(), onExportApprovedPlan: vi.fn(), onExportTaskReport: vi.fn(), onViewImplementation: vi.fn() }
   const root = createRoot(container)
   await act(async () => root.render(<VerificationPanel {...props} />))
   return { props, root }
 }
 
+async function render(status: EngineeringTask['status'], overrides: Record<string, unknown> = {},
+  activeAction: string | null = null) {
+  return renderSelected(task(status, overrides), activeAction)
+}
+
 describe('VerificationPanel', () => {
+  it('allows a current plan to start when only superseded-plan attempts are preserved', async () => {
+    const selected = task('AwaitingManualVerification')
+    const historical = { ...attempt('CompletedFailed'), verificationPlanId: '99999999-9999-4999-8999-999999999999',
+      verificationPlanFingerprint: '9'.repeat(64) }
+    selected.manualVerificationAttempts = [historical]
+    const view = await renderSelected(selected)
+    const button = Array.from(container!.querySelectorAll('button')).find(item => item.textContent === 'Start verification')!
+    expect(button.disabled).toBe(false)
+    await act(async () => button.click())
+    expect(view.props.onStart).toHaveBeenCalledOnce()
+    await act(async () => view.root.unmount())
+  })
+
+  it('blocks Start only when an attempt belongs to the current plan', async () => {
+    const currentAttempt = { ...attempt(), attemptNumber: 2, attemptId: '99999999-9999-4999-8999-999999999999' }
+    const selected = task('AwaitingManualVerification')
+    selected.currentVerificationAttemptId = currentAttempt.attemptId
+    selected.manualVerificationAttempts = [
+      { ...attempt('CompletedFailed'), verificationPlanId: '88888888-8888-4888-8888-888888888888' }, currentAttempt,
+    ]
+    selected.verificationEligibility = manualEligibility({ canRecordVerificationResult: true }) as
+      EngineeringTask['verificationEligibility']
+    const view = await renderSelected(selected)
+    expect(Array.from(container!.querySelectorAll('button')).some(item => item.textContent === 'Start verification')).toBe(false)
+    await act(async () => view.root.unmount())
+  })
+
+  it('ignores multiple attempts from other plans when gating the current plan', async () => {
+    const selected = task('AwaitingManualVerification')
+    selected.manualVerificationAttempts = [
+      { ...attempt('CompletedFailed'), verificationPlanId: '77777777-7777-4777-8777-777777777777' },
+      { ...attempt('CompletedPassed'), attemptId: '88888888-8888-4888-8888-888888888888', attemptNumber: 2,
+        verificationPlanId: '99999999-9999-4999-8999-999999999999' },
+    ]
+    const view = await renderSelected(selected)
+    expect(Array.from(container!.querySelectorAll<HTMLButtonElement>('button'))
+      .find(item => item.textContent === 'Start verification')?.disabled).toBe(false)
+    await act(async () => view.root.unmount())
+  })
+
+  it.each([
+    ['ImplementationApproved', 'replacement-verification-plan', 'Generating verification plan 2…'],
+    ['AwaitingManualVerification', 'start-verification', 'Starting verification…'],
+  ] as const)('shows accessible pending feedback for %s', async (status, activeAction, label) => {
+    const view = await render(status, {}, activeAction)
+    const button = Array.from(container!.querySelectorAll('button')).find(item => item.textContent === label)
+    expect(button?.disabled).toBe(true)
+    expect(button?.getAttribute('aria-busy')).toBe('true')
+    await act(async () => view.root.unmount())
+  })
+
   it('uses backend eligibility to distinguish active, ambiguous, and explicitly retryable generation', async () => {
     const activeEligibility = {
       canGenerateVerificationPlan: false, canStartVerificationAttempt: false, canRecordVerificationResult: false,
@@ -187,6 +251,30 @@ describe('VerificationPanel', () => {
     await act(async () => button.click())
     expect(retry.props.onGenerate).toHaveBeenCalledOnce()
     await act(async () => retry.root.unmount())
+  })
+
+  it('offers an explicit Fake-mode replacement after locally rejected provider output', async () => {
+    const selected = task('VerificationPlanning', { verificationEligibility: {
+      canGenerateVerificationPlan: true, canStartVerificationAttempt: false, canRecordVerificationResult: false,
+      canCompleteVerificationPassed: false, canCompleteVerificationFailed: false, readyForDelivery: false,
+      ineligibilityReason: 'The completed provider output was rejected locally.',
+      isInitialVerificationPlanGeneration: false, canRetryVerificationPlanGeneration: true,
+      verificationGenerationStatus: 'RejectedProviderOutput',
+      verificationGenerationStatusMessage: 'OpenAI completed the request, but Forge rejected the generated plan. You may explicitly generate a new plan; another provider request may incur a charge.',
+    } })
+    const capabilities = {
+      verificationPlanningProvider: 'Fake', planningProvider: 'Fake',
+    } as SystemCapabilities
+    const view = await renderSelected(selected, null, capabilities)
+
+    expect(container?.textContent).toContain('OpenAI completed the request, but Forge rejected the generated plan.')
+    expect(container?.textContent).not.toContain('ambiguous')
+    const button = [...container!.querySelectorAll('button')]
+      .find(item => item.textContent === 'Generate replacement plan with Fake mode')!
+    expect(button.disabled).toBe(false)
+    await act(async () => button.click())
+    expect(view.props.onGenerate).toHaveBeenCalledOnce()
+    await act(async () => view.root.unmount())
   })
 
   it('labels initial generation separately from a safe retry', async () => {
@@ -317,6 +405,79 @@ describe('VerificationPanel', () => {
     await act(async () => view.root.unmount())
   })
 
+  it('uses a compact responsive failed-case editor without removing any failure field', async () => {
+    const view = await render('AwaitingManualVerification', activeOverrides())
+    const result = container!.querySelector<HTMLSelectElement>('.verification-form-grid select')!
+    await act(async () => {
+      result.value = 'Failed'
+      result.dispatchEvent(new Event('change', { bubbles: true }))
+    })
+
+    const card = container!.querySelector('.compact-failure-card')!
+    expect(card).toBeTruthy()
+    expect(card.querySelector('legend')?.textContent).toContain('Failure details required')
+    expect(card.querySelector('legend')?.textContent).toContain('FAILED OR BLOCKED')
+    expect(card.querySelector('.failure-title')?.textContent).toContain('Title')
+    for (const label of ['Expected result', 'Actual result', 'Reproduction steps', 'Environment notes', 'Error message', 'Severity'])
+      expect(card.textContent).toContain(label)
+    expect(card.querySelector('.verification-failure-grid.responsive-form-grid')).toBeTruthy()
+    const footer = card.querySelector('.verification-failure-footer')!
+    expect(footer.textContent).toContain('Severity')
+    expect(footer.textContent).toContain('Results are appended to immutable history.')
+    const save = footer.querySelector<HTMLButtonElement>('button')!
+    expect(save.textContent).toBe('Save case result')
+    expect(save.disabled).toBe(true)
+    expect(save.hasAttribute('aria-busy')).toBe(true)
+    await act(async () => view.root.unmount())
+  })
+
+  it('keeps completion confirmation and pass or fail actions compact and explicit', async () => {
+    const view = await render('AwaitingManualVerification', activeOverrides())
+    const completion = container!.querySelector('.verification-completion')!
+    const confirmation = completion.querySelector<HTMLLabelElement>('.verification-confirmation')!
+    expect(confirmation.querySelector('input[type="checkbox"]')).toBeTruthy()
+    expect(confirmation.textContent).toContain('recorded by a human')
+    expect(completion.querySelector('textarea')?.getAttribute('rows')).toBe('2')
+    const actions = completion.querySelector('.verification-completion-actions')!
+    expect(actions.textContent).toContain('Complete as passed')
+    expect(actions.textContent).toContain('Complete as failed')
+    await act(async () => view.root.unmount())
+  })
+
+  it('offers the bound implementation diff globally and inside changed-file review cases', async () => {
+    const changedFilePlan = { ...multiCasePlan, testCases: [
+      { ...multiCasePlan.testCases[0], title: 'Changed file review', objective: 'Review the bounded diff.' },
+      multiCasePlan.testCases[1],
+    ] }
+    const view = await render('AwaitingManualVerification', activeOverrides([], changedFilePlan))
+    const actions = [...container!.querySelectorAll<HTMLButtonElement>('button')]
+      .filter(button => button.textContent === 'View approved implementation diff')
+
+    expect(actions).toHaveLength(2)
+    expect(container!.textContent).toContain('Review the exact approved diff used by this verification plan.')
+    expect(container!.querySelectorAll('.verification-document-actions button')).toHaveLength(3)
+    await act(async () => actions[1].click())
+    expect(view.props.onViewImplementation).toHaveBeenCalledOnce()
+    expect(view.props.onViewImplementation).toHaveBeenCalledWith(changedFilePlan)
+    await act(async () => view.root.unmount())
+  })
+
+  it('keeps a completed failed case collapsed to one textual summary control', async () => {
+    const view = await render('ManualVerificationFailed', failedOverrides())
+    const summary = container!.querySelector<HTMLButtonElement>('.verification-case-summary')!
+
+    await act(async () => summary.click())
+
+    expect(summary.textContent).toContain('01')
+    expect(summary.textContent).toContain('Manual check')
+    expect(summary.textContent).toContain('Required')
+    expect(summary.textContent).toContain('Failed')
+    expect(summary.getAttribute('aria-expanded')).toBe('false')
+    expect(container!.querySelectorAll('.verification-case-summary')).toHaveLength(1)
+    expect(summary.closest('.verification-case-card')!.querySelector('.verification-result-summary')).toBeNull()
+    await act(async () => view.root.unmount())
+  })
+
   it('renders keyboard-operable case disclosures with only one case expanded', async () => {
     const view = await render('AwaitingManualVerification', activeOverrides())
     const summaries = [...container!.querySelectorAll<HTMLButtonElement>('.verification-case-summary')]
@@ -399,10 +560,10 @@ describe('VerificationPanel', () => {
     await act(async () => root.unmount())
   })
 
-  it('preserves failed detail in a compact disclosure without offering analysis or correction', async () => {
+  it('preserves failed detail while the governed correction workflow remains available', async () => {
     const { root } = await render('ManualVerificationFailed', failedOverrides())
     expect(container?.textContent).toContain('MANUAL VERIFICATION FAILED · USER REPORTED')
-    expect(container?.textContent).toContain('Failure analysis and implementation correction are unavailable')
+    expect(container?.textContent).toContain('failed attempt is immutable')
     const summary = container!.querySelector<HTMLButtonElement>('.verification-case-summary')!
     expect(summary.textContent).toContain('Failed')
     expect(summary.getAttribute('aria-expanded')).toBe('true')

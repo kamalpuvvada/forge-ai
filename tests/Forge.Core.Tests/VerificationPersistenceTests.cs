@@ -970,6 +970,115 @@ public sealed class VerificationPersistenceTests : IDisposable
         Assert.Equal(response.ProviderResponseId, call.ProviderResponseId);
     }
 
+    [Fact]
+    public async Task Rejected_provider_output_preserves_telemetry_replays_without_dispatch_and_allows_explicit_new_command()
+    {
+        var (repository, task, revision) = await ApprovedPersistedTaskAsync();
+        var rejectedGateway = new VerificationQueueGateway("invalid-claim");
+        var command = new VerificationPlanGenerationCommand(Guid.NewGuid(), task.Id, task.RowVersion,
+            revision.RevisionId, revision.ResultFingerprint!);
+
+        var exception = await Assert.ThrowsAsync<VerificationException>(() => OpenAIService(repository, rejectedGateway)
+            .GeneratePlanAsync(command));
+        Assert.Contains("another provider request may incur a charge", exception.Message, StringComparison.Ordinal);
+        var restartedRepository = new SqliteEngineeringTaskRepository(ConnectionString);
+        var rejected = (await restartedRepository.GetAsync(task.Id))!;
+        var rejectedAttempt = Assert.Single(rejected.VerificationPlanGenerationAttempts);
+        Assert.Equal(VerificationGenerationAttemptStatus.RejectedProviderOutput, rejectedAttempt.Status);
+        Assert.Equal(1, rejectedAttempt.PhysicalRequestCount);
+        Assert.Equal(0, rejectedAttempt.PossiblyDispatchedRequestCount);
+        var response = Assert.Single(rejectedAttempt.ProviderResponses);
+        Assert.Equal("req_verification", response.ProviderRequestId);
+        Assert.Equal("resp_verification", response.ProviderResponseId);
+        Assert.True(response.UsageAvailable);
+        Assert.Equal(101, response.InputTokens);
+        Assert.Equal(37, response.OutputTokens);
+        var rejectedCall = Assert.Single(rejected.ModelCalls);
+        Assert.Equal(response.LogicalCallId, rejectedCall.Id);
+        Assert.Equal(response.ProviderRequestId, rejectedCall.ProviderRequestId);
+        Assert.Equal(response.ProviderResponseId, rejectedCall.ProviderResponseId);
+        Assert.Equal(VerificationCallDispatchDisposition.ResponseReceived,
+            rejectedCall.VerificationDispatchDisposition);
+        Assert.NotNull(rejectedCall.EstimatedCostUsd);
+
+        await OpenAIService(restartedRepository, rejectedGateway).GeneratePlanAsync(command);
+        Assert.Equal(1, rejectedGateway.RequestCount);
+
+        var retryGateway = new VerificationQueueGateway("success");
+        var explicitRetry = new VerificationPlanGenerationCommand(Guid.NewGuid(), rejected.Id,
+            rejected.RowVersion, revision.RevisionId, revision.ResultFingerprint!);
+        var completed = await OpenAIService(restartedRepository, retryGateway).GeneratePlanAsync(explicitRetry);
+
+        Assert.Equal(1, retryGateway.RequestCount);
+        Assert.Equal(2, completed.VerificationPlanGenerationAttempts.Count);
+        Assert.Equal(VerificationGenerationAttemptStatus.RejectedProviderOutput,
+            completed.VerificationPlanGenerationAttempts[0].Status);
+        Assert.Equal(VerificationGenerationAttemptStatus.Completed,
+            completed.VerificationPlanGenerationAttempts[1].Status);
+        Assert.Equal(2, completed.ModelCalls.Count);
+        Assert.Single(completed.VerificationPlans);
+    }
+
+    [Fact]
+    public async Task Rejected_completed_output_replays_without_dispatch_and_legacy_shape_allows_one_explicit_retry()
+    {
+        var (repository, task, revision) = await ApprovedPersistedTaskAsync();
+        var gateway = new VerificationQueueGateway("invalid-claim");
+        var command = new VerificationPlanGenerationCommand(Guid.NewGuid(), task.Id, task.RowVersion,
+            revision.RevisionId, revision.ResultFingerprint!);
+
+        await Assert.ThrowsAsync<VerificationException>(() => OpenAIService(repository, gateway)
+            .GeneratePlanAsync(command));
+        var rejected = (await new SqliteEngineeringTaskRepository(ConnectionString).GetAsync(task.Id))!;
+        var rejectedAttempt = Assert.Single(rejected.VerificationPlanGenerationAttempts);
+        Assert.Equal(VerificationGenerationAttemptStatus.RejectedProviderOutput, rejectedAttempt.Status);
+        Assert.Equal(1, rejectedAttempt.PhysicalRequestCount);
+        Assert.Equal(0, rejectedAttempt.PossiblyDispatchedRequestCount);
+        Assert.Equal(VerificationProviderResponseStatus.Completed,
+            Assert.Single(rejectedAttempt.ProviderResponses).Status);
+        var rejectedCall = Assert.Single(rejected.ModelCalls);
+        Assert.Equal(VerificationCallDispatchDisposition.ResponseReceived,
+            rejectedCall.VerificationDispatchDisposition);
+        Assert.NotNull(rejectedCall.EstimatedCostUsd);
+
+        await OpenAIService(new SqliteEngineeringTaskRepository(ConnectionString), gateway).GeneratePlanAsync(command);
+        Assert.Equal(1, gateway.RequestCount);
+
+        await using (var connection = new SqliteConnection(ConnectionString))
+        {
+            await connection.OpenAsync();
+            await using var legacy = connection.CreateCommand();
+            legacy.CommandText = """
+                UPDATE VerificationPlanGenerationCommands
+                SET Status = 'AmbiguousAfterDispatch',
+                    Json = json_set(Json, '$.status', $status)
+                WHERE CommandId = $commandId;
+                """;
+            legacy.Parameters.AddWithValue("$commandId", command.CommandId.ToString("D"));
+            legacy.Parameters.AddWithValue("$status", (int)VerificationGenerationAttemptStatus.AmbiguousAfterDispatch);
+            Assert.Equal(1, await legacy.ExecuteNonQueryAsync());
+        }
+
+        var restartedRepository = new SqliteEngineeringTaskRepository(ConnectionString);
+        var legacyTask = (await restartedRepository.GetAsync(task.Id))!;
+        var legacyAttempt = Assert.Single(legacyTask.VerificationPlanGenerationAttempts);
+        Assert.Equal(VerificationGenerationAttemptStatus.AmbiguousAfterDispatch, legacyAttempt.Status);
+        Assert.True(VerificationGenerationAttemptSemantics.IsLegacyRejectedProviderOutput(
+            legacyAttempt, legacyTask.ModelCalls));
+
+        var explicitRetry = new VerificationPlanGenerationCommand(Guid.NewGuid(), legacyTask.Id,
+            legacyTask.RowVersion, revision.RevisionId, revision.ResultFingerprint!);
+        var completed = await Service(restartedRepository).GeneratePlanAsync(explicitRetry);
+
+        Assert.Equal(2, completed.VerificationPlanGenerationAttempts.Count);
+        Assert.Equal(VerificationGenerationAttemptStatus.AmbiguousAfterDispatch,
+            completed.VerificationPlanGenerationAttempts[0].Status);
+        Assert.Equal(VerificationGenerationAttemptStatus.Completed,
+            completed.VerificationPlanGenerationAttempts[1].Status);
+        Assert.Equal(rejectedCall.EstimatedCostUsd, completed.ModelCalls.Single().EstimatedCostUsd);
+        Assert.Single(completed.VerificationPlans);
+    }
+
     [Theory]
     [InlineData(true, VerificationGenerationAttemptStatus.FailedBeforeDispatch, 0)]
     [InlineData(false, VerificationGenerationAttemptStatus.RetryableProviderResponse, 2)]
@@ -1261,7 +1370,9 @@ public sealed class VerificationPersistenceTests : IDisposable
             var output = outcome as string == "malformed" ? "{ malformed" : JsonSerializer.Serialize(new
             {
                 contextFingerprint = fingerprint,
-                summary = "Concise manual verification guidance.", scope = "Exact approved revision only.",
+                summary = outcome as string == "invalid-claim"
+                    ? "Manual verification has already passed."
+                    : "Concise manual verification guidance.", scope = "Exact approved revision only.",
                 preconditions = new[] { "Use the exact approved revision." },
                 testCases = new[]
                 {

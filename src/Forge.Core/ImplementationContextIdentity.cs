@@ -56,6 +56,28 @@ public static class ImplementationContextIdentity
         }
         foreach (var convention in context.ProjectConventions ?? []) Append(hash, convention);
         Append(hash, context.OmittedOptionalContextCount.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        if (context.Correction is { } correction)
+        {
+            Append(hash, "CORRECTION");
+            Append(hash, correction.ProposalId.ToString("D"));
+            Append(hash, correction.ProposalFingerprint);
+            Append(hash, correction.PreviousRevisionId.ToString("D"));
+            Append(hash, correction.PreviousResultFingerprint);
+            foreach (var operation in correction.CorrectionOperations.OrderBy(item => RepositoryPathRules.Normalize(item.Path), StringComparer.Ordinal))
+            {
+                Append(hash, RepositoryPathRules.Normalize(operation.Path));
+                Append(hash, operation.Action.ToString());
+            }
+            foreach (var item in correction.PreviousFinalContent.OrderBy(item => RepositoryPathRules.Normalize(item.Key), StringComparer.Ordinal))
+            {
+                Append(hash, RepositoryPathRules.Normalize(item.Key));
+                Append(hash, item.Value ?? "DELETED");
+            }
+            Append(hash, correction.RootCauseSummary);
+            Append(hash, correction.CorrectionStrategy);
+            Append(hash, correction.ExpectedBehavior);
+            Append(hash, correction.VerificationImpact);
+        }
         return Convert.ToHexString(hash.GetHashAndReset()).ToLowerInvariant();
     }
 

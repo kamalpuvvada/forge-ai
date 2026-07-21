@@ -5,7 +5,8 @@ public enum ModelCallStage
     Clarification,
     Planning,
     Implementation,
-    VerificationPlanning
+    VerificationPlanning,
+    FailureAnalysis
 }
 
 public sealed record ModelPricingSnapshot(

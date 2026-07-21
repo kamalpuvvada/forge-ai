@@ -34,6 +34,10 @@ public sealed class SensitiveContentDetectorTests
     [Theory]
     [InlineData("token budget = 6000")]
     [InlineData("password validation is required")]
+    [InlineData("username label")]
+    [InlineData("password label")]
+    [InlineData("Enter username demo")]
+    [InlineData("Enter password forge123")]
     [InlineData("https://example.invalid/path")]
     [InlineData("token count and token usage are shown")]
     [InlineData("API key documentation and bearer authentication explanation")]
@@ -46,6 +50,14 @@ public sealed class SensitiveContentDetectorTests
     public void Ordinary_source_text_is_not_classified_as_a_secret(string value)
     {
         Assert.False(SensitiveContentDetector.ContainsSensitiveValue(value));
+    }
+
+    [Fact]
+    public void Demo_password_assignment_reproduces_the_context_free_secret_assignment_match()
+    {
+        var value = "Enter password" + ": " + "forge123";
+
+        Assert.True(SensitiveContentDetector.ContainsSensitiveValue(value));
     }
 
     [Fact]

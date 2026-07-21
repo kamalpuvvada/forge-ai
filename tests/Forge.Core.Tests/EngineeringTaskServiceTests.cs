@@ -97,7 +97,7 @@ public sealed class EngineeringTaskServiceTests
         var repository = new InMemoryRepository();
         var now = DateTimeOffset.UtcNow;
         var task = EngineeringTask.Create("C:/repo", "Add report export", now);
-        task.ApplyClarificationEvaluation(ClarificationEvaluation.Summarize("Add report export"), now);
+        task.ApplyClarificationEvaluation(ClarificationEvaluation.Summarize("Modify only `src/App.cs` to add report export."), now);
         task.ApproveRequirementSummary(now);
         task.BeginRepositoryAnalysis(now);
         var snapshot = PlanningWorkflowTests.Snapshot(now);
@@ -125,7 +125,7 @@ public sealed class EngineeringTaskServiceTests
         var repository = new InMemoryRepository();
         var now = DateTimeOffset.UtcNow;
         var task = EngineeringTask.Create("C:/repo", "Add report export", now);
-        task.ApplyClarificationEvaluation(ClarificationEvaluation.Summarize("Add report export"), now);
+        task.ApplyClarificationEvaluation(ClarificationEvaluation.Summarize("Modify only `src/App.cs` to add report export."), now);
         task.ApproveRequirementSummary(now);
         task.BeginRepositoryAnalysis(now);
         var snapshot = PlanningWorkflowTests.Snapshot(now);
@@ -264,7 +264,7 @@ public sealed class EngineeringTaskServiceTests
             new RepositoryAnalysisLimits());
 
         var exception = await Assert.ThrowsAsync<PlanningException>(() =>
-            service.RequestPlanRevisionAsync(task.Id, "Exclude src/App.cs."));
+            service.RequestPlanRevisionAsync(task.Id, "Do not propose or run validation commands."));
         var restored = await repository.GetAsync(task.Id);
 
         Assert.Equal("plan_constraint_violation", exception.Category);
@@ -437,7 +437,7 @@ public sealed class EngineeringTaskServiceTests
     private static EngineeringTask ReviewTask(DateTimeOffset now)
     {
         var task = EngineeringTask.Create("C:/repo", "Add pricing snapshot export", now);
-        task.ApplyClarificationEvaluation(ClarificationEvaluation.Summarize("Add pricing snapshot export"), now);
+        task.ApplyClarificationEvaluation(ClarificationEvaluation.Summarize("Modify only `src/App.cs` to add pricing snapshot export."), now);
         task.ApproveRequirementSummary(now);
         task.BeginRepositoryAnalysis(now);
         var snapshot = PlanningWorkflowTests.Snapshot(now);
@@ -454,7 +454,8 @@ public sealed class EngineeringTaskServiceTests
         RepositoryTextFile selectedFile)
     {
         var task = EngineeringTask.Create("C:/repo", "Export the task report from the UI", now);
-        task.ApplyClarificationEvaluation(ClarificationEvaluation.Summarize("Export the task report through the frontend API helper."), now);
+        task.ApplyClarificationEvaluation(ClarificationEvaluation.Summarize(
+            "Modify only `web/src/api.ts` to export the task report through the frontend API helper."), now);
         task.ApproveRequirementSummary(now);
         task.BeginRepositoryAnalysis(now);
         task.StoreRepositorySnapshot(snapshot, now);
@@ -534,10 +535,12 @@ public sealed class EngineeringTaskServiceTests
             CancellationToken cancellationToken = default)
         {
             CallCount++;
+            var fixtureScope = "Modify only:\n" + string.Join('\n',
+                context.Evidence.Select(item => $"- {item.RelativePath}"));
             var unconstrained = context with
             {
-                OriginalRequirement = "Update selected files.",
-                ApprovedRequirementSummary = "Update selected files.",
+                OriginalRequirement = fixtureScope,
+                ApprovedRequirementSummary = fixtureScope,
                 LatestPlanRevision = null,
                 PreviousPlanAffectedPaths = null
             };

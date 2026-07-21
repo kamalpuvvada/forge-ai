@@ -20,7 +20,7 @@ internal enum VerificationResponsePersistencePoint
     AfterCommit
 }
 
-public sealed partial class SqliteEngineeringTaskRepository : IEngineeringTaskRepository, IImplementationApprovalRepository, IVerificationRepository
+public sealed partial class SqliteEngineeringTaskRepository : IEngineeringTaskRepository, IImplementationApprovalRepository, IVerificationRepository, ICorrectionWorkflowRepository, IDeliveryRepository
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     private const int MaximumHistoryCount = 50;
@@ -31,17 +31,20 @@ public sealed partial class SqliteEngineeringTaskRepository : IEngineeringTaskRe
     private readonly string connectionString;
     private readonly ImplementationLimits implementationLimits;
     private readonly VerificationLimits verificationLimits;
+    private readonly CorrectionLimits correctionLimits;
     private readonly TimeProvider? timeProvider;
     private readonly Func<CancellationToken, Task>? afterImplementationBoundsRead;
     private readonly Func<SqliteConnection, SqliteTransaction, CancellationToken, Task>? afterApprovalBindingInsert;
     private readonly Func<VerificationResponsePersistencePoint, CancellationToken, Task>? verificationResponseHook;
 
     public SqliteEngineeringTaskRepository(string connectionString, ImplementationLimits? implementationLimits = null,
-        TimeProvider? timeProvider = null, VerificationLimits? verificationLimits = null)
+        TimeProvider? timeProvider = null, VerificationLimits? verificationLimits = null,
+        CorrectionLimits? correctionLimits = null)
     {
         this.connectionString = connectionString;
         this.implementationLimits = implementationLimits ?? new ImplementationLimits();
         this.verificationLimits = verificationLimits ?? new VerificationLimits();
+        this.correctionLimits = correctionLimits ?? new CorrectionLimits();
         this.timeProvider = timeProvider;
     }
 
@@ -137,7 +140,7 @@ public sealed partial class SqliteEngineeringTaskRepository : IEngineeringTaskRe
         await using var connection = new SqliteConnection(connectionString);
         await connection.OpenAsync(cancellationToken);
         var task = await ReadTaskAsync(connection, null, id, cancellationToken);
-        if (task?.Status == WorkflowStatus.ImplementationApproved)
+        if (task?.ApprovedImplementationRevisionId is not null)
             await ValidateCommittedApprovalAsync(connection, task, cancellationToken);
         return task;
     }
@@ -231,7 +234,8 @@ public sealed partial class SqliteEngineeringTaskRepository : IEngineeringTaskRe
             Guid.Parse(reader.GetString(reader.GetOrdinal("Id"))),
             implementationRevisions,
             ReadNullableGuid(reader, "ActiveImplementationRevisionId"),
-            ReadNullableGuid(reader, "ApprovedImplementationRevisionId"));
+            ReadNullableGuid(reader, "ApprovedImplementationRevisionId"),
+            ReadNullableGuid(reader, "PendingImplementationRevisionId"));
         var task = EngineeringTask.Rehydrate(
             Guid.Parse(reader.GetString(reader.GetOrdinal("Id"))),
             reader.GetString(reader.GetOrdinal("Repository")),
@@ -270,13 +274,22 @@ public sealed partial class SqliteEngineeringTaskRepository : IEngineeringTaskRe
             currentVerificationPlanId: ReadNullableGuid(reader, "CurrentVerificationPlanId"),
             currentVerificationAttemptId: ReadNullableGuid(reader, "CurrentVerificationAttemptId"),
             verificationDataFormatVersion: ReadRequiredInt32(reader,
-                reader.GetOrdinal("VerificationDataFormatVersion")));
+                reader.GetOrdinal("VerificationDataFormatVersion")),
+            pendingImplementationRevisionId: ReadNullableGuid(reader, "PendingImplementationRevisionId"),
+            currentFailureAnalysisId: ReadNullableGuid(reader, "CurrentFailureAnalysisId"),
+            currentCorrectionProposalId: ReadNullableGuid(reader, "CurrentCorrectionProposalId"),
+            correctionDataFormatVersion: ReadRequiredInt32(reader, reader.GetOrdinal("CorrectionDataFormatVersion")),
+            currentDeliveryProposalId: ReadNullableGuid(reader, "CurrentDeliveryProposalId"),
+            currentDeliveryAttemptId: ReadNullableGuid(reader, "CurrentDeliveryAttemptId"),
+            deliveryDataFormatVersion: ReadRequiredInt32(reader, reader.GetOrdinal("DeliveryDataFormatVersion")));
         await reader.DisposeAsync();
         var verificationPresence = await ReadVerificationArtifactPresenceAsync(
             connection, transaction, task.Id, cancellationToken);
         PersistedVerificationValidator.ValidateFormatBoundary(task, verificationPresence.HasChildRows,
             verificationPresence.HasCommandBindings);
         var verification = await ReadVerificationStateAsync(connection, transaction, task.Id, cancellationToken);
+        var correction = await ReadCorrectionStateAsync(connection, transaction, task.Id, cancellationToken);
+        var delivery = await ReadDeliveryStateAsync(connection, transaction, task.Id, cancellationToken);
         task = EngineeringTask.Rehydrate(
             task.Id, task.Repository, task.OriginalRequirement, task.CurrentClarifiedRequirement,
             task.ClarificationAnswers, task.RequirementRevisionNotes, task.ModelCalls,
@@ -290,8 +303,16 @@ public sealed partial class SqliteEngineeringTaskRepository : IEngineeringTaskRe
             task.ActiveImplementationRevisionId, task.ApprovedImplementationRevisionId,
             verification.Plans, verification.GenerationAttempts, verification.Attempts,
             task.CurrentVerificationPlanId, task.CurrentVerificationAttemptId,
-            task.VerificationDataFormatVersion);
+            task.VerificationDataFormatVersion, task.PendingImplementationRevisionId,
+            correction.Analyses, correction.Proposals, correction.FailureAttempts, correction.CorrectionAttempts,
+            correction.ApprovalCommands,
+            task.CurrentFailureAnalysisId,
+            task.CurrentCorrectionProposalId, task.CorrectionDataFormatVersion,
+            delivery.Proposals, delivery.Attempts, delivery.Approvals,
+            task.CurrentDeliveryProposalId, task.CurrentDeliveryAttemptId, task.DeliveryDataFormatVersion);
         PersistedVerificationValidator.Validate(task, verificationLimits);
+        PersistedCorrectionValidator.Validate(task, correctionLimits);
+        PersistedDeliveryValidator.Validate(task);
         return task;
     }
 
@@ -342,6 +363,10 @@ public sealed partial class SqliteEngineeringTaskRepository : IEngineeringTaskRe
             await InsertApprovalBindingAsync(connection, transaction, command, cancellationToken);
             if (afterApprovalBindingInsert is not null)
                 await afterApprovalBindingInsert(connection, transaction, cancellationToken);
+            if (task.ImplementationRevisions.Count == 2)
+                foreach (var verificationPlan in task.VerificationPlans)
+                    await UpdateVerificationPlanAsync(connection, transaction, task.Id,
+                        verificationPlan, cancellationToken);
             await SaveTaskAsync(task, connection, transaction, cancellationToken);
             var approvedRevisionAfterSave = task.ImplementationRevisions.Single(revision =>
                 revision.RevisionId == command.RevisionId);
@@ -390,12 +415,14 @@ public sealed partial class SqliteEngineeringTaskRepository : IEngineeringTaskRe
         CancellationToken cancellationToken)
     {
         PersistedVerificationValidator.Validate(task, verificationLimits);
+        PersistedCorrectionValidator.Validate(task, correctionLimits);
         PersistedImplementationValidator.Validate(
             task.Status, task.PlanApprovedAt, task.ImplementationPlan, task.ImplementationWorkspace,
             task.ImplementationResult, task.LastImplementationFailure, task.ImplementationLease,
             implementationLimits, task.ImplementationStartedAt, task.ImplementationCompletedAt,
             timeProvider?.GetUtcNow(), task.UpdatedAt, task.Id, task.ImplementationRevisions,
-            task.ActiveImplementationRevisionId, task.ApprovedImplementationRevisionId);
+            task.ActiveImplementationRevisionId, task.ApprovedImplementationRevisionId,
+            task.PendingImplementationRevisionId);
         var workspaceJson = SerializeImplementation(task.ImplementationWorkspace);
         var resultJson = SerializeImplementation(task.ImplementationResult);
         var failureJson = SerializeImplementation(task.LastImplementationFailure);
@@ -416,7 +443,10 @@ public sealed partial class SqliteEngineeringTaskRepository : IEngineeringTaskRe
                 ImplementationWorkspace, ImplementationResult, LastImplementationFailure,
                 ImplementationStartedAt, ImplementationCompletedAt, ImplementationLease,
                 ImplementationRevisions, ActiveImplementationRevisionId, ApprovedImplementationRevisionId,
-                CurrentVerificationPlanId, CurrentVerificationAttemptId, VerificationDataFormatVersion, RowVersion)
+                PendingImplementationRevisionId, CurrentVerificationPlanId, CurrentVerificationAttemptId,
+                VerificationDataFormatVersion, CurrentFailureAnalysisId, CurrentCorrectionProposalId,
+                CorrectionDataFormatVersion, CurrentDeliveryProposalId, CurrentDeliveryAttemptId,
+                DeliveryDataFormatVersion, RowVersion)
             VALUES (
                 $id, $repository, $original, $clarified, $answers, $revisions, $planRevisions, $modelCalls, $question, $summary,
                 $status, $created, $updated, $requirementApproved, $planApproved,
@@ -425,7 +455,10 @@ public sealed partial class SqliteEngineeringTaskRepository : IEngineeringTaskRe
                 $implementationWorkspace, $implementationResult, $implementationFailure,
                 $implementationStarted, $implementationCompleted, $implementationLease,
                 $implementationRevisions, $activeImplementationRevisionId, $approvedImplementationRevisionId,
-                $currentVerificationPlanId, $currentVerificationAttemptId, $verificationDataFormatVersion, 1)
+                $pendingImplementationRevisionId, $currentVerificationPlanId, $currentVerificationAttemptId,
+                $verificationDataFormatVersion, $currentFailureAnalysisId, $currentCorrectionProposalId,
+                $correctionDataFormatVersion, $currentDeliveryProposalId, $currentDeliveryAttemptId,
+                $deliveryDataFormatVersion, 1)
             ON CONFLICT(Id) DO UPDATE SET
                 Repository = excluded.Repository,
                 OriginalRequirement = excluded.OriginalRequirement,
@@ -458,9 +491,16 @@ public sealed partial class SqliteEngineeringTaskRepository : IEngineeringTaskRe
                 ImplementationRevisions = excluded.ImplementationRevisions,
                 ActiveImplementationRevisionId = excluded.ActiveImplementationRevisionId,
                 ApprovedImplementationRevisionId = excluded.ApprovedImplementationRevisionId,
+                PendingImplementationRevisionId = excluded.PendingImplementationRevisionId,
                 CurrentVerificationPlanId = excluded.CurrentVerificationPlanId,
                 CurrentVerificationAttemptId = excluded.CurrentVerificationAttemptId,
                 VerificationDataFormatVersion = excluded.VerificationDataFormatVersion,
+                CurrentFailureAnalysisId = excluded.CurrentFailureAnalysisId,
+                CurrentCorrectionProposalId = excluded.CurrentCorrectionProposalId,
+                CorrectionDataFormatVersion = excluded.CorrectionDataFormatVersion,
+                CurrentDeliveryProposalId = excluded.CurrentDeliveryProposalId,
+                CurrentDeliveryAttemptId = excluded.CurrentDeliveryAttemptId,
+                DeliveryDataFormatVersion = excluded.DeliveryDataFormatVersion,
                 RowVersion = EngineeringTasks.RowVersion + 1
             WHERE EngineeringTasks.RowVersion = $expectedRowVersion
               AND EngineeringTasks.VerificationDataFormatVersion <= excluded.VerificationDataFormatVersion
@@ -503,11 +543,23 @@ public sealed partial class SqliteEngineeringTaskRepository : IEngineeringTaskRe
             task.ActiveImplementationRevisionId is { } activeRevisionId ? activeRevisionId.ToString("D") : DBNull.Value);
         command.Parameters.AddWithValue("$approvedImplementationRevisionId",
             task.ApprovedImplementationRevisionId is { } approvedRevisionId ? approvedRevisionId.ToString("D") : DBNull.Value);
+        command.Parameters.AddWithValue("$pendingImplementationRevisionId",
+            task.PendingImplementationRevisionId is { } pendingRevisionId ? pendingRevisionId.ToString("D") : DBNull.Value);
         command.Parameters.AddWithValue("$currentVerificationPlanId",
             task.CurrentVerificationPlanId is { } verificationPlanId ? verificationPlanId.ToString("D") : DBNull.Value);
         command.Parameters.AddWithValue("$currentVerificationAttemptId",
             task.CurrentVerificationAttemptId is { } verificationAttemptId ? verificationAttemptId.ToString("D") : DBNull.Value);
         command.Parameters.AddWithValue("$verificationDataFormatVersion", task.VerificationDataFormatVersion);
+        command.Parameters.AddWithValue("$currentFailureAnalysisId",
+            task.CurrentFailureAnalysisId is { } analysisId ? analysisId.ToString("D") : DBNull.Value);
+        command.Parameters.AddWithValue("$currentCorrectionProposalId",
+            task.CurrentCorrectionProposalId is { } proposalId ? proposalId.ToString("D") : DBNull.Value);
+        command.Parameters.AddWithValue("$correctionDataFormatVersion", task.CorrectionDataFormatVersion);
+        command.Parameters.AddWithValue("$currentDeliveryProposalId",
+            task.CurrentDeliveryProposalId is { } deliveryProposalId ? deliveryProposalId.ToString("D") : DBNull.Value);
+        command.Parameters.AddWithValue("$currentDeliveryAttemptId",
+            task.CurrentDeliveryAttemptId is { } deliveryAttemptId ? deliveryAttemptId.ToString("D") : DBNull.Value);
+        command.Parameters.AddWithValue("$deliveryDataFormatVersion", task.DeliveryDataFormatVersion);
         command.Parameters.AddWithValue("$expectedRowVersion", task.RowVersion);
         command.Parameters.AddWithValue("$expectedLeaseId",
             task.ExpectedImplementationLeaseIdForSave is { } expectedLease
@@ -1011,7 +1063,8 @@ public sealed partial class SqliteEngineeringTaskRepository : IEngineeringTaskRe
         if (binding is null || binding.TaskId != task.Id || binding.ExpectedRowVersion != expectedRowVersion ||
             binding.RevisionId != revision.RevisionId ||
             !string.Equals(binding.ResultFingerprint, resultFingerprint, StringComparison.Ordinal) ||
-            binding.ApprovedRowVersion != task.RowVersion || binding.ApprovalTimestamp != approvedAt)
+            binding.ApprovedRowVersion != expectedRowVersion + 1 ||
+            binding.ApprovedRowVersion > task.RowVersion || binding.ApprovalTimestamp != approvedAt)
             throw Corrupt();
     }
 

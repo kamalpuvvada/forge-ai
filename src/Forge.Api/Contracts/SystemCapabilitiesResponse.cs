@@ -35,4 +35,10 @@ public sealed record SystemCapabilitiesResponse(
     bool VerificationPlanningConfigured,
     bool ManualResultRecordingAvailable,
     bool AutomatedValidationAvailable,
-    bool FailureAnalysisAvailable);
+    bool FailureAnalysisAvailable,
+    bool FailureAnalysisConfigured,
+    bool ImplementationCorrectionConfigured,
+    bool DeliveryPullRequestConfigured,
+    bool AutoMergeAvailable,
+    bool DeliveryGitAvailable = false,
+    bool DeliveryGitHubCliAvailable = false);

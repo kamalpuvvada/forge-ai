@@ -33,6 +33,8 @@ public sealed class OpenAIImplementationEngine(
         context identity exactly. For modify and delete operations, echo the supplied original SHA-256 and UTF-8
         byte count exactly. Provide complete replacement text for create and modify operations; never return
         patches, shell commands, tool calls, Markdown fences, absolute paths, secrets, or unrelated files. Keep
+        If correction context is present, return the complete approved operation set, preserve previous final
+        content byte-for-byte outside the correction subset, and materially change at least one correction path.
         the summary, warnings, and rationales concise. Do not claim that validation, staging, commits, pushes,
         pull requests, builds, tests, or commands ran. Provider output remains untrusted until Forge validates it.
         """;
@@ -102,7 +104,17 @@ public sealed class OpenAIImplementationEngine(
 
     public async Task<ImplementationEvaluation> GenerateAsync(
         ImplementationContext context,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default) =>
+        await GenerateCoreAsync(context, null, cancellationToken);
+
+    public async Task<ImplementationEvaluation> GenerateCorrectionAsync(
+        ImplementationContext context, IImplementationGenerationObserver observer,
+        CancellationToken cancellationToken = default) =>
+        await GenerateCoreAsync(context, observer ?? throw new ArgumentNullException(nameof(observer)), cancellationToken);
+
+    private async Task<ImplementationEvaluation> GenerateCoreAsync(
+        ImplementationContext context, IImplementationGenerationObserver? observer,
+        CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
         ArgumentNullException.ThrowIfNull(context);
@@ -127,6 +139,8 @@ public sealed class OpenAIImplementationEngine(
             OpenAIResponseEnvelope? response = null;
             try
             {
+                if (observer is not null)
+                    await observer.RecordDispatchIntentAsync(callId, startedAt, CancellationToken.None);
                 response = await configuredGateway.CreateResponseAsync(new OpenAIResponseRequest(
                     options.ImplementationModel,
                     options.ImplementationReasoningEffort,
@@ -137,6 +151,8 @@ public sealed class OpenAIImplementationEngine(
                     "forge_implementation_operations",
                     "Bounded structured file operations for an approved implementation plan.",
                     clientRequestId), logicalDeadline.Token);
+                if (observer is not null)
+                    await observer.RecordResponseAsync(callId, ToTelemetry(callId, startedAt, response), CancellationToken.None);
 
                 var structuredOutput = RequireAcceptedOutput(response);
                 if (Encoding.UTF8.GetByteCount(structuredOutput) > MaximumRawResponseBytes)
@@ -155,12 +171,20 @@ public sealed class OpenAIImplementationEngine(
                     throw Failure("implementation_validation_rejected",
                         "OpenAI completed the request, but Forge rejected the proposed operations.", exception);
                 }
-                calls.Add(CreateCall(callId, startedAt, response, true, null, pricingSnapshot));
+                var successfulCall = CreateCall(callId, startedAt, response, true, null, pricingSnapshot,
+                    VerificationCallDispatchDisposition.ResponseReceived);
+                calls.Add(successfulCall);
+                if (observer is not null)
+                    await observer.RecordCallAsync(callId, successfulCall, CancellationToken.None);
                 return new ImplementationEvaluation(output, calls);
             }
             catch (OpenAITransportException exception) when (exception.Retryable && attempt + 1 < MaximumPhysicalRequests)
             {
-                calls.Add(CreateCall(callId, startedAt, response, false, MapTransportCategory(exception.Category), pricingSnapshot));
+                var failedCall = CreateCall(callId, startedAt, response, false, MapTransportCategory(exception.Category), pricingSnapshot,
+                    DispatchDisposition(exception));
+                calls.Add(failedCall);
+                if (observer is not null)
+                    await observer.RecordCallAsync(callId, failedCall, CancellationToken.None);
                 var delay = exception.RetryAfter is { } requested
                     ? TimeSpan.FromMilliseconds(Math.Min(requested.TotalMilliseconds, 5_000))
                     : TimeSpan.Zero;
@@ -181,7 +205,11 @@ public sealed class OpenAIImplementationEngine(
                 var category = cancellationToken.IsCancellationRequested
                     ? "implementation_cancelled"
                     : "implementation_timeout";
-                calls.Add(CreateCall(callId, startedAt, response, false, category, pricingSnapshot));
+                var failedCall = CreateCall(callId, startedAt, response, false, category, pricingSnapshot,
+                    VerificationCallDispatchDisposition.PossiblyDispatched);
+                calls.Add(failedCall);
+                if (observer is not null)
+                    await observer.RecordCallAsync(callId, failedCall, CancellationToken.None);
                 throw new ImplementationProviderException(
                     category == "implementation_cancelled" ? "OpenAI implementation was cancelled safely." : "The OpenAI implementation request timed out.",
                     category, calls, exception);
@@ -189,7 +217,13 @@ public sealed class OpenAIImplementationEngine(
             catch (Exception exception)
             {
                 var category = Category(exception);
-                calls.Add(CreateCall(callId, startedAt, response, false, category, pricingSnapshot));
+                var failedCall = CreateCall(callId, startedAt, response, false, category, pricingSnapshot,
+                    exception is OpenAITransportException transport ? DispatchDisposition(transport) :
+                    response is null ? VerificationCallDispatchDisposition.PossiblyDispatched :
+                    VerificationCallDispatchDisposition.ResponseReceived);
+                calls.Add(failedCall);
+                if (observer is not null)
+                    await observer.RecordCallAsync(callId, failedCall, CancellationToken.None);
                 throw new ImplementationProviderException(SafeMessage(category), category, calls, exception);
             }
         }
@@ -197,6 +231,24 @@ public sealed class OpenAIImplementationEngine(
         throw new ImplementationProviderException("OpenAI could not complete the implementation request.",
             "implementation_provider_error", calls);
     }
+
+    private VerificationProviderResponseTelemetry ToTelemetry(Guid id, DateTimeOffset startedAt,
+        OpenAIResponseEnvelope response) => new(id, startedAt, timeProvider.GetUtcNow(),
+        OpenAIProviderIdentifier.Normalize(response.ResponseId),
+        OpenAIProviderIdentifier.Normalize(response.ProviderRequestId), response.Status switch
+        {
+            OpenAIResponseStatus.Queued => VerificationProviderResponseStatus.Queued,
+            OpenAIResponseStatus.InProgress => VerificationProviderResponseStatus.InProgress,
+            OpenAIResponseStatus.Completed => VerificationProviderResponseStatus.Completed,
+            OpenAIResponseStatus.Incomplete => VerificationProviderResponseStatus.Incomplete,
+            OpenAIResponseStatus.Failed => VerificationProviderResponseStatus.Failed,
+            OpenAIResponseStatus.Cancelled => VerificationProviderResponseStatus.Cancelled,
+            _ => VerificationProviderResponseStatus.Unknown
+        }, response.IncompleteReason?.ToString(),
+        response.EffectiveUsageAvailability != VerificationUsageAvailability.Unavailable,
+        response.InputTokens, response.CachedInputTokens, response.OutputTokens, response.ReasoningTokens,
+        response.HttpStatusCode, VerificationCallDispatchDisposition.ResponseReceived,
+        response.EffectiveUsageAvailability);
 
     public void EnsureConfigured()
     {
@@ -247,7 +299,20 @@ public sealed class OpenAIImplementationEngine(
                 item.ContentHash
             }),
             evidenceBackedProjectConventions = context.ProjectConventions ?? [],
-            omittedOptionalContextCount = context.OmittedOptionalContextCount
+            omittedOptionalContextCount = context.OmittedOptionalContextCount,
+            correction = context.Correction is null ? null : new
+            {
+                proposalId = context.Correction.ProposalId,
+                proposalFingerprint = context.Correction.ProposalFingerprint,
+                previousRevisionId = context.Correction.PreviousRevisionId,
+                previousResultFingerprint = context.Correction.PreviousResultFingerprint,
+                affectedApprovedOperations = context.Correction.CorrectionOperations,
+                previousFinalContent = context.Correction.PreviousFinalContent,
+                context.Correction.RootCauseSummary,
+                context.Correction.CorrectionStrategy,
+                context.Correction.ExpectedBehavior,
+                context.Correction.VerificationImpact
+            }
         };
         return JsonSerializer.Serialize(payload, JsonOptions);
     }
@@ -352,6 +417,23 @@ public sealed class OpenAIImplementationEngine(
         if (optionalBytes > MaximumOptionalContextBytes)
             throw ContextLimit("Optional implementation context exceeds its limit.");
         foreach (var value in context.ProjectConventions ?? []) RejectSensitiveContext(value);
+        if (context.Correction is { } correction)
+        {
+            if (correction.ProposalId == Guid.Empty || correction.PreviousRevisionId == Guid.Empty ||
+                !IsLowerSha256(correction.ProposalFingerprint) || !IsLowerSha256(correction.PreviousResultFingerprint) ||
+                correction.CorrectionOperations.Count is < 1 or > 10 ||
+                correction.PreviousFinalContent.Count != context.Files.Count)
+                throw ContextLimit("The correction implementation context is incomplete.");
+            var correctionBytes = Encoding.UTF8.GetByteCount(JsonSerializer.Serialize(correction, JsonOptions));
+            if (correctionBytes > 96 * 1024)
+                throw ContextLimit("The correction implementation context exceeds its aggregate limit.");
+            RejectSensitiveContext(correction.RootCauseSummary);
+            RejectSensitiveContext(correction.CorrectionStrategy);
+            RejectSensitiveContext(correction.ExpectedBehavior);
+            RejectSensitiveContext(correction.VerificationImpact);
+            foreach (var content in correction.PreviousFinalContent.Values)
+                if (content is not null) RejectSensitiveContext(content);
+        }
     }
 
     private static string RequireAcceptedOutput(OpenAIResponseEnvelope response)
@@ -379,7 +461,8 @@ public sealed class OpenAIImplementationEngine(
         OpenAIResponseEnvelope? response,
         bool succeeded,
         string? category,
-        ModelPricingSnapshot pricing)
+        ModelPricingSnapshot pricing,
+        VerificationCallDispatchDisposition disposition)
     {
         decimal? cost = response?.UsageAvailable == true &&
                         costCalculator.TryCalculate(pricing, response.InputTokens, response.CachedInputTokens,
@@ -392,8 +475,17 @@ public sealed class OpenAIImplementationEngine(
             response?.UsageAvailable == true ? response.CachedInputTokens : null,
             response?.UsageAvailable == true ? response.OutputTokens : null,
             response?.UsageAvailable == true ? response.ReasoningTokens : null,
-            cost, category, pricing, OpenAIProviderIdentifier.Normalize(response?.ProviderRequestId));
+            cost, category, pricing, OpenAIProviderIdentifier.Normalize(response?.ProviderRequestId),
+            disposition, response?.HttpStatusCode, response?.UsageAvailable,
+            response?.EffectiveUsageAvailability);
     }
+
+    private static VerificationCallDispatchDisposition DispatchDisposition(OpenAITransportException exception) =>
+        exception.StatusCode is not null || exception.DispatchCertainty == OpenAITransportDispatchCertainty.ResponseReceived
+            ? VerificationCallDispatchDisposition.ResponseReceived
+            : exception.DispatchCertainty == OpenAITransportDispatchCertainty.DefinitelyBeforeRequestDispatch
+                ? VerificationCallDispatchDisposition.DefinitelyNotDispatched
+                : VerificationCallDispatchDisposition.PossiblyDispatched;
 
     private static string Category(Exception exception) => exception switch
     {

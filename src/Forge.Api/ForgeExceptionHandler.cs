@@ -31,6 +31,8 @@ public sealed class ForgeExceptionHandler(
                 _ => (400, "Repository path invalid", discovery.Message, "repository_missing_path")
             },
             ImplementationException implementation => MapImplementationFailure(implementation),
+            CorrectionException correction => MapCorrectionFailure(correction),
+            DeliveryException delivery => MapDeliveryFailure(delivery),
             VerificationException verification => MapVerificationFailure(verification),
             PlanningProviderException { Category: "missing_direct_evidence" } provider => (
                 422,
@@ -111,6 +113,48 @@ public sealed class ForgeExceptionHandler(
             "implementation_unsafe_path" =>
                 (400, "Unsafe implementation path", safe.Message, safe.Category),
             _ => (422, "Implementation generation rejected", safe.Message, safe.Category)
+        };
+    }
+
+    private static (int Status, string Title, string Detail, string Code) MapCorrectionFailure(
+        CorrectionException exception)
+    {
+        var message = SensitiveContentDetector.ContainsSensitiveValue(exception.Message)
+            ? "The correction workflow failed safely."
+            : exception.Message;
+        return exception.Category switch
+        {
+            "correction_stale_binding" or "correction_recovery_required" or "correction_revision_limit" =>
+                (409, "Correction state changed", message, exception.Category),
+            "failure_analysis_configuration" or "failure_analysis_rate_limit" or "failure_analysis_timeout" =>
+                (503, "Failure analysis unavailable", message, exception.Category),
+            "failure_analysis_authentication" or "failure_analysis_permission" or
+                "failure_analysis_model_unavailable" or "failure_analysis_provider_error" or
+                "failure_analysis_invalid_request" or "failure_analysis_invalid_structured_output" or
+                "failure_analysis_incomplete_response" or "failure_analysis_unexpected_output" =>
+                (502, "Failure-analysis provider failure", message, exception.Category),
+            "unsupported_failure_classification" or "correction_unsupported_classification" =>
+                (409, "Correction route unavailable", message, exception.Category),
+            _ => (422, "Correction rejected", message, exception.Category)
+        };
+    }
+
+    internal static (int Status, string Title, string Detail, string Code) MapDeliveryFailure(
+        DeliveryException exception)
+    {
+        var message = SensitiveContentDetector.ContainsSensitiveValue(exception.Message)
+            ? "Delivery failed safely."
+            : exception.Message;
+        return exception.Category switch
+        {
+            "delivery_authentication_unavailable" => (503, "GitHub authentication unavailable", message, exception.Category),
+            "delivery_remote_invalid" or "delivery_remote_conflict" or "delivery_branch_conflict" or
+                "delivery_push_destination_mismatch" or
+                "delivery_stale_binding" or "delivery_workspace_unavailable" or
+                "delivery_scope_mismatch" or "delivery_recovery_required" =>
+                (409, "Delivery state changed", message, exception.Category),
+            "delivery_failed_before_mutation" => (503, "Delivery failed before mutation", message, exception.Category),
+            _ => (422, "Delivery rejected", message, exception.Category)
         };
     }
 

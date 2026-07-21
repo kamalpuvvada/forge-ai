@@ -6,18 +6,28 @@ namespace Forge.Core;
 
 public static partial class VerificationValidator
 {
+    public const string InitialPlanLanguageOverrideLimitation =
+        "Development-only initial-plan text-classifier override applied. Structural, binding, command, path, and sensitive-content validation remained enforced.";
+    public const string InitialPlanLanguageOverrideSafetyNote =
+        "MANUAL — NOT EXECUTED BY FORGE. All outcomes require explicit user reporting.";
+
     public static VerificationPlan FinalizeCandidate(
         VerificationPlanContext context,
         VerificationPlanCandidate candidate,
         int planNumber,
         Guid planId,
         IReadOnlyList<Guid> modelCallIds,
-        VerificationLimits limits)
+        VerificationLimits limits,
+        bool initialPlanLanguageOverrideApplied = false)
     {
         ArgumentNullException.ThrowIfNull(context);
         ArgumentNullException.ThrowIfNull(candidate);
-        ValidateCandidate(context, candidate, limits);
-        if (planId == Guid.Empty || planNumber is < 1 or > 6)
+        if (initialPlanLanguageOverrideApplied)
+            candidate = ValidateAppliedInitialPlanLanguageOverride(context, candidate, limits, true);
+        else
+            ValidateCandidate(context, candidate, limits);
+        if (planId == Guid.Empty || planNumber is < 1 or > 6 ||
+            initialPlanLanguageOverrideApplied && planNumber != 1)
             throw Invalid("The verification plan identity is invalid.");
 
         var testCases = candidate.TestCases.Select(testCase => new VerificationTestCase(
@@ -36,7 +46,10 @@ public static partial class VerificationValidator
             context.CreatedAt, candidate.Source, candidate.Model, candidate.ReasoningEffort,
             candidate.Summary.Trim(), candidate.Scope.Trim(), Trim(candidate.Preconditions), testCases,
             Trim(candidate.Risks), Trim(candidate.Limitations), Trim(candidate.EvidenceGuidance), string.Empty,
-            VerificationPlanStatus.Current, modelCallIds.ToArray(), null, null);
+            VerificationPlanStatus.Current, modelCallIds.ToArray(), context.PreviousPlan?.PlanId,
+            context.PreviousPlan is null ? null :
+                $"Replacement verification after failure analysis {context.FailureAnalysis!.AnalysisId:D} and approved correction proposal {context.CorrectionProposal!.ProposalId:D}.",
+            initialPlanLanguageOverrideApplied);
         var plan = provisional with { PlanFingerprint = VerificationFingerprint.ComputePlan(context.TaskId, provisional) };
         ValidatePersistedPlan(context.TaskId, plan, context, limits);
         return plan;
@@ -46,6 +59,37 @@ public static partial class VerificationValidator
         VerificationPlanContext context,
         VerificationPlanCandidate candidate,
         VerificationLimits limits)
+        => ValidateCandidateCore(context, candidate, limits, false);
+
+    public static VerificationPlanCandidate ValidateCandidateForGeneration(
+        VerificationPlanContext context,
+        VerificationPlanCandidate candidate,
+        VerificationLimits limits,
+        bool allowInitialPlanLanguageOverride,
+        out bool initialPlanLanguageOverrideApplied)
+    {
+        initialPlanLanguageOverrideApplied = false;
+        try
+        {
+            ValidateCandidate(context, candidate, limits);
+            return candidate;
+        }
+        catch (VerificationException exception) when (
+            exception.ValidationFailureReason is VerificationValidationFailureReason.ManualExecutionClaim or
+                VerificationValidationFailureReason.HistoricalFailureClaim)
+        {
+            if (!allowInitialPlanLanguageOverride) throw;
+            var audited = ValidateAppliedInitialPlanLanguageOverride(context, candidate, limits, true);
+            initialPlanLanguageOverrideApplied = true;
+            return audited;
+        }
+    }
+
+    private static void ValidateCandidateCore(
+        VerificationPlanContext context,
+        VerificationPlanCandidate candidate,
+        VerificationLimits limits,
+        bool suppressFragileTextClassifiers)
     {
         if (!string.Equals(candidate.ContextFingerprint, context.ContextFingerprint, StringComparison.Ordinal))
             throw Invalid("The verification plan does not match its approved context.");
@@ -83,8 +127,27 @@ public static partial class VerificationValidator
                 limits.MaximumEvidenceRequirementCharacters, "evidence requirement");
             Collection(testCase.SafetyNotes, limits.MaximumEvidenceRequirements,
                 limits.MaximumSafetyNoteCharacters, "safety note");
-            if (testCase.OriginTestCaseId is not null || testCase.RegressionFailureReportIds.Count > 0)
-                throw Invalid("Initial verification plans cannot reference prior correction evidence.");
+            if (context.PreviousPlan is null)
+            {
+                if (testCase.OriginTestCaseId is not null || testCase.RegressionFailureReportIds.Count > 0)
+                    throw Invalid("Initial verification plans cannot reference prior correction evidence.");
+            }
+            else
+            {
+                var priorCaseIds = context.PreviousPlan.TestCases.Select(item => item.TestCaseId).ToHashSet();
+                var failureEvidence = (context.PreviousFailureEvidence ?? []).ToDictionary(item => item.ResultRevisionId);
+                var failureIds = failureEvidence.Keys.ToHashSet();
+                if (testCase.OriginTestCaseId is { } origin && !priorCaseIds.Contains(origin))
+                    throw Invalid("A replacement verification case referenced an unknown prior case.");
+                if (testCase.RegressionFailureReportIds.Any(id => !failureIds.Contains(id)) ||
+                    testCase.RegressionFailureReportIds.Count != testCase.RegressionFailureReportIds.Distinct().Count())
+                    throw Invalid("A replacement verification case referenced unknown or duplicate failure evidence.");
+                if (testCase.RegressionFailureReportIds.Count > 0 && testCase.OriginTestCaseId is null)
+                    throw Invalid("A regression verification case must identify its exact prior case.");
+                if (testCase.OriginTestCaseId is { } exactOrigin && testCase.RegressionFailureReportIds.Any(id =>
+                        failureEvidence[id].TestCaseId != exactOrigin))
+                    throw Invalid("A regression verification case referenced failure evidence from a different prior case.");
+            }
             if (testCase.OrderedSteps is null || testCase.OrderedSteps.Count is < 1 ||
                 testCase.OrderedSteps.Count > limits.MaximumStepsPerCase ||
                 !testCase.OrderedSteps.Select(step => step.Order).SequenceEqual(Enumerable.Range(1, testCase.OrderedSteps.Count)))
@@ -99,7 +162,17 @@ public static partial class VerificationValidator
             }
         }
 
-        foreach (var value in Text(candidate)) ValidateSafeText(value, context);
+        if (context.PreviousPlan is not null)
+        {
+            var requiredCoverage = (context.PreviousFailureEvidence ?? []).Select(item => item.ResultRevisionId).ToHashSet();
+            var actualCoverage = candidate.TestCases.Where(item => item.IsRequired)
+                .SelectMany(item => item.RegressionFailureReportIds).ToHashSet();
+            if (requiredCoverage.Count == 0 || !requiredCoverage.SetEquals(actualCoverage))
+                throw Invalid("The replacement verification plan does not cover every current failed result.");
+        }
+
+        foreach (var (value, testCase, field) in Text(candidate))
+            ValidateSafeText(value, context, testCase, field, suppressFragileTextClassifiers);
     }
 
     public static void ValidatePersistedPlan(
@@ -116,6 +189,10 @@ public static partial class VerificationValidator
             plan.GeneratedAt.Offset != TimeSpan.Zero || plan.TestCases.Any(item => item.TestCaseId == Guid.Empty) ||
             plan.TestCases.Select(item => item.TestCaseId).Distinct().Count() != plan.TestCases.Count)
             throw Invalid("The verification plan binding is invalid.");
+        if (context.PreviousPlan is null && (plan.SupersedesPlanId is not null || plan.RegenerationReason is not null) ||
+            context.PreviousPlan is not null && (plan.SupersedesPlanId != context.PreviousPlan.PlanId ||
+                string.IsNullOrWhiteSpace(plan.RegenerationReason) || plan.RegenerationReason.Length > 500))
+            throw Invalid("The replacement verification-plan binding is invalid.");
         var candidate = new VerificationPlanCandidate(
             plan.GenerationContextFingerprint, plan.Summary, plan.Scope, plan.Preconditions,
             plan.TestCases.Select(item => new VerificationTestCaseCandidate(
@@ -125,7 +202,10 @@ public static partial class VerificationValidator
                 item.ExpectedResult, item.NegativeOrEdgeCases, item.RegressionScope, item.EvidenceRequirements,
                 item.SafetyNotes, item.OriginTestCaseId, item.RegressionFailureReportIds)).ToArray(),
             plan.Risks, plan.Limitations, plan.EvidenceGuidance, plan.Source, plan.Model, plan.ReasoningEffort);
-        ValidateCandidate(context, candidate, limits);
+        if (plan.InitialPlanLanguageOverrideApplied)
+            ValidateAppliedInitialPlanLanguageOverride(context, candidate, limits, false);
+        else
+            ValidateCandidate(context, candidate, limits);
         var withoutFingerprint = plan with { PlanFingerprint = string.Empty };
         if (!IsLowerSha256(plan.PlanFingerprint) || !string.Equals(plan.PlanFingerprint,
                 VerificationFingerprint.ComputePlan(taskId, withoutFingerprint), StringComparison.Ordinal))
@@ -185,6 +265,10 @@ public static partial class VerificationValidator
         var current = VerificationFingerprint.CurrentResults(attempt).ToDictionary(item => item.TestCaseId);
         if (command.Passed)
         {
+            foreach (var regressionCase in plan.TestCases.Where(item => item.RegressionFailureReportIds.Count > 0))
+                if (!current.TryGetValue(regressionCase.TestCaseId, out var regressionResult) ||
+                    regressionResult.Result != ManualVerificationCaseResult.Passed)
+                    throw Invalid("Every regression verification case must be Passed before completion.");
             foreach (var testCase in plan.TestCases.Where(item => item.IsRequired))
             {
                 if (!current.TryGetValue(testCase.TestCaseId, out var result) ||
@@ -255,23 +339,97 @@ public static partial class VerificationValidator
         }
     }
 
-    private static void ValidateSafeText(string value, VerificationPlanContext context)
+    private static void ValidateSafeText(
+        string value,
+        VerificationPlanContext context,
+        VerificationTestCaseCandidate? testCase,
+        VerificationPlanTextField field,
+        bool suppressFragileTextClassifiers)
     {
-        if (SensitiveContentDetector.ContainsSensitiveValue(value) || HasUnsafeLocalPath(value))
+        var inspected = AllowsApprovedManualContext(field)
+            ? RedactExactApprovedManualTestData(value, context.ApprovedManualTestData ?? [])
+            : value;
+        if (SensitiveContentDetector.ContainsSensitiveValue(inspected) || HasUnsafeLocalPath(inspected) ||
+            HasUnsafePlanUrl(value, field, context.ApprovedManualTestData ?? []))
             throw Invalid("The verification plan contains sensitive or absolute local data.");
-        if (HistoricalExecutionClaim().IsMatch(value))
-            throw Invalid("The verification plan claimed that manual verification had already been performed.");
+        var executionClaim = !suppressFragileTextClassifiers &&
+            (CompletedValidationStatusClaim().IsMatch(value) ||
+             CompletedBehaviorExecutionClaim().IsMatch(value) ||
+             CompletedActorClaim().IsMatch(value) ||
+             StandaloneAlreadyCompletedClaim().IsMatch(value));
+        var nonOverridableExecutionClaim = NonOverridableCompletedExecutionClaim().IsMatch(value);
+        var historicalFailureReference = !suppressFragileTextClassifiers &&
+            ExplicitHistoricalFailureClaim().IsMatch(value);
+        if (historicalFailureReference && (context.PreviousPlan is null ||
+                HasUnknownHistoricalIdentity(value, context) ||
+                testCase is not null && !IsAllowedHistoricalFailureReference(value, context, testCase)))
+            throw Invalid("The verification plan contains an invalid historical failure reference.",
+                VerificationValidationFailureReason.HistoricalFailureClaim);
+        if (suppressFragileTextClassifiers && HistoricalGuid().IsMatch(value))
+            throw Invalid("The verification plan contains an invalid historical failure reference.");
+        if (nonOverridableExecutionClaim || executionClaim &&
+            !IsAllowedHistoricalFailureReference(value, context, testCase))
+            throw Invalid("The verification plan claimed that manual verification had already been performed.",
+                VerificationValidationFailureReason.ManualExecutionClaim);
         var allowed = context.ApprovedPlan.AffectedFiles.Select(item => RepositoryPathRules.Normalize(item.Path))
             .Concat(context.RepositoryEvidence.Select(item => RepositoryPathRules.Normalize(item.RelativePath)))
             .ToHashSet(RepositoryPathRules.Comparer);
         var approvedDirectories = allowed.Select(PathDirectory).Where(directory => directory.Length > 0)
             .ToHashSet(RepositoryPathRules.Comparer);
+        foreach (var commandPath in context.ApprovedValidationCommands.SelectMany(command =>
+                     CrediblePathCandidates(command.Command, approvedDirectories)))
+        {
+            var normalized = RepositoryPathRules.Normalize(commandPath.Trim('`', '\'', '"', '.', ',', ';', ':', ')', ']', '}'));
+            if (!RepositoryPathRules.IsSafeRelativePath(normalized, 300)) continue;
+            allowed.Add(normalized);
+            var directory = PathDirectory(normalized);
+            if (directory.Length > 0) approvedDirectories.Add(directory);
+        }
         foreach (var candidate in CrediblePathCandidates(value, approvedDirectories))
         {
             var path = RepositoryPathRules.Normalize(candidate.Trim('`', '\'', '"', '.', ',', ';', ':', ')', ']', '}'));
             if (RepositoryPathRules.IsSafeRelativePath(path, 300) && !allowed.Contains(path))
                 throw Invalid("The verification plan referenced a repository path outside approved evidence.");
         }
+    }
+
+    private static bool IsAllowedHistoricalFailureReference(
+        string value,
+        VerificationPlanContext context,
+        VerificationTestCaseCandidate? testCase)
+    {
+        if (context.PreviousPlan is null || context.PreviousFailureEvidence is not { Count: > 0 } ||
+            CurrentExecutionSuccessClaim().IsMatch(value) || HasUnknownHistoricalIdentity(value, context))
+            return false;
+        if (testCase is null)
+            return PriorFailureMarker().IsMatch(value) && FailureReferenceMarker().IsMatch(value);
+        if (testCase.OriginTestCaseId is not { } origin || testCase.RegressionFailureReportIds.Count == 0)
+            return false;
+        var failures = context.PreviousFailureEvidence.ToDictionary(item => item.ResultRevisionId);
+        if (!context.PreviousPlan.TestCases.Any(item => item.TestCaseId == origin) ||
+            testCase.RegressionFailureReportIds.Any(id => !failures.TryGetValue(id, out var failure) ||
+                failure.TestCaseId != origin))
+            return false;
+        var allowedTextIdentities = testCase.RegressionFailureReportIds.Append(origin)
+            .Append(context.PreviousPlan.PlanId)
+            .Append(context.FailureAnalysis?.FailedAttemptId ?? Guid.Empty)
+            .Where(id => id != Guid.Empty)
+            .ToHashSet();
+        return HistoricalGuid().Matches(value).Select(match => Guid.Parse(match.Value))
+            .All(allowedTextIdentities.Contains);
+    }
+
+    private static bool HasUnknownHistoricalIdentity(string value, VerificationPlanContext context)
+    {
+        var identities = HistoricalGuid().Matches(value).Select(match => Guid.Parse(match.Value)).ToArray();
+        if (identities.Length == 0) return false;
+        var allowed = (context.PreviousFailureEvidence ?? []).Select(item => item.ResultRevisionId)
+            .Concat(context.PreviousPlan?.TestCases.Select(item => item.TestCaseId) ?? [])
+            .Append(context.PreviousPlan?.PlanId ?? Guid.Empty)
+            .Append(context.FailureAnalysis?.FailedAttemptId ?? Guid.Empty)
+            .Where(id => id != Guid.Empty)
+            .ToHashSet();
+        return identities.Any(id => !allowed.Contains(id));
     }
 
     private static IEnumerable<string> CrediblePathCandidates(string value, HashSet<string> approvedDirectories)
@@ -313,6 +471,96 @@ public static partial class VerificationValidator
     {
         var separator = path.LastIndexOf('/');
         return separator <= 0 ? string.Empty : path[..separator];
+    }
+
+    internal static IReadOnlyList<string> ExtractApprovedManualTestData(EngineeringTask task)
+    {
+        ArgumentNullException.ThrowIfNull(task);
+        var source = string.Join('\n', new[]
+        {
+            task.RequirementSummary ?? string.Empty
+        }.Concat(task.ClarificationAnswers.SelectMany(answer => new[] { answer.Question, answer.Answer })));
+        if (source.Length > 64 * 1024) source = source[..(64 * 1024)];
+        var values = new List<string>();
+        void Add(string candidate)
+        {
+            candidate = candidate.TrimEnd('.', ',', ';', ':');
+            if (!IsSafeApprovedManualTestData(candidate) || values.Contains(candidate, StringComparer.Ordinal) ||
+                values.Count == 8) return;
+            values.Add(candidate);
+        }
+        foreach (Match match in ApprovedCredentialValue().Matches(source))
+        {
+            var start = Math.Max(0, match.Index - 96);
+            var end = Math.Min(source.Length, match.Index + match.Length + 96);
+            if (!DemoTestMarker().IsMatch(source[start..end])) continue;
+            Add(match.Groups[1].Value);
+            if (values.Count == 8) break;
+        }
+        foreach (var answer in task.ClarificationAnswers)
+        {
+            var pair = answer.Question + " " + answer.Answer;
+            if (!CredentialLabel().IsMatch(answer.Question) || !DemoTestMarker().IsMatch(pair)) continue;
+            var exact = ApprovedLiteralOnly().Match(answer.Answer.Trim());
+            if (exact.Success) Add(exact.Groups[1].Value);
+        }
+        return values;
+    }
+
+    private static bool IsSafeApprovedManualTestData(string value)
+    {
+        var normalized = value.ToLowerInvariant();
+        if (value.Length is < 3 or > 32 || SensitiveContentDetector.ContainsSensitiveValue(value) ||
+            normalized is "input" or "field" or "value" or "masked" or "masking" or "required" or
+                "should" or "must" or "can") return false;
+        var classes = (value.Any(char.IsLower) ? 1 : 0) + (value.Any(char.IsUpper) ? 1 : 0) +
+                      (value.Any(char.IsDigit) ? 1 : 0) + (value.Any(character => "._-".Contains(character)) ? 1 : 0);
+        return value.Length < 16 || classes < 3 || value.Distinct().Take(12).Count() < 12;
+    }
+
+    private static bool AllowsApprovedManualContext(VerificationPlanTextField field) => field is
+        VerificationPlanTextField.Objective or VerificationPlanTextField.Precondition or
+        VerificationPlanTextField.TestData or VerificationPlanTextField.OrderedInstruction or
+        VerificationPlanTextField.ExpectedObservation or VerificationPlanTextField.ExpectedResult or
+        VerificationPlanTextField.EvidenceRequirement or VerificationPlanTextField.RegressionScope or
+        VerificationPlanTextField.SafetyNote or VerificationPlanTextField.EvidenceGuidance;
+
+    private static string RedactExactApprovedManualTestData(string value, IReadOnlyList<string> approved)
+    {
+        var inspected = value;
+        foreach (var literal in approved.Where(IsSafeApprovedManualTestData).Distinct(StringComparer.Ordinal))
+        {
+            var pattern = $@"(?<![A-Za-z0-9._-]){Regex.Escape(literal)}(?![A-Za-z0-9._-])";
+            inspected = Regex.Replace(inspected, pattern, "[APPROVED DEMO TEST DATA]",
+                RegexOptions.CultureInvariant, TimeSpan.FromMilliseconds(100));
+        }
+        return inspected;
+    }
+
+    private static bool HasUnsafePlanUrl(
+        string value,
+        VerificationPlanTextField field,
+        IReadOnlyList<string> approvedManualTestData)
+    {
+        foreach (Match match in PlanUrlCandidate().Matches(value))
+        {
+            var candidate = match.Value.TrimEnd('.', ',', ';', ')', ']', '}');
+            if (!AllowsApprovedManualContext(field) || !Uri.TryCreate(candidate, UriKind.Absolute, out var uri) ||
+                uri.Scheme is not ("http" or "https") || uri.UserInfo.Length != 0 ||
+                !string.Equals(uri.Host, "localhost", StringComparison.OrdinalIgnoreCase) && uri.Host != "127.0.0.1")
+                return true;
+            string path;
+            try { path = Uri.UnescapeDataString(uri.AbsolutePath); }
+            catch (UriFormatException) { return true; }
+            var parameters = uri.Query + "&" + uri.Fragment;
+            if (path.Contains('\\') || path.Split('/', StringSplitOptions.RemoveEmptyEntries).Contains("..") ||
+                path.Any(char.IsControl) || SensitiveUrlParameter().IsMatch(parameters) ||
+                SensitiveContentDetector.ContainsSensitiveValue(parameters) ||
+                !string.Equals(parameters, RedactExactApprovedManualTestData(parameters, approvedManualTestData),
+                    StringComparison.Ordinal))
+                return true;
+        }
+        return false;
     }
 
     private static void ValidateUserText(string value)
@@ -403,26 +651,55 @@ public static partial class VerificationValidator
         foreach (var value in values) Required(value, maximumLength, $"Verification {label}");
     }
 
-    private static IEnumerable<string> Text(VerificationPlanCandidate candidate)
+    private static IEnumerable<(string Value, VerificationTestCaseCandidate? TestCase, VerificationPlanTextField Field)> Text(
+        VerificationPlanCandidate candidate)
     {
-        yield return candidate.Summary;
-        yield return candidate.Scope;
-        foreach (var value in candidate.Preconditions.Concat(candidate.Risks).Concat(candidate.Limitations)
-                     .Concat(candidate.EvidenceGuidance)) yield return value;
+        yield return (candidate.Summary, null, VerificationPlanTextField.Other);
+        yield return (candidate.Scope, null, VerificationPlanTextField.Other);
+        foreach (var value in candidate.Preconditions)
+            yield return (value, null, VerificationPlanTextField.Precondition);
+        foreach (var value in candidate.Risks.Concat(candidate.Limitations))
+            yield return (value, null, VerificationPlanTextField.Other);
+        foreach (var value in candidate.EvidenceGuidance)
+            yield return (value, null, VerificationPlanTextField.EvidenceGuidance);
         foreach (var testCase in candidate.TestCases)
         {
-            yield return testCase.Title;
-            yield return testCase.Objective;
-            yield return testCase.ExpectedResult;
-            foreach (var value in testCase.Preconditions.Concat(testCase.TestData)
-                         .Concat(testCase.NegativeOrEdgeCases).Concat(testCase.RegressionScope)
-                         .Concat(testCase.EvidenceRequirements).Concat(testCase.SafetyNotes)) yield return value;
+            yield return (testCase.Title, testCase, VerificationPlanTextField.Other);
+            yield return (testCase.Objective, testCase, VerificationPlanTextField.Objective);
+            yield return (testCase.ExpectedResult, testCase, VerificationPlanTextField.ExpectedResult);
+            foreach (var value in testCase.Preconditions)
+                yield return (value, testCase, VerificationPlanTextField.Precondition);
+            foreach (var value in testCase.TestData)
+                yield return (value, testCase, VerificationPlanTextField.TestData);
+            foreach (var value in testCase.NegativeOrEdgeCases)
+                yield return (value, testCase, VerificationPlanTextField.Other);
+            foreach (var value in testCase.RegressionScope)
+                yield return (value, testCase, VerificationPlanTextField.RegressionScope);
+            foreach (var value in testCase.EvidenceRequirements)
+                yield return (value, testCase, VerificationPlanTextField.EvidenceRequirement);
+            foreach (var value in testCase.SafetyNotes)
+                yield return (value, testCase, VerificationPlanTextField.SafetyNote);
             foreach (var step in testCase.OrderedSteps)
             {
-                yield return step.Instruction;
-                yield return step.ExpectedObservation;
+                yield return (step.Instruction, testCase, VerificationPlanTextField.OrderedInstruction);
+                yield return (step.ExpectedObservation, testCase, VerificationPlanTextField.ExpectedObservation);
             }
         }
+    }
+
+    private enum VerificationPlanTextField
+    {
+        Other,
+        Objective,
+        Precondition,
+        TestData,
+        OrderedInstruction,
+        ExpectedObservation,
+        ExpectedResult,
+        EvidenceRequirement,
+        RegressionScope,
+        SafetyNote,
+        EvidenceGuidance
     }
 
     private static IEnumerable<string> ResultText(UpdateManualVerificationCaseCommand command)
@@ -460,7 +737,45 @@ public static partial class VerificationValidator
     private static string? EmptyToNull(string? value) => string.IsNullOrEmpty(value) ? null : value;
     private static bool IsLowerSha256(string value) => value.Length == 64 &&
         value.All(character => character is >= '0' and <= '9' or >= 'a' and <= 'f');
-    private static VerificationException Invalid(string message) => new("verification_validation", message);
+    private static VerificationPlanCandidate ValidateAppliedInitialPlanLanguageOverride(
+        VerificationPlanContext context,
+        VerificationPlanCandidate candidate,
+        VerificationLimits limits,
+        bool requireRuntimeEligibility)
+    {
+        if (candidate.Source != VerificationPlanSource.OpenAI || context.PreviousPlan is not null ||
+            context.PreviousFailureEvidence is { Count: > 0 } || context.FailureAnalysis is not null ||
+            context.CorrectionProposal is not null || requireRuntimeEligibility &&
+            !context.InitialPlanLanguageOverrideEligible || candidate.TestCases.Any(testCase =>
+                testCase.OriginTestCaseId is not null || testCase.RegressionFailureReportIds.Count > 0) ||
+            !requireRuntimeEligibility && (!candidate.Limitations.Contains(
+                InitialPlanLanguageOverrideLimitation, StringComparer.Ordinal) || candidate.TestCases.Any(testCase =>
+                !testCase.SafetyNotes.Contains(InitialPlanLanguageOverrideSafetyNote, StringComparer.Ordinal))))
+            throw Invalid("The initial verification-plan language override is not eligible for this plan.");
+
+        var audited = candidate with
+        {
+            Limitations = AppendOnce(candidate.Limitations, InitialPlanLanguageOverrideLimitation),
+            TestCases = candidate.TestCases.Select(testCase => testCase with
+            {
+                SafetyNotes = AppendOnce(testCase.SafetyNotes, InitialPlanLanguageOverrideSafetyNote)
+            }).ToArray()
+        };
+        foreach (var (value, _, _) in Text(audited))
+            if (NonOverridableCompletedExecutionClaim().IsMatch(value))
+                throw Invalid("The verification plan claimed that manual verification had already been performed.",
+                    VerificationValidationFailureReason.ManualExecutionClaim);
+        ValidateCandidateCore(context, audited, limits, true);
+        return audited;
+    }
+
+    private static IReadOnlyList<string> AppendOnce(IReadOnlyList<string> values, string required) =>
+        values.Contains(required, StringComparer.Ordinal) ? values : values.Append(required).ToArray();
+
+    private static VerificationException Invalid(
+        string message,
+        VerificationValidationFailureReason reason = VerificationValidationFailureReason.General) =>
+        new("verification_validation", message, validationFailureReason: reason);
 
     [GeneratedRegex("""(?i)(?:[a-z]:[\\/]|file://|\\\\[^\\/\s]+[\\/][^\s]+|(?:^|[\s'"`(])/(?:home|users|private|tmp|var|opt|etc)/[^\s'"`]+)""", RegexOptions.CultureInvariant)]
     private static partial Regex AbsoluteLocalPath();
@@ -471,8 +786,53 @@ public static partial class VerificationValidator
     [GeneratedRegex("""(?:[?&#=]|^)\.\.(?:[/\\]|$)""", RegexOptions.CultureInvariant)]
     private static partial Regex QueryOrFragmentTraversal();
 
-    [GeneratedRegex(@"(?i)\b(?:test|tests|build|lint|validation|check|command)s?\s+(?:was|were|has|have|had|is|are)\s+(?:already\s+)?(?:run|ran|passed|successful|completed|executed|verified)\b", RegexOptions.CultureInvariant)]
-    private static partial Regex HistoricalExecutionClaim();
+    [GeneratedRegex(@"(?i)\b(?:manual\s+(?:verification|review|attempt)|verification|this\s+(?:test|case)|tests?|build|lint|validation|checks?|all\s+checks|commands?)\b\s+(?:(?:was|were|has|have|had|is|are)\s+(?:already\s+)?(?:been\s+)?(?:run|ran|tested|passed|failed|successful|completed|executed|verified|confirmed|performed|succeeded|worked)|(?:already\s+)?(?:ran|passed|failed|completed|executed|verified|confirmed|performed|succeeded|worked))\b", RegexOptions.CultureInvariant)]
+    private static partial Regex CompletedValidationStatusClaim();
+
+    [GeneratedRegex(@"(?i)\b(?:(?:[a-z][a-z0-9-]*\s+){0,4}flow|application|implementation|corrected\s+(?:implementation|behavior)|behavior)\b\s+(?:(?:was|were|has|have|had|is|are)\s+(?:already\s+)?(?:been\s+)?(?:run|ran|tested|completed|executed|verified|confirmed|performed|worked)|(?:already\s+)?(?:ran|tested|completed|executed|verified|confirmed|performed|worked))\b", RegexOptions.CultureInvariant)]
+    private static partial Regex CompletedBehaviorExecutionClaim();
+
+    [GeneratedRegex(@"(?i)\b(?:forge|the\s+user|user|human|operator|reviewer)\b\s+(?:(?:was|were|has|have|had)\s+(?:already\s+)?(?:been\s+)?(?:run|tested|completed|executed|verified|confirmed|performed)|(?:already\s+)?(?:ran|tested|passed|failed|completed|executed|verified|confirmed|performed|approved))\b", RegexOptions.CultureInvariant)]
+    private static partial Regex CompletedActorClaim();
+
+    [GeneratedRegex(@"(?i)\b(?:already|previously)\s+(?:been\s+)?(?:run|tested|passed|completed|executed|verified|confirmed|performed)\b", RegexOptions.CultureInvariant)]
+    private static partial Regex StandaloneAlreadyCompletedClaim();
+
+    [GeneratedRegex(@"(?i)\b(?:forge\s+(?:executed|ran|verified|confirmed)|verification\s+(?:already\s+passed|has\s+passed)|manual\s+verification\s+was\s+(?:completed|performed)|(?:build\s+was|tests\s+were)\s+executed\s+by\s+forge|user\s+already\s+confirmed|human\s+already\s+approved)\b", RegexOptions.CultureInvariant)]
+    private static partial Regex NonOverridableCompletedExecutionClaim();
+
+    [GeneratedRegex("""(?i)\b(?:username|user|password|passwd|pwd)\b\s*(?:(?::|=)|(?:is|use)\s+)?['\"]?([A-Za-z0-9._-]{3,32})""", RegexOptions.CultureInvariant)]
+    private static partial Regex ApprovedCredentialValue();
+
+    [GeneratedRegex(@"(?i)\b(?:username|user|password|passwd|pwd)\b", RegexOptions.CultureInvariant)]
+    private static partial Regex CredentialLabel();
+
+    [GeneratedRegex("""^['\"]?([A-Za-z0-9._-]{3,32})['\"]?[.,;:]?$""", RegexOptions.CultureInvariant)]
+    private static partial Regex ApprovedLiteralOnly();
+
+    [GeneratedRegex(@"(?i)\b(?:demo|demo[- ]only|test|testing|test[- ]only|sample|example|synthetic|non[- ]production)\b", RegexOptions.CultureInvariant)]
+    private static partial Regex DemoTestMarker();
+
+    [GeneratedRegex("""(?i)\b[a-z][a-z0-9+.-]*://[^\s'\"`]+""", RegexOptions.CultureInvariant)]
+    private static partial Regex PlanUrlCandidate();
+
+    [GeneratedRegex(@"(?i)(?:^|[?&#;])(?:access[_-]?token|auth[_-]?token|token|api[_-]?key|key|password|passwd|pwd|username|user|client[_-]?secret|secret|credential|session|jwt|bearer|code|sig|signature)=", RegexOptions.CultureInvariant)]
+    private static partial Regex SensitiveUrlParameter();
+
+    [GeneratedRegex(@"(?i)\b(?:previous(?:ly)?|prior|historical|superseded|attempt\s+1)\b", RegexOptions.CultureInvariant)]
+    private static partial Regex PriorFailureMarker();
+
+    [GeneratedRegex(@"(?i)\b(?:fail(?:ed|ure)?|blocked|user[- ]reported|repeat|recheck)\b", RegexOptions.CultureInvariant)]
+    private static partial Regex FailureReferenceMarker();
+
+    [GeneratedRegex(@"(?i)\b(?:(?:(?:previous(?:ly)?|prior|historical)\b.{0,100}\b(?:fail(?:ed|ure)?|blocked|result|verification|manual\s+(?:review|attempt|verification)))|superseded\s+(?:verification\s+)?plan|attempt\s+1|origin\s+test\s+case|regression\s+failure\s+report|failed\s+result\s+revision|(?:repeat|recheck)\s+(?:the\s+)?(?:previous(?:ly)?\s+)?(?:failed\s+verification|failure\s+result)(?:\s+(?:revision\s+)?(?:id\s+)?[A-Za-z0-9-]+)?|(?:attempt|plan|analysis|proposal|result(?:\s+revision)?)\s+(?:id\s+)?[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\b", RegexOptions.CultureInvariant)]
+    private static partial Regex ExplicitHistoricalFailureClaim();
+
+    [GeneratedRegex(@"(?i)\b(?:corrected\s+(?:implementation|behavior).{0,60}(?:verified|passed|confirmed|successful)|forge.{0,60}(?:verified|confirmed|executed|passed)|this\s+(?:test|case).{0,60}(?:executed|passed|completed|successful)|manual\s+verification\s+has\s+already\s+passed)\b", RegexOptions.CultureInvariant)]
+    private static partial Regex CurrentExecutionSuccessClaim();
+
+    [GeneratedRegex(@"(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b", RegexOptions.CultureInvariant)]
+    private static partial Regex HistoricalGuid();
 
     [GeneratedRegex("""(?<![A-Za-z0-9])([/\\]?[A-Za-z0-9_~+.-]+(?:[/\\][A-Za-z0-9_~+.-]+)+)""", RegexOptions.CultureInvariant)]
     private static partial Regex SlashTokenCandidate();

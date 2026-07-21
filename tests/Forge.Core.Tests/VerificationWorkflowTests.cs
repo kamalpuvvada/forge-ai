@@ -53,6 +53,67 @@ public sealed class VerificationWorkflowTests
         Assert.Matches("^[0-9a-f]{64}$", completed.AttemptFingerprint!);
     }
 
+    [Theory]
+    [InlineData(ManualVerificationCaseResult.NotApplicable)]
+    [InlineData(ManualVerificationCaseResult.Blocked)]
+    [InlineData(ManualVerificationCaseResult.Failed)]
+    [InlineData(ManualVerificationCaseResult.NotStarted)]
+    public async Task Regression_case_must_be_exactly_passed_for_successful_completion(
+        ManualVerificationCaseResult regressionResult)
+    {
+        var task = ApprovedImplementation();
+        var (original, _) = await GeneratePlan(task);
+        var target = original.TestCases[0];
+        var plan = original with
+        {
+            TestCases = original.TestCases.Select(item => item.TestCaseId == target.TestCaseId
+                ? item with { OriginTestCaseId = Guid.NewGuid(), RegressionFailureReportIds = [Guid.NewGuid()] }
+                : item).ToArray()
+        };
+        var attempt = StartAttempt(task, original) with { VerificationPlanId = plan.PlanId };
+        var revisions = new List<ManualCaseResultRevision>();
+        foreach (var testCase in plan.TestCases.Where(item => item.IsRequired))
+        {
+            var result = testCase.TestCaseId == target.TestCaseId ? regressionResult : ManualVerificationCaseResult.Passed;
+            if (result == ManualVerificationCaseResult.NotStarted) continue;
+            var failure = result is ManualVerificationCaseResult.Failed or ManualVerificationCaseResult.Blocked
+                ? new VerificationFailureDetails("Regression mismatch", testCase.ExpectedResult, "Observed mismatch",
+                    ["Repeat manually."], ["Disposable test environment."], null, [], VerificationFailureSeverity.High)
+                : null;
+            revisions.Add(new ManualCaseResultRevision(Guid.NewGuid(), 1, attempt.AttemptId, testCase.TestCaseId,
+                result, Now.AddMinutes(4), null, null, [],
+                result == ManualVerificationCaseResult.NotApplicable ? "Not used." : null,
+                failure, null, Guid.NewGuid()));
+        }
+        attempt = attempt with { ResultRevisions = revisions };
+
+        Assert.Throws<VerificationException>(() => VerificationValidator.ValidateCompletion(
+            Complete(task, plan, attempt, true, true), attempt, plan, Limits));
+    }
+
+    [Fact]
+    public async Task Passed_regression_case_allows_successful_completion()
+    {
+        var task = ApprovedImplementation();
+        var (original, _) = await GeneratePlan(task);
+        var target = original.TestCases[0];
+        var plan = original with
+        {
+            TestCases = original.TestCases.Select(item => item.TestCaseId == target.TestCaseId
+                ? item with { OriginTestCaseId = Guid.NewGuid(), RegressionFailureReportIds = [Guid.NewGuid()] }
+                : item).ToArray()
+        };
+        var attempt = StartAttempt(task, original);
+        var revisions = plan.TestCases.Where(item => item.IsRequired).Select(testCase =>
+            new ManualCaseResultRevision(Guid.NewGuid(), 1, attempt.AttemptId, testCase.TestCaseId,
+                ManualVerificationCaseResult.Passed, Now.AddMinutes(4), null, null,
+                testCase.EvidenceRequirements.Count > 0 ? ["Safe user-reported evidence."] : [], null, null, null,
+                Guid.NewGuid())).ToArray();
+        attempt = attempt with { ResultRevisions = revisions };
+
+        VerificationValidator.ValidateCompletion(Complete(task, plan, attempt, true, true), attempt, plan, Limits);
+    }
+
     [Fact]
     public async Task Failed_result_requires_details_and_completes_only_as_failed()
     {

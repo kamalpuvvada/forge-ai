@@ -5,7 +5,8 @@ public sealed class VerificationWorkflowService(
     IVerificationPlanEngine engine,
     ImplementationOperationCoordinator coordinator,
     VerificationLimits limits,
-    TimeProvider timeProvider)
+    TimeProvider timeProvider,
+    VerificationPlanLanguageOverridePolicy? languageOverridePolicy = null)
 {
     public async Task<EngineeringTask> GeneratePlanAsync(
         VerificationPlanGenerationCommand command,
@@ -28,7 +29,8 @@ public sealed class VerificationWorkflowService(
                 task.VerificationPlans.Count + 1,
                 Guid.NewGuid(),
                 evaluation.ModelCalls.Select(call => call.Id).ToArray(),
-                limits);
+                limits,
+                evaluation.InitialPlanLanguageOverrideApplied && languageOverridePolicy?.Enabled == true);
             return await repository.CompletePlanGenerationAsync(
                 task.Id, command.CommandId, plan, evaluation.ModelCalls, timeProvider.GetUtcNow(),
                 CancellationToken.None);
@@ -177,6 +179,31 @@ public sealed class VerificationWorkflowService(
             throw new VerificationException("verification_stale_binding", "The approved implementation revision is incomplete.");
         var commands = task.ImplementationPlan.ProposedValidationCommands
             .Select((command, index) => new ApprovedValidationCommand($"V{index + 1}", command)).ToArray();
+        VerificationPlan? previousPlan = null;
+        IReadOnlyList<ManualCaseResultRevision>? previousFailures = null;
+        FailureAnalysis? failureAnalysis = null;
+        CorrectionProposal? correctionProposal = null;
+        if (revision.RevisionNumber == 2)
+        {
+            failureAnalysis = task.CurrentFailureAnalysisId is { } analysisId
+                ? task.FailureAnalyses.SingleOrDefault(item => item.AnalysisId == analysisId)
+                : null;
+            correctionProposal = task.CurrentCorrectionProposalId is { } proposalId
+                ? task.CorrectionProposals.SingleOrDefault(item => item.ProposalId == proposalId)
+                : null;
+            previousPlan = task.VerificationPlans.SingleOrDefault(item =>
+                item.Status == VerificationPlanStatus.Superseded &&
+                failureAnalysis is not null && item.PlanId == failureAnalysis.VerificationPlanId);
+            var failedAttempt = task.ManualVerificationAttempts.SingleOrDefault(item =>
+                failureAnalysis is not null && item.AttemptId == failureAnalysis.FailedAttemptId);
+            previousFailures = failedAttempt is null ? null : VerificationFingerprint.CurrentResults(failedAttempt)
+                .Where(item => item.Result is ManualVerificationCaseResult.Failed or ManualVerificationCaseResult.Blocked)
+                .ToArray();
+            if (failureAnalysis is null || correctionProposal is null || previousPlan is null ||
+                previousFailures is null || previousFailures.Count == 0)
+                throw new VerificationException("verification_stale_binding",
+                    "The replacement verification context is incomplete.");
+        }
         var provisional = new VerificationPlanContext(
             task.Id,
             task.RequirementSummary,
@@ -191,7 +218,17 @@ public sealed class VerificationWorkflowService(
             string.Empty,
             now,
             task.EvidenceFilesInspected,
-            task.EvidenceFilesSelected);
+            task.EvidenceFilesSelected,
+            previousPlan,
+            previousFailures,
+            failureAnalysis,
+            correctionProposal,
+            VerificationValidator.ExtractApprovedManualTestData(task),
+            previousPlan is null && task.VerificationPlans.Count == 0 &&
+            task.ManualVerificationAttempts.Count == 0 &&
+            !task.ManualVerificationAttempts.SelectMany(attempt => attempt.ResultRevisions).Any(result =>
+                result.Result is ManualVerificationCaseResult.Failed or ManualVerificationCaseResult.Blocked) &&
+            task.FailureAnalyses.Count == 0 && task.CorrectionProposals.Count == 0);
         return provisional with { ContextFingerprint = VerificationFingerprint.ComputeContext(provisional) };
     }
 }

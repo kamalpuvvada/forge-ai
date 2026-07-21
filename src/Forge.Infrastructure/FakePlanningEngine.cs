@@ -11,7 +11,7 @@ public sealed class FakePlanningEngine : IPlanningEngine
     {
         cancellationToken.ThrowIfCancellationRequested();
         ArgumentNullException.ThrowIfNull(context);
-        var constraints = PlanConstraintPolicy.Derive(context);
+        var constraints = FakePlanningScopeResolver.Resolve(context, PlanConstraintPolicy.Derive(context));
         var evidenceByPath = context.Evidence
             .GroupBy(item => RepositoryPathRules.Normalize(item.RelativePath), RepositoryPathRules.Comparer)
             .ToDictionary(group => group.Key, group => group.ToArray(), RepositoryPathRules.Comparer);

@@ -6,7 +6,8 @@ namespace Forge.Api.Controllers;
 
 [ApiController]
 [Route("api/system")]
-public sealed class SystemController(ForgeAiOptions options, OpenAIConfigurationState configurationState) : ControllerBase
+public sealed class SystemController(ForgeAiOptions options, OpenAIConfigurationState configurationState,
+    IDeliveryExecutableAvailability? deliveryAvailability = null) : ControllerBase
 {
     [HttpGet("capabilities")]
     [ProducesResponseType<SystemCapabilitiesResponse>(StatusCodes.Status200OK)]
@@ -19,7 +20,11 @@ public sealed class SystemController(ForgeAiOptions options, OpenAIConfiguration
         var openAiImplementationAvailable = isOpenAi && options.IsImplementationConfigurationComplete(configurationState.HasApiKey);
         var implementationConfigured = isFake || openAiImplementationAvailable;
         var verificationConfigured = isFake || isOpenAi && options.IsVerificationPlanningConfigurationComplete(configurationState.HasApiKey);
+        var failureAnalysisConfigured = isFake || isOpenAi && options.IsFailureAnalysisConfigurationComplete(configurationState.HasApiKey);
         var provider = isFake ? "Fake" : isOpenAi ? "OpenAI" : "Unavailable";
+        var deliveryGitAvailable = deliveryAvailability?.GitAvailable ?? IsExecutableAvailable("git");
+        var deliveryGitHubCliAvailable = deliveryAvailability?.GitHubCliAvailable ?? IsExecutableAvailable("gh");
+        var deliveryConfigured = deliveryGitAvailable && deliveryGitHubCliAvailable;
         return Ok(new SystemCapabilitiesResponse(
             options.Mode,
             provider,
@@ -39,23 +44,37 @@ public sealed class SystemController(ForgeAiOptions options, OpenAIConfiguration
             isFake || isOpenAi && planningConfigured,
             implementationConfigured,
             true,
-            false,
+            implementationConfigured && failureAnalysisConfigured,
             false,
             implementationConfigured,
-            false,
+            deliveryConfigured,
             isFake,
             openAiImplementationAvailable,
             false,
-            false,
-            false,
-            false,
+            deliveryConfigured,
+            deliveryConfigured,
+            deliveryConfigured,
             provider,
             options.VerificationPlanningModel,
             options.VerificationPlanningReasoningEffort,
             verificationConfigured,
             true,
             false,
-            false));
+            failureAnalysisConfigured,
+            failureAnalysisConfigured,
+            implementationConfigured && failureAnalysisConfigured,
+            deliveryConfigured,
+            false,
+            deliveryGitAvailable,
+            deliveryGitHubCliAvailable));
+    }
+
+    private static bool IsExecutableAvailable(string name)
+    {
+        var path = Environment.GetEnvironmentVariable("PATH") ?? string.Empty;
+        var extensions = OperatingSystem.IsWindows() ? new[] { ".exe", ".cmd", ".bat", string.Empty } : new[] { string.Empty };
+        return path.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries)
+            .Any(directory => extensions.Any(extension => System.IO.File.Exists(Path.Combine(directory, name + extension))));
     }
 }
 

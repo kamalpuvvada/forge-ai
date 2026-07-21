@@ -12,8 +12,35 @@ public sealed class FakeVerificationPlanEngine : IVerificationPlanEngine
         cancellationToken.ThrowIfCancellationRequested();
         ArgumentNullException.ThrowIfNull(context);
         var cases = new List<VerificationTestCaseCandidate>();
+        if (context.PreviousPlan is { } previousPlan)
+        {
+            foreach (var failure in context.PreviousFailureEvidence ?? [])
+            {
+                var priorCase = previousPlan.TestCases.Single(item => item.TestCaseId == failure.TestCaseId);
+                cases.Add(new VerificationTestCaseCandidate(
+                    cases.Count + 1,
+                    $"Regression: {priorCase.Title}",
+                    "Recheck the previously failed or blocked behavior against the approved correction revision.",
+                    VerificationTestCategory.Regression,
+                    true,
+                    ["Use correction revision 2 and the same relevant setup as the originating case."],
+                    [],
+                    [new VerificationTestStepCandidate(1,
+                        "Repeat the originating manual verification behavior and record the corrected observation.",
+                        null,
+                        "The previously reported failure is no longer present in the corrected revision.")],
+                    "The corrected revision satisfies the originating expected result.",
+                    [],
+                    ["Covers one exact prior failed-result revision."],
+                    ["Record concise user-reported evidence for this regression check."],
+                    ["Forge does not execute this check or independently verify the result."],
+                    priorCase.TestCaseId,
+                    [failure.ResultRevisionId]));
+            }
+        }
         foreach (var command in context.ApprovedValidationCommands.Take(11))
         {
+            if (cases.Count >= 11) break;
             var category = Category(command.Command);
             cases.Add(new VerificationTestCaseCandidate(
                 cases.Count + 1,
