@@ -42,20 +42,92 @@
 .approval-dialog h2 { margin: 0 0 10px; }
 .approval-dialog p { overflow-wrap: anywhere; }
 .approval-dialog ul { margin: 16px 0 22px; padding-left: 20px; color: var(--muted); }
-.verification-panel { margin-top: 1.5rem; padding: clamp(1rem, 3vw, 2rem); border: 1px solid var(--line); border-radius: 1rem; background: #fffdf8; }
-.verification-panel h2 { margin-top: .35rem; }
-.verification-trust { display: flex; flex-wrap: wrap; gap: .65rem 1rem; align-items: center; margin: 1rem 0; padding: .8rem; border-left: 4px solid #bc6c25; background: #fff7e8; }
-.verification-trust small { flex-basis: 100%; }
-.verification-panel dl { display: grid; gap: .5rem; }
-.verification-panel dl div { display: grid; grid-template-columns: minmax(8rem, 12rem) 1fr; gap: 1rem; }
-.verification-panel dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
-.verification-case-tabs { display: grid; gap: .5rem; margin: 1rem 0; }
-.verification-case-tabs button { padding: .75rem; text-align: left; border: 1px solid #cbc5b9; border-radius: .5rem; background: white; }
-.verification-case-tabs button[aria-current="true"] { border-color: #7f4f24; box-shadow: inset 4px 0 #7f4f24; }
-.verification-case fieldset, .verification-completion { display: grid; gap: 1rem; margin: 1rem 0; padding: 1rem; border: 1px solid #cbc5b9; border-radius: .75rem; }
-.verification-case label, .verification-completion label { display: grid; gap: .35rem; }
-.verification-case textarea, .verification-completion textarea, .verification-case input, .verification-case select { width: 100%; box-sizing: border-box; }
-.verification-case li small, .verification-case li code { display: block; margin-top: .25rem; }
+.verification-panel { display: grid; gap: 14px; margin-top: 0; padding: 28px 42px 34px; border-top: 1px solid var(--line); background: #fff; }
+.verification-panel h2 { max-width: 680px; margin: 0; font-size: clamp(22px, 3vw, 28px); letter-spacing: -.025em; }
+.verification-panel .eyebrow { margin: 0; }
+.verification-intro, .verification-summary, .verification-scope { max-width: 720px; margin: 0; color: var(--muted); font-size: 12px; line-height: 1.65; }
+.verification-summary { color: var(--ink); }
+.verification-scope { font-size: 11px; }
+.verification-status-strip { display: flex; flex-wrap: wrap; gap: 6px 14px; align-items: center; padding: 10px 12px; border: 1px solid var(--line); background: #f7f9f6; color: var(--muted); font: 500 9px/1.45 'IBM Plex Mono', monospace; }
+.verification-status-strip strong { color: var(--green-dark); letter-spacing: .04em; }
+.verification-status-strip span { padding-left: 14px; border-left: 1px solid #d4dbd5; }
+.verification-status-strip small { flex-basis: 100%; color: #7c867f; }
+.verification-generation-action { display: flex; justify-content: space-between; align-items: center; gap: 18px; }
+.verification-generation-action p { margin: 0; color: var(--muted); font-size: 11px; line-height: 1.5; }
+.verification-metadata { display: grid; gap: 0; margin: 0; border: 1px solid var(--line); background: #fff; }
+.verification-metadata div { display: grid; grid-template-columns: 150px minmax(0, 1fr); gap: 14px; padding: 9px 12px; border-bottom: 1px solid var(--line); }
+.verification-metadata div:last-child { border-bottom: 0; }
+.verification-metadata dt { color: var(--muted); font-size: 10px; }
+.verification-metadata dd { min-width: 0; margin: 0; }
+.verification-metadata code { display: block; max-width: 100%; overflow-wrap: anywhere; color: #435249; font: 9px/1.5 'IBM Plex Mono', monospace; }
+.verification-preconditions { border: 1px solid var(--line); background: #fff; }
+.verification-preconditions summary, .verification-case-history summary { display: flex; justify-content: space-between; gap: 12px; padding: 11px 12px; cursor: pointer; color: var(--green-dark); font: 600 9px 'IBM Plex Mono', monospace; text-transform: uppercase; }
+.verification-preconditions ul { margin: 0; padding: 0 32px 13px; color: var(--muted); font-size: 11px; line-height: 1.6; }
+.verification-plan-actions { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 10px; }
+.verification-plan-actions > .primary-button { flex: 0 0 auto; }
+.verification-documents { display: flex; flex: 1 1 520px; justify-content: space-between; align-items: center; gap: 14px; padding: 12px 14px; border: 1px solid var(--line); background: #f7f9f6; }
+.verification-documents > div:first-child { min-width: 120px; }
+.verification-documents strong { font-size: 11px; }
+.verification-documents p { margin: 3px 0 0; color: var(--muted); font-size: 9px; }
+.verification-document-actions, .verification-completion-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
+.verification-document-actions .secondary-button { min-height: 36px; padding: 0 11px; font-size: 10px; }
+.verification-documents .export-error { flex-basis: 100%; margin: 0; }
+.verification-progress { margin: 4px 0 0; padding: 10px 12px; border: 1px solid #cbd6cc; background: #f5f8f3; color: var(--muted); font-size: 11px; }
+.verification-progress strong { color: var(--green-dark); }
+.verification-cases { display: grid; gap: 8px; }
+.verification-case-card { min-width: 0; border: 1px solid var(--line); background: #fff; }
+.verification-case-card:has(.verification-case-summary:focus-visible) { border-color: var(--green); }
+.verification-case-summary { width: 100%; display: grid; grid-template-columns: 34px minmax(0, 1fr) auto auto 18px; align-items: center; gap: 10px; padding: 12px 13px; border: 0; background: #fff; color: var(--ink); text-align: left; cursor: pointer; }
+.verification-case-summary:hover { background: #f7f9f6; }
+.verification-case-summary[aria-expanded="true"] { background: #f5f8f3; box-shadow: inset 3px 0 var(--green); }
+.case-number { color: var(--green); font: 600 9px 'IBM Plex Mono', monospace; }
+.case-title { min-width: 0; font-size: 12px; font-weight: 600; overflow-wrap: anywhere; }
+.case-requirement, .case-result { padding: 3px 6px; background: #edf1ed; color: #59655d; font: 600 8px 'IBM Plex Mono', monospace; text-transform: uppercase; }
+.status-passed .case-result, .status-notapplicable .case-result { background: #eaf4ed; color: var(--green-dark); }
+.status-failed .case-result, .status-blocked .case-result { background: #fff0e9; color: #8b4d32; }
+.case-disclosure { color: var(--green); font: 600 15px 'IBM Plex Mono', monospace; text-align: center; }
+.verification-case-body { min-width: 0; padding: 14px; border-top: 1px solid var(--line); }
+.verification-result-summary { margin-bottom: 12px; padding: 10px 12px; border: 1px solid #cbd6cc; background: #f5f8f3; }
+.verification-result-summary strong { color: var(--green-dark); font: 600 9px 'IBM Plex Mono', monospace; }
+.verification-result-summary p, .verification-result-summary small { display: block; margin: 5px 0 0; color: var(--muted); font-size: 10px; line-height: 1.5; }
+.verification-result-summary dl { display: grid; gap: 5px; margin: 10px 0 0; }
+.verification-result-summary dl div { display: grid; grid-template-columns: 100px minmax(0, 1fr); gap: 10px; }
+.verification-result-summary dt { color: var(--muted); font-size: 9px; }
+.verification-result-summary dd { min-width: 0; margin: 0; overflow-wrap: anywhere; font-size: 10px; }
+.verification-case fieldset, .verification-completion, .verification-failure-fields { min-width: 0; display: grid; gap: 13px; margin: 0; padding: 0; border: 0; }
+.verification-case legend, .verification-completion legend, .verification-failure-fields legend { padding: 0; color: var(--green-dark); font: 600 10px 'IBM Plex Mono', monospace; text-transform: uppercase; }
+.verification-case-guidance { display: grid; gap: 10px; }
+.verification-case-guidance section { padding: 11px 12px; border: 1px solid var(--line); background: #f7f9f6; }
+.verification-case-guidance section > small { color: var(--green); font: 600 8px 'IBM Plex Mono', monospace; letter-spacing: .06em; }
+.verification-case-guidance p { margin: 5px 0 0; color: #4e5b53; font-size: 11px; line-height: 1.55; }
+.verification-case-guidance ol { margin: 7px 0 0; padding-left: 20px; }
+.verification-case-guidance li { padding: 5px 0; color: var(--muted); font-size: 11px; }
+.verification-case-guidance li p { margin: 0; }
+.verification-case-guidance li small, .verification-case-guidance li code { display: block; max-width: 100%; margin-top: 4px; overflow-wrap: anywhere; font-size: 9px; }
+.manual-label { width: fit-content; padding: 4px 7px; border: 1px solid #cbd6cc; background: #eef4ef; color: var(--green-dark); font: 600 8px 'IBM Plex Mono', monospace; letter-spacing: .04em; }
+.verification-form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.verification-case label, .verification-completion label, .verification-failure-fields label { min-width: 0; display: grid; gap: 5px; color: #536158; font-size: 10px; font-weight: 600; }
+.verification-case textarea, .verification-completion textarea, .verification-case input, .verification-case select, .verification-failure-fields textarea, .verification-failure-fields input, .verification-failure-fields select { width: 100%; max-width: 100%; box-sizing: border-box; }
+.verification-case textarea, .verification-completion textarea, .verification-failure-fields textarea { min-height: 76px; resize: vertical; }
+.verification-failure-fields { padding: 13px; border: 1px solid #e1c7bb; background: #fff8f4; }
+.verification-save-row { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+.verification-save-row span { color: var(--muted); font-size: 9px; }
+.verification-case-history { margin-top: 12px; border: 1px solid var(--line); background: #f7f9f6; }
+.verification-case-history article { display: grid; gap: 4px; padding: 10px 12px; border-top: 1px solid var(--line); }
+.verification-case-history article strong, .verification-case-history article span { font: 600 9px/1.45 'IBM Plex Mono', monospace; }
+.verification-case-history article span { color: var(--muted); }
+.verification-case-history article p { margin: 2px 0 0; color: var(--muted); font-size: 10px; }
+.verification-completion { margin-top: 6px; padding: 16px; border: 1px solid var(--line); background: #f7f9f6; }
+.verification-completion > p { margin: 0; color: var(--muted); font-size: 11px; }
+.verification-confirmation { display: flex!important; grid-template-columns: none; align-items: flex-start; gap: 9px!important; }
+.verification-confirmation input { width: auto; margin-top: 2px; }
+.verification-completion-actions { justify-content: flex-start; }
+.verification-boundary { margin: 0; padding: 11px 12px; border-left: 3px solid var(--green); background: #f5f8f3; color: var(--muted); font-size: 10px; line-height: 1.55; }
+.verification-terminal { text-align: left; }
+.verification-terminal .verification-documents { flex: none; }
+.terminal-cases { margin-top: 2px; }
+.verification-failed .verification-result-summary { border-color: #e1c7bb; background: #fff8f4; }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 
 @media (max-width: 640px) {
   .progress { grid-template-columns: repeat(9, 92px); }
@@ -66,5 +138,18 @@
   .changed-file-review summary { grid-template-columns: minmax(0, 1fr) auto; }
   .changed-file-review summary .diff-counts { grid-column: 1 / -1; }
   .diff-truncation-banner.compact { display: grid; }
-  .verification-panel dl div { grid-template-columns: 1fr; gap: .15rem; }
+  .verification-panel { padding: 24px 20px 28px; }
+  .verification-generation-action, .verification-documents, .verification-save-row { align-items: stretch; flex-direction: column; }
+  .verification-status-strip span { padding-left: 0; border-left: 0; }
+  .verification-metadata div { grid-template-columns: 1fr; gap: 3px; }
+  .verification-document-actions, .verification-completion-actions { display: grid; grid-template-columns: 1fr; }
+  .verification-document-actions button, .verification-completion-actions button, .verification-generation-action button, .verification-save-row button { width: 100%; }
+  .verification-case-summary { grid-template-columns: 28px minmax(0, 1fr) 18px; gap: 8px; }
+  .case-number { grid-column: 1; grid-row: 1 / span 2; }
+  .case-title { grid-column: 2; grid-row: 1; }
+  .case-requirement, .case-result { grid-column: 2; grid-row: 2; width: fit-content; }
+  .case-result { margin-left: 66px; }
+  .case-disclosure { grid-column: 3; grid-row: 1 / span 2; }
+  .verification-form-grid { grid-template-columns: 1fr; }
+  .verification-result-summary dl div { grid-template-columns: 1fr; gap: 2px; }
 }

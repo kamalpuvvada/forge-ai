@@ -799,6 +799,20 @@ describe('App task navigation hardening', () => {
     expect(findButton(rendered.container, 'Download task report PDF')).toBeTruthy()
   })
 
+  it('groups later verification documents once without a duplicate approved-plan section', async () => {
+    const manual = buildManualVerificationTask(firstId, true)
+    manual.implementationPlan = buildPlan()
+    manual.planApprovedAt = '2026-07-18T12:05:00.000Z'
+    forgeApi.getTask.mockResolvedValue(manual)
+    await navigate(taskUrl(firstId))
+    const rendered = await renderApp()
+
+    expect(rendered.container.textContent).not.toContain('Approved plan documents')
+    expect([...rendered.container.querySelectorAll('button')].filter(button => button.textContent === 'Approved plan PDF')).toHaveLength(1)
+    expect([...rendered.container.querySelectorAll('button')].filter(button => button.textContent === 'Verification plan PDF')).toHaveLength(1)
+    expect([...rendered.container.querySelectorAll('button')].filter(button => button.textContent === 'Task report PDF')).toHaveLength(1)
+  })
+
   it('does not let a stale implementation response restore a task after New task navigation', async () => {
     const approved = buildTask(firstId, 'PlanApproved', { implementationPlan: buildPlan() })
     const pending = deferred<EngineeringTask>()

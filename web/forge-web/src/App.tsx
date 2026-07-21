@@ -622,7 +622,10 @@ function App() {
     ?? false
   const persistedCheckoutVerified = task?.implementationResult?.activeCheckoutVerified === true
   const hasApprovedPlan = Boolean(task?.implementationPlan && task.planApprovedAt)
-  const approvedPlanControlsRenderedInState = task ? ['PlanApproved', 'Implementing', 'AwaitingImplementationReview', 'ImplementationApproved'].includes(task.status) : false
+  const approvedPlanControlsRenderedInState = task ? [
+    'PlanApproved', 'Implementing', 'AwaitingImplementationReview', 'ImplementationApproved',
+    'AwaitingManualVerification', 'ManualVerificationFailed', 'ReadyForDelivery',
+  ].includes(task.status) : false
   const activeImplementationRevision = task?.implementationRevisions.find(revision => revision.revisionId === task.activeImplementationRevisionId) ?? null
   const nativeApprovalDialogSupported = typeof HTMLDialogElement !== 'undefined'
     && typeof HTMLDialogElement.prototype.showModal === 'function'
@@ -767,7 +770,20 @@ function App() {
               : approvalDialogOpen && <div className="approval-dialog approval-dialog-fallback" role="dialog" aria-modal="true" aria-labelledby="implementation-approval-title" aria-describedby="implementation-approval-description" onKeyDown={event => { if (event.key === 'Escape') { event.preventDefault(); closeApprovalDialog() } }}>{approvalDialogContents}</div>}
             <div className="export-actions"><button className="secondary-button" onClick={() => void exportPdf('plan')} disabled={exportingPdf !== null}>Download approved plan</button><button className="secondary-button" onClick={() => void exportPdf('task')} disabled={exportingPdf !== null}>Download task report PDF</button></div>{pdfExportError && <p className="export-error" role="alert">{pdfExportError}</p>}
           </div>}
-          {task && ['ImplementationApproved', 'VerificationPlanning', 'AwaitingManualVerification', 'ManualVerificationFailed', 'ReadyForDelivery'].includes(task.status) && <VerificationPanel task={task} capabilities={capabilities} busy={busy} onGenerate={() => void generateVerificationPlan()} onStart={startVerificationAttempt} onSaveCase={saveVerificationCase} onComplete={completeVerification} onExportPlan={() => void exportVerificationPlan()} />}
+          {task && ['ImplementationApproved', 'VerificationPlanning', 'AwaitingManualVerification', 'ManualVerificationFailed', 'ReadyForDelivery'].includes(task.status) && <VerificationPanel
+            task={task}
+            capabilities={capabilities}
+            busy={busy}
+            documentsBusy={exportingPdf !== null}
+            documentError={pdfExportError}
+            onGenerate={() => void generateVerificationPlan()}
+            onStart={startVerificationAttempt}
+            onSaveCase={saveVerificationCase}
+            onComplete={completeVerification}
+            onExportPlan={() => void exportVerificationPlan()}
+            onExportApprovedPlan={() => void exportPdf('plan')}
+            onExportTaskReport={() => void exportPdf('task')}
+          />}
           {task && hasApprovedPlan && !approvedPlanControlsRenderedInState && <div className="semantic-plan-actions"><div><strong>Approved plan documents</strong><p>The persisted plan approval remains valid in this later workflow state.</p></div><div className="export-actions"><button className="secondary-button" onClick={() => void exportPdf('plan')} disabled={exportingPdf !== null}>Download approved plan</button><button className="secondary-button" onClick={() => void exportPdf('task')} disabled={exportingPdf !== null}>Download task report PDF</button></div></div>}
           {task && task.evidenceItems.length > 0 && <section className="evidence-view"><div className="evidence-heading"><div><p className="eyebrow">SELECTED REPOSITORY EVIDENCE</p><h3>{task.evidenceFilesSelected} files · {task.totalEvidenceCharacters.toLocaleString()} characters</h3></div><span>{task.evidenceFilesInspected} eligible files inspected</span></div>{task.evidenceItems.map(item => <details className="evidence-item" key={item.id}><summary><b>{item.id}</b><code>{item.relativePath}:{item.startLine}-{item.endLine}</code><span>score {item.score}</span></summary><p>{item.reasonSelected}</p><pre>{item.excerpt}</pre></details>)}</section>}
         </section>
