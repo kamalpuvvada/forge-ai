@@ -10,8 +10,7 @@ public sealed class OpenAIVerificationPlanEngine(
     ForgeAiOptions options,
     IOpenAIResponsesGateway? gateway,
     ModelCostCalculator costCalculator,
-    TimeProvider timeProvider,
-    bool allowInitialPlanLanguageOverride = false) : IVerificationPlanEngine
+    TimeProvider timeProvider) : IVerificationPlanEngine
 {
     internal const int MaximumRequirementBytes = 8 * 1024;
     internal const int MaximumPlanBytes = 32 * 1024;
@@ -151,13 +150,7 @@ public sealed class OpenAIVerificationPlanEngine(
                     Model = options.VerificationPlanningModel,
                     ReasoningEffort = options.VerificationPlanningReasoningEffort
                 };
-                var initialPlanLanguageOverrideApplied = false;
-                try
-                {
-                    candidate = VerificationValidator.ValidateCandidateForGeneration(context, candidate,
-                        new VerificationLimits(), allowInitialPlanLanguageOverride,
-                        out initialPlanLanguageOverrideApplied);
-                }
+                try { VerificationValidator.ValidateCandidate(context, candidate, new VerificationLimits()); }
                 catch (VerificationException exception)
                 {
                     throw Failure("verification_validation_rejected",
@@ -166,7 +159,7 @@ public sealed class OpenAIVerificationPlanEngine(
                 var successfulCall = CreateCall(callId, startedAt, response, true, null, pricing);
                 calls.Add(successfulCall);
                 await observer.RecordCallAsync(callId, successfulCall, CancellationToken.None);
-                return new VerificationPlanEvaluation(candidate, calls, initialPlanLanguageOverrideApplied);
+                return new VerificationPlanEvaluation(candidate, calls);
             }
             catch (OpenAITransportException exception) when (exception.Retryable &&
                 attempt + 1 < MaximumLogicalAttemptsPerCommand)

@@ -82,8 +82,7 @@ public sealed record VerificationPlan(
     VerificationPlanStatus Status,
     IReadOnlyList<Guid> ModelCallIds,
     Guid? SupersedesPlanId,
-    string? RegenerationReason,
-    bool InitialPlanLanguageOverrideApplied = false);
+    string? RegenerationReason);
 
 public sealed record VerificationTestStepCandidate(
     int Order,
@@ -142,18 +141,14 @@ public sealed record VerificationPlanContext(
     IReadOnlyList<ManualCaseResultRevision>? PreviousFailureEvidence = null,
     FailureAnalysis? FailureAnalysis = null,
     CorrectionProposal? CorrectionProposal = null,
-    IReadOnlyList<string>? ApprovedManualTestData = null,
-    bool InitialPlanLanguageOverrideEligible = false);
+    IReadOnlyList<string>? ApprovedManualTestData = null);
 
 public sealed record VerificationPlanEvaluation(
     VerificationPlanCandidate Candidate,
-    IReadOnlyList<ModelCallRecord> ModelCalls,
-    bool InitialPlanLanguageOverrideApplied = false)
+    IReadOnlyList<ModelCallRecord> ModelCalls)
 {
     public VerificationPlanEvaluation(VerificationPlanCandidate candidate) : this(candidate, []) { }
 }
-
-public sealed record VerificationPlanLanguageOverridePolicy(bool Enabled);
 
 public interface IVerificationPlanEngine
 {
@@ -487,22 +482,12 @@ public sealed class VerificationLimits
     public int GenerationLeaseSeconds { get; set; } = 300;
 }
 
-public enum VerificationValidationFailureReason
-{
-    General,
-    ManualExecutionClaim,
-    HistoricalFailureClaim
-}
-
 public sealed class VerificationException(
     string category,
     string safeMessage,
-    Exception? innerException = null,
-    VerificationValidationFailureReason validationFailureReason = VerificationValidationFailureReason.General)
-    : Exception(safeMessage, innerException)
+    Exception? innerException = null) : Exception(safeMessage, innerException)
 {
     public string Category { get; } = category;
-    public VerificationValidationFailureReason ValidationFailureReason { get; } = validationFailureReason;
 }
 
 public sealed class VerificationDurabilityException(Exception innerException)

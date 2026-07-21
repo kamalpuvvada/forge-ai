@@ -6,28 +6,18 @@ namespace Forge.Core;
 
 public static partial class VerificationValidator
 {
-    public const string InitialPlanLanguageOverrideLimitation =
-        "Development-only initial-plan text-classifier override applied. Structural, binding, command, path, and sensitive-content validation remained enforced.";
-    public const string InitialPlanLanguageOverrideSafetyNote =
-        "MANUAL — NOT EXECUTED BY FORGE. All outcomes require explicit user reporting.";
-
     public static VerificationPlan FinalizeCandidate(
         VerificationPlanContext context,
         VerificationPlanCandidate candidate,
         int planNumber,
         Guid planId,
         IReadOnlyList<Guid> modelCallIds,
-        VerificationLimits limits,
-        bool initialPlanLanguageOverrideApplied = false)
+        VerificationLimits limits)
     {
         ArgumentNullException.ThrowIfNull(context);
         ArgumentNullException.ThrowIfNull(candidate);
-        if (initialPlanLanguageOverrideApplied)
-            candidate = ValidateAppliedInitialPlanLanguageOverride(context, candidate, limits, true);
-        else
-            ValidateCandidate(context, candidate, limits);
-        if (planId == Guid.Empty || planNumber is < 1 or > 6 ||
-            initialPlanLanguageOverrideApplied && planNumber != 1)
+        ValidateCandidate(context, candidate, limits);
+        if (planId == Guid.Empty || planNumber is < 1 or > 6)
             throw Invalid("The verification plan identity is invalid.");
 
         var testCases = candidate.TestCases.Select(testCase => new VerificationTestCase(
@@ -48,8 +38,7 @@ public static partial class VerificationValidator
             Trim(candidate.Risks), Trim(candidate.Limitations), Trim(candidate.EvidenceGuidance), string.Empty,
             VerificationPlanStatus.Current, modelCallIds.ToArray(), context.PreviousPlan?.PlanId,
             context.PreviousPlan is null ? null :
-                $"Replacement verification after failure analysis {context.FailureAnalysis!.AnalysisId:D} and approved correction proposal {context.CorrectionProposal!.ProposalId:D}.",
-            initialPlanLanguageOverrideApplied);
+                $"Replacement verification after failure analysis {context.FailureAnalysis!.AnalysisId:D} and approved correction proposal {context.CorrectionProposal!.ProposalId:D}.");
         var plan = provisional with { PlanFingerprint = VerificationFingerprint.ComputePlan(context.TaskId, provisional) };
         ValidatePersistedPlan(context.TaskId, plan, context, limits);
         return plan;
@@ -59,37 +48,6 @@ public static partial class VerificationValidator
         VerificationPlanContext context,
         VerificationPlanCandidate candidate,
         VerificationLimits limits)
-        => ValidateCandidateCore(context, candidate, limits, false);
-
-    public static VerificationPlanCandidate ValidateCandidateForGeneration(
-        VerificationPlanContext context,
-        VerificationPlanCandidate candidate,
-        VerificationLimits limits,
-        bool allowInitialPlanLanguageOverride,
-        out bool initialPlanLanguageOverrideApplied)
-    {
-        initialPlanLanguageOverrideApplied = false;
-        try
-        {
-            ValidateCandidate(context, candidate, limits);
-            return candidate;
-        }
-        catch (VerificationException exception) when (
-            exception.ValidationFailureReason is VerificationValidationFailureReason.ManualExecutionClaim or
-                VerificationValidationFailureReason.HistoricalFailureClaim)
-        {
-            if (!allowInitialPlanLanguageOverride) throw;
-            var audited = ValidateAppliedInitialPlanLanguageOverride(context, candidate, limits, true);
-            initialPlanLanguageOverrideApplied = true;
-            return audited;
-        }
-    }
-
-    private static void ValidateCandidateCore(
-        VerificationPlanContext context,
-        VerificationPlanCandidate candidate,
-        VerificationLimits limits,
-        bool suppressFragileTextClassifiers)
     {
         if (!string.Equals(candidate.ContextFingerprint, context.ContextFingerprint, StringComparison.Ordinal))
             throw Invalid("The verification plan does not match its approved context.");
@@ -172,7 +130,7 @@ public static partial class VerificationValidator
         }
 
         foreach (var (value, testCase, field) in Text(candidate))
-            ValidateSafeText(value, context, testCase, field, suppressFragileTextClassifiers);
+            ValidateSafeText(value, context, testCase, field);
     }
 
     public static void ValidatePersistedPlan(
@@ -202,10 +160,7 @@ public static partial class VerificationValidator
                 item.ExpectedResult, item.NegativeOrEdgeCases, item.RegressionScope, item.EvidenceRequirements,
                 item.SafetyNotes, item.OriginTestCaseId, item.RegressionFailureReportIds)).ToArray(),
             plan.Risks, plan.Limitations, plan.EvidenceGuidance, plan.Source, plan.Model, plan.ReasoningEffort);
-        if (plan.InitialPlanLanguageOverrideApplied)
-            ValidateAppliedInitialPlanLanguageOverride(context, candidate, limits, false);
-        else
-            ValidateCandidate(context, candidate, limits);
+        ValidateCandidate(context, candidate, limits);
         var withoutFingerprint = plan with { PlanFingerprint = string.Empty };
         if (!IsLowerSha256(plan.PlanFingerprint) || !string.Equals(plan.PlanFingerprint,
                 VerificationFingerprint.ComputePlan(taskId, withoutFingerprint), StringComparison.Ordinal))
@@ -343,8 +298,7 @@ public static partial class VerificationValidator
         string value,
         VerificationPlanContext context,
         VerificationTestCaseCandidate? testCase,
-        VerificationPlanTextField field,
-        bool suppressFragileTextClassifiers)
+        VerificationPlanTextField field)
     {
         var inspected = AllowsApprovedManualContext(field)
             ? RedactExactApprovedManualTestData(value, context.ApprovedManualTestData ?? [])
@@ -352,25 +306,17 @@ public static partial class VerificationValidator
         if (SensitiveContentDetector.ContainsSensitiveValue(inspected) || HasUnsafeLocalPath(inspected) ||
             HasUnsafePlanUrl(value, field, context.ApprovedManualTestData ?? []))
             throw Invalid("The verification plan contains sensitive or absolute local data.");
-        var executionClaim = !suppressFragileTextClassifiers &&
-            (CompletedValidationStatusClaim().IsMatch(value) ||
-             CompletedBehaviorExecutionClaim().IsMatch(value) ||
-             CompletedActorClaim().IsMatch(value) ||
-             StandaloneAlreadyCompletedClaim().IsMatch(value));
-        var nonOverridableExecutionClaim = NonOverridableCompletedExecutionClaim().IsMatch(value);
-        var historicalFailureReference = !suppressFragileTextClassifiers &&
-            ExplicitHistoricalFailureClaim().IsMatch(value);
+        var executionClaim = CompletedValidationStatusClaim().IsMatch(value) ||
+            CompletedBehaviorExecutionClaim().IsMatch(value) ||
+            CompletedActorClaim().IsMatch(value) ||
+            StandaloneAlreadyCompletedClaim().IsMatch(value);
+        var historicalFailureReference = ExplicitHistoricalFailureClaim().IsMatch(value);
         if (historicalFailureReference && (context.PreviousPlan is null ||
                 HasUnknownHistoricalIdentity(value, context) ||
                 testCase is not null && !IsAllowedHistoricalFailureReference(value, context, testCase)))
-            throw Invalid("The verification plan contains an invalid historical failure reference.",
-                VerificationValidationFailureReason.HistoricalFailureClaim);
-        if (suppressFragileTextClassifiers && HistoricalGuid().IsMatch(value))
             throw Invalid("The verification plan contains an invalid historical failure reference.");
-        if (nonOverridableExecutionClaim || executionClaim &&
-            !IsAllowedHistoricalFailureReference(value, context, testCase))
-            throw Invalid("The verification plan claimed that manual verification had already been performed.",
-                VerificationValidationFailureReason.ManualExecutionClaim);
+        if (executionClaim && !IsAllowedHistoricalFailureReference(value, context, testCase))
+            throw Invalid("The verification plan claimed that manual verification had already been performed.");
         var allowed = context.ApprovedPlan.AffectedFiles.Select(item => RepositoryPathRules.Normalize(item.Path))
             .Concat(context.RepositoryEvidence.Select(item => RepositoryPathRules.Normalize(item.RelativePath)))
             .ToHashSet(RepositoryPathRules.Comparer);
@@ -737,45 +683,7 @@ public static partial class VerificationValidator
     private static string? EmptyToNull(string? value) => string.IsNullOrEmpty(value) ? null : value;
     private static bool IsLowerSha256(string value) => value.Length == 64 &&
         value.All(character => character is >= '0' and <= '9' or >= 'a' and <= 'f');
-    private static VerificationPlanCandidate ValidateAppliedInitialPlanLanguageOverride(
-        VerificationPlanContext context,
-        VerificationPlanCandidate candidate,
-        VerificationLimits limits,
-        bool requireRuntimeEligibility)
-    {
-        if (candidate.Source != VerificationPlanSource.OpenAI || context.PreviousPlan is not null ||
-            context.PreviousFailureEvidence is { Count: > 0 } || context.FailureAnalysis is not null ||
-            context.CorrectionProposal is not null || requireRuntimeEligibility &&
-            !context.InitialPlanLanguageOverrideEligible || candidate.TestCases.Any(testCase =>
-                testCase.OriginTestCaseId is not null || testCase.RegressionFailureReportIds.Count > 0) ||
-            !requireRuntimeEligibility && (!candidate.Limitations.Contains(
-                InitialPlanLanguageOverrideLimitation, StringComparer.Ordinal) || candidate.TestCases.Any(testCase =>
-                !testCase.SafetyNotes.Contains(InitialPlanLanguageOverrideSafetyNote, StringComparer.Ordinal))))
-            throw Invalid("The initial verification-plan language override is not eligible for this plan.");
-
-        var audited = candidate with
-        {
-            Limitations = AppendOnce(candidate.Limitations, InitialPlanLanguageOverrideLimitation),
-            TestCases = candidate.TestCases.Select(testCase => testCase with
-            {
-                SafetyNotes = AppendOnce(testCase.SafetyNotes, InitialPlanLanguageOverrideSafetyNote)
-            }).ToArray()
-        };
-        foreach (var (value, _, _) in Text(audited))
-            if (NonOverridableCompletedExecutionClaim().IsMatch(value))
-                throw Invalid("The verification plan claimed that manual verification had already been performed.",
-                    VerificationValidationFailureReason.ManualExecutionClaim);
-        ValidateCandidateCore(context, audited, limits, true);
-        return audited;
-    }
-
-    private static IReadOnlyList<string> AppendOnce(IReadOnlyList<string> values, string required) =>
-        values.Contains(required, StringComparer.Ordinal) ? values : values.Append(required).ToArray();
-
-    private static VerificationException Invalid(
-        string message,
-        VerificationValidationFailureReason reason = VerificationValidationFailureReason.General) =>
-        new("verification_validation", message, validationFailureReason: reason);
+    private static VerificationException Invalid(string message) => new("verification_validation", message);
 
     [GeneratedRegex("""(?i)(?:[a-z]:[\\/]|file://|\\\\[^\\/\s]+[\\/][^\s]+|(?:^|[\s'"`(])/(?:home|users|private|tmp|var|opt|etc)/[^\s'"`]+)""", RegexOptions.CultureInvariant)]
     private static partial Regex AbsoluteLocalPath();
@@ -797,9 +705,6 @@ public static partial class VerificationValidator
 
     [GeneratedRegex(@"(?i)\b(?:already|previously)\s+(?:been\s+)?(?:run|tested|passed|completed|executed|verified|confirmed|performed)\b", RegexOptions.CultureInvariant)]
     private static partial Regex StandaloneAlreadyCompletedClaim();
-
-    [GeneratedRegex(@"(?i)\b(?:forge\s+(?:executed|ran|verified|confirmed)|verification\s+(?:already\s+passed|has\s+passed)|manual\s+verification\s+was\s+(?:completed|performed)|(?:build\s+was|tests\s+were)\s+executed\s+by\s+forge|user\s+already\s+confirmed|human\s+already\s+approved)\b", RegexOptions.CultureInvariant)]
-    private static partial Regex NonOverridableCompletedExecutionClaim();
 
     [GeneratedRegex("""(?i)\b(?:username|user|password|passwd|pwd)\b\s*(?:(?::|=)|(?:is|use)\s+)?['\"]?([A-Za-z0-9._-]{3,32})""", RegexOptions.CultureInvariant)]
     private static partial Regex ApprovedCredentialValue();

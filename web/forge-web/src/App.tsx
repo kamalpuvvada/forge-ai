@@ -71,9 +71,11 @@ function App() {
   const verificationActionActive = useRef(false)
   const taskActionActive = useRef(false)
   const currentTask = useRef<EngineeringTask | null>(null)
+  const currentImplementationReviewTarget = useRef<ImplementationReviewTarget | null>(null)
   const implementationResultCache = useRef(new Map<string, ImplementationResult>())
   const currentBusy = useRef(false)
   currentTask.current = task
+  currentImplementationReviewTarget.current = implementationReviewTarget
   currentBusy.current = busy
   const selectedTaskId = task?.id ?? null
   const activeStage = task ? stageByStatus[task.status] : 0
@@ -226,7 +228,9 @@ function App() {
     const handleLocation = () => {
       const selection = parseTaskSelection(window.location.search)
       const selected = currentTask.current
-      if (selection.kind === 'task' && selected?.id.toLowerCase() === selection.id) {
+      const implementationViewRequested = new URLSearchParams(window.location.search).get('view') === 'implementation'
+      if (selection.kind === 'task' && selected?.id.toLowerCase() === selection.id &&
+        (implementationViewRequested || currentImplementationReviewTarget.current !== null)) {
         applyImplementationReviewLocation(selected, window.location.search)
         return
       }

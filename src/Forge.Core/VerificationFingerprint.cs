@@ -162,8 +162,6 @@ public static class VerificationFingerprint
         if (plan.SupersedesPlanId is { } superseded) writer.WriteString("supersedesPlanId", superseded);
         else writer.WriteNull("supersedesPlanId");
         WriteNullable(writer, "regenerationReason", plan.RegenerationReason);
-        if (plan.InitialPlanLanguageOverrideApplied)
-            writer.WriteBoolean("initialPlanLanguageOverrideApplied", true);
         writer.WriteEndObject();
     });
 

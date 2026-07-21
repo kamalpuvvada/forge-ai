@@ -294,114 +294,6 @@ public sealed class OpenAIVerificationPlanEngineTests
     }
 
     [Fact]
-    public async Task Initial_plan_language_override_is_opt_in_and_preserves_openai_audit_and_usage()
-    {
-        var context = Context();
-        var output = ValidJson(context).Replace(
-            "Concise manual verification guidance.",
-            "Test unsuccessful credentials; confirm the previous failed login submission shows the failure message and whether the successful behavior was verified against the expected result.",
-            StringComparison.Ordinal);
-
-        var disabled = await Assert.ThrowsAsync<VerificationProviderException>(() =>
-            Engine(new QueueGateway(Envelope(output))).GenerateAsync(context));
-        Assert.Equal(VerificationGenerationAttemptStatus.RejectedProviderOutput, disabled.DurableStatus);
-
-        var evaluation = await Engine(new QueueGateway(Envelope(output)), true).GenerateAsync(context);
-        var plan = VerificationValidator.FinalizeCandidate(context, evaluation.Candidate, 1, Guid.NewGuid(),
-            evaluation.ModelCalls.Select(call => call.Id).ToArray(), new VerificationLimits(),
-            evaluation.InitialPlanLanguageOverrideApplied);
-
-        Assert.True(evaluation.InitialPlanLanguageOverrideApplied);
-        Assert.True(plan.InitialPlanLanguageOverrideApplied);
-        Assert.Equal(VerificationPlanSource.OpenAI, plan.Source);
-        Assert.Equal("gpt-5.6-sol", plan.Model);
-        Assert.Contains(VerificationValidator.InitialPlanLanguageOverrideLimitation, plan.Limitations);
-        Assert.All(plan.TestCases, testCase => Assert.Contains(
-            VerificationValidator.InitialPlanLanguageOverrideSafetyNote, testCase.SafetyNotes));
-        var call = Assert.Single(evaluation.ModelCalls);
-        Assert.True(call.Succeeded);
-        Assert.Equal("request-id", call.ProviderRequestId);
-        Assert.Equal("response-id", call.ProviderResponseId);
-        Assert.Equal(100, call.InputTokens);
-        Assert.Equal(50, call.OutputTokens);
-        Assert.NotNull(call.EstimatedCostUsd);
-    }
-
-    public static IEnumerable<object[]> NonOverridableCompletedClaims()
-    {
-        yield return ["Forge executed the tests."];
-        yield return ["Forge ran the tests."];
-        yield return ["Forge verified the behavior."];
-        yield return ["Forge confirmed the behavior."];
-        yield return ["Verification already passed."];
-        yield return ["Verification has passed."];
-        yield return ["Manual verification was completed."];
-        yield return ["Manual verification was performed."];
-        yield return ["Build was executed by Forge."];
-        yield return ["Tests were executed by Forge."];
-        yield return ["User already confirmed the result."];
-        yield return ["Human already approved the result."];
-    }
-
-    [Theory]
-    [MemberData(nameof(NonOverridableCompletedClaims))]
-    public void Initial_plan_language_override_never_accepts_bounded_completed_claims(string wording)
-    {
-        var context = Context();
-        var candidate = OpenAIVerificationPlanEngine.Parse(ValidJson(context)) with
-        { Model = "gpt-5.6-sol", ReasoningEffort = "medium", Summary = wording };
-
-        var exception = Assert.Throws<VerificationException>(() =>
-            VerificationValidator.ValidateCandidateForGeneration(context, candidate, new VerificationLimits(), true,
-                out _));
-
-        Assert.Equal(VerificationValidationFailureReason.ManualExecutionClaim,
-            exception.ValidationFailureReason);
-    }
-
-    public static IEnumerable<object[]> UnsafeOverrideValues()
-    {
-        yield return ["api_key" + ": " + "sk-" + new string('a', 24)];
-        yield return [SyntheticSensitiveValues.BearerAuthorization()];
-        yield return [@"C:\Users\Example\project\src\App.cs"];
-        yield return ["Review `src/Unapproved.cs` manually."];
-        yield return [$"Use plan {Guid.NewGuid():D}."];
-    }
-
-    [Theory]
-    [MemberData(nameof(UnsafeOverrideValues))]
-    public void Initial_plan_language_override_preserves_content_path_and_historical_validation(string unsafeValue)
-    {
-        var context = Context();
-        var candidate = OpenAIVerificationPlanEngine.Parse(ValidJson(context)) with
-        {
-            Model = "gpt-5.6-sol", ReasoningEffort = "medium",
-            Summary = "Test unsuccessful credentials and confirm the previous failed login submission shows the expected failure message."
-        };
-        var testCase = Assert.Single(candidate.TestCases) with { TestData = [unsafeValue] };
-
-        Assert.Throws<VerificationException>(() => VerificationValidator.ValidateCandidateForGeneration(
-            context, candidate with { TestCases = [testCase] }, new VerificationLimits(), true, out _));
-    }
-
-    [Fact]
-    public void Initial_plan_language_override_preserves_approved_command_validation()
-    {
-        var context = Context();
-        var candidate = OpenAIVerificationPlanEngine.Parse(ValidJson(context)) with
-        {
-            Model = "gpt-5.6-sol", ReasoningEffort = "medium",
-            Summary = "Test unsuccessful credentials and confirm the previous failed login submission shows the expected failure message."
-        };
-        var testCase = Assert.Single(candidate.TestCases);
-        var step = Assert.Single(testCase.OrderedSteps) with { ApprovedValidationCommandId = "V999" };
-
-        Assert.Throws<VerificationException>(() => VerificationValidator.ValidateCandidateForGeneration(
-            context, candidate with { TestCases = [testCase with { OrderedSteps = [step] }] },
-            new VerificationLimits(), true, out _));
-    }
-
-    [Fact]
     public async Task Realistic_prospective_openai_manual_plan_preserves_binding_telemetry_and_manual_boundary()
     {
         var context = Context();
@@ -804,9 +696,7 @@ public sealed class OpenAIVerificationPlanEngineTests
         return unbound with { ContextFingerprint = VerificationFingerprint.ComputeContext(unbound) };
     }
 
-    private static OpenAIVerificationPlanEngine Engine(
-        IOpenAIResponsesGateway gateway,
-        bool allowInitialPlanLanguageOverride = false) => new(
+    private static OpenAIVerificationPlanEngine Engine(IOpenAIResponsesGateway gateway) => new(
         new ForgeAiOptions
         {
             Mode = ForgeAiModes.OpenAI,
@@ -814,8 +704,7 @@ public sealed class OpenAIVerificationPlanEngineTests
             VerificationPlanningReasoningEffort = "medium",
             VerificationPlanningMaxOutputTokens = 8_000,
             VerificationPlanningTimeoutSeconds = 30
-        }, gateway, new ModelCostCalculator(ForgeAiOptions.DefaultPricing()), TimeProvider.System,
-        allowInitialPlanLanguageOverride);
+        }, gateway, new ModelCostCalculator(ForgeAiOptions.DefaultPricing()), TimeProvider.System);
 
     private static OpenAIResponseEnvelope Envelope(string output) => new(
         "response-id", output, 100, 0, 50, 10, ProviderRequestId: "request-id",

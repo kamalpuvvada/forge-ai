@@ -5,8 +5,7 @@ public sealed class VerificationWorkflowService(
     IVerificationPlanEngine engine,
     ImplementationOperationCoordinator coordinator,
     VerificationLimits limits,
-    TimeProvider timeProvider,
-    VerificationPlanLanguageOverridePolicy? languageOverridePolicy = null)
+    TimeProvider timeProvider)
 {
     public async Task<EngineeringTask> GeneratePlanAsync(
         VerificationPlanGenerationCommand command,
@@ -29,8 +28,7 @@ public sealed class VerificationWorkflowService(
                 task.VerificationPlans.Count + 1,
                 Guid.NewGuid(),
                 evaluation.ModelCalls.Select(call => call.Id).ToArray(),
-                limits,
-                evaluation.InitialPlanLanguageOverrideApplied && languageOverridePolicy?.Enabled == true);
+                limits);
             return await repository.CompletePlanGenerationAsync(
                 task.Id, command.CommandId, plan, evaluation.ModelCalls, timeProvider.GetUtcNow(),
                 CancellationToken.None);
@@ -223,12 +221,7 @@ public sealed class VerificationWorkflowService(
             previousFailures,
             failureAnalysis,
             correctionProposal,
-            VerificationValidator.ExtractApprovedManualTestData(task),
-            previousPlan is null && task.VerificationPlans.Count == 0 &&
-            task.ManualVerificationAttempts.Count == 0 &&
-            !task.ManualVerificationAttempts.SelectMany(attempt => attempt.ResultRevisions).Any(result =>
-                result.Result is ManualVerificationCaseResult.Failed or ManualVerificationCaseResult.Blocked) &&
-            task.FailureAnalyses.Count == 0 && task.CorrectionProposals.Count == 0);
+            VerificationValidator.ExtractApprovedManualTestData(task));
         return provisional with { ContextFingerprint = VerificationFingerprint.ComputeContext(provisional) };
     }
 }

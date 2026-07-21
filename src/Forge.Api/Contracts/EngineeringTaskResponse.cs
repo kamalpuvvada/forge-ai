@@ -347,7 +347,7 @@ public sealed record VerificationPlanResponse(
     IReadOnlyList<VerificationTestCaseResponse> TestCases, IReadOnlyList<string> Risks,
     IReadOnlyList<string> Limitations, IReadOnlyList<string> EvidenceGuidance,
     string PlanFingerprint, VerificationPlanStatus Status, string TrustLabel, string ExecutionLabel,
-    Guid? SupersedesPlanId, string? RegenerationReason, bool InitialPlanLanguageOverrideApplied);
+    Guid? SupersedesPlanId, string? RegenerationReason);
 
 public sealed record VerificationFailureDetailsResponse(
     string Title, string ExpectedResult, string ActualResult, IReadOnlyList<string> ReproductionSteps,
@@ -947,7 +947,7 @@ public sealed record EngineeringTaskResponse(
             testCase.RegressionFailureReportIds)).ToArray(),
         plan.Risks, plan.Limitations, plan.EvidenceGuidance, plan.PlanFingerprint, plan.Status,
         VerificationTrustLabels.ForgeGenerated, VerificationTrustLabels.ManualNotExecuted,
-        plan.SupersedesPlanId, plan.RegenerationReason, plan.InitialPlanLanguageOverrideApplied);
+        plan.SupersedesPlanId, plan.RegenerationReason);
 
     private static ManualCaseResultRevisionResponse ToManualResultResponse(ManualCaseResultRevision result) => new(
         result.ResultRevisionId, result.RevisionNumber, result.TestCaseId, result.Result, result.RecordedAt,

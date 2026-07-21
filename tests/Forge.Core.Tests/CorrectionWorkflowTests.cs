@@ -126,16 +126,6 @@ public sealed class CorrectionWorkflowTests
         task.BeginVerificationPlanGeneration(generation, Now.AddMinutes(16));
         var replacementContext = VerificationWorkflowService.CreateContext(task, Now.AddMinutes(16));
         var replacementCandidate = (await new FakeVerificationPlanEngine().GenerateAsync(replacementContext)).Candidate;
-        var replacementOverrideException = Assert.Throws<VerificationException>(() =>
-            VerificationValidator.ValidateCandidateForGeneration(replacementContext, replacementCandidate with
-            {
-                Source = VerificationPlanSource.OpenAI,
-                Model = "gpt-5.6-sol",
-                ReasoningEffort = "medium",
-                Summary = "Confirm the manual verification was successful."
-            }, VerificationLimits, true, out _));
-        Assert.Equal("The initial verification-plan language override is not eligible for this plan.",
-            replacementOverrideException.Message);
         var regressionIndex = replacementCandidate.TestCases.ToList().FindIndex(item => item.RegressionFailureReportIds.Count > 0);
         Assert.True(regressionIndex >= 0);
         var regression = replacementCandidate.TestCases[regressionIndex];

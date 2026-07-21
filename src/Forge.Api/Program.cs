@@ -23,10 +23,6 @@ var databasePath = Path.GetFullPath(configuredDataSource, builder.Environment.Co
 var connectionString = $"Data Source={databasePath}";
 var aiOptions = builder.Configuration.GetSection("Forge:AI").Get<ForgeAiOptions>() ?? new ForgeAiOptions();
 aiOptions.ValidateSyntax();
-var verificationLanguageOverridePolicy = new VerificationPlanLanguageOverridePolicy(
-    builder.Environment.IsDevelopment() &&
-    string.Equals(aiOptions.Mode, ForgeAiModes.OpenAI, StringComparison.OrdinalIgnoreCase) &&
-    builder.Configuration.GetValue<bool>("Forge:Verification:AllowInitialPlanLanguageOverride"));
 var analysisLimits = builder.Configuration.GetSection("Forge:RepositoryAnalysis").Get<RepositoryAnalysisLimits>() ?? new RepositoryAnalysisLimits();
 var implementationLimits = builder.Configuration.GetSection("Forge:Implementation:Limits").Get<ImplementationLimits>() ?? new ImplementationLimits();
 var verificationLimits = builder.Configuration.GetSection("Forge:Verification:Limits").Get<VerificationLimits>() ?? new VerificationLimits();
@@ -48,7 +44,6 @@ builder.Services.AddSingleton(aiOptions);
 builder.Services.AddSingleton(analysisLimits);
 builder.Services.AddSingleton(implementationLimits);
 builder.Services.AddSingleton(verificationLimits);
-builder.Services.AddSingleton(verificationLanguageOverridePolicy);
 builder.Services.AddSingleton(correctionLimits);
 builder.Services.AddSingleton(workspaceOptions);
 builder.Services.AddSingleton(gitProcessOptions);
@@ -100,8 +95,7 @@ builder.Services.AddSingleton<IVerificationPlanEngine>(services => aiOptions.Mod
         aiOptions,
         services.GetService<IOpenAIResponsesGateway>(),
         services.GetRequiredService<ModelCostCalculator>(),
-        services.GetRequiredService<TimeProvider>(),
-        verificationLanguageOverridePolicy.Enabled),
+        services.GetRequiredService<TimeProvider>()),
     _ => throw new InvalidOperationException($"Unsupported Forge AI mode '{aiOptions.Mode}'. Use 'Fake' or 'OpenAI'.")
 });
 builder.Services.AddSingleton<IFailureAnalysisEngine>(services => aiOptions.Mode switch

@@ -147,6 +147,7 @@ describe('App task navigation hardening', () => {
     while (mountedApps.length > 0) {
       await mountedApps.pop()!()
     }
+    vi.restoreAllMocks()
     document.body.innerHTML = ''
   })
 
