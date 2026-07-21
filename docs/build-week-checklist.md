@@ -15,6 +15,16 @@
 - [x] Persisted bounded changed-file metadata and human diff-review state
 - [x] Bounded implementation-revision ledger and exact persisted-review approval
 - [x] Globally bound atomic approval commands, verified-checkout eligibility, and token-safe branch projection
+- [x] Bounded Fake/OpenAI manual verification-plan generation with no command execution
+- [x] Append-only user-reported manual results and explicit pass/fail completion
+- [x] Exact revision/plan/result binding and truthful `ReadyForDelivery` gate
+- [x] Verification-plan PDF and task-report verification chronology
+- [x] Fail-closed verification eligibility and truthful complete/partial/unavailable cost projection
+- [x] Positive legacy proof: version zero only without verification artifacts; all verification data requires current parent/child format
+- [x] Explicit backend authorization for manual Start, Save, Pass, and Fail; Start requires empty attempt history, and nonempty history requires a current pointer with no fallback
+- [x] Immutable verification-child ownership guarded on INSERT and `TaskId` UPDATE
+- [x] Structural query-bearing repository-path checks and complete fail-closed full-task/history frontend decoders
+- [ ] Automated validation and failure analysis/correction (future slices)
 - [x] Stage-specific clarification/planning telemetry and truthful capabilities
 - [x] README setup and validation commands
 - [ ] Curated demo repository and demo data

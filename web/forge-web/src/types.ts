@@ -1,4 +1,4 @@
-export type WorkflowStatus = 'Draft' | 'Clarifying' | 'RequirementSummaryReady' | 'AwaitingRequirementApproval' | 'ReadyForPlanning' | 'Planning' | 'AwaitingPlanApproval' | 'PlanApproved' | 'Implementing' | 'AwaitingImplementationReview' | 'ImplementationApproved' | 'Validating' | 'Reviewing' | 'Completed' | 'Failed'
+export type WorkflowStatus = 'Draft' | 'Clarifying' | 'RequirementSummaryReady' | 'AwaitingRequirementApproval' | 'ReadyForPlanning' | 'Planning' | 'AwaitingPlanApproval' | 'PlanApproved' | 'Implementing' | 'AwaitingImplementationReview' | 'ImplementationApproved' | 'VerificationPlanning' | 'AwaitingManualVerification' | 'ManualVerificationFailed' | 'ReadyForDelivery' | 'Validating' | 'Reviewing' | 'Completed' | 'Failed'
 export interface ClarificationAnswer { question: string; answer: string; answeredAt: string }
 export interface RequirementRevision { correction: string; previousSummary: string; submittedAt: string }
 export interface PlanRevision {
@@ -30,6 +30,11 @@ export interface ModelCall {
   storedPricingSnapshot: { inputPerMillionUsd: number; cachedInputPerMillionUsd: number; outputPerMillionUsd: number } | null
   failureCategory: string | null
   providerRequestId: string | null
+  providerUsageAvailability?: 'Complete' | 'Partial' | 'Unavailable' | null
+  providerUsageAvailable?: boolean | null
+  verificationDispatchDisposition?: 'DefinitelyNotDispatched' | 'PossiblyDispatched' | 'ResponseReceived' | null
+  providerHttpStatusCode?: number | null
+  isPartialEstimate?: boolean
 }
 export interface ModelTelemetry {
   totalCalls: number
@@ -42,6 +47,15 @@ export interface ModelTelemetry {
   totalEstimatedCostUsd: number | null
   costUnavailableCallCount: number
   isPartialEstimate: boolean
+  verificationLogicalAttemptCount?: number
+  verificationPhysicalRequestCount?: number
+  verificationPossiblyDispatchedRequestCount?: number
+  verificationDefinitelyUndispatchedAttemptCount?: number
+  completeEstimatedSubtotalUsd?: number | null
+  partialEstimatedSubtotalUsd?: number | null
+  availableEstimatedSubtotalUsd?: number | null
+  hasPartialEstimates?: boolean
+  possiblyDispatchedUnavailableEstimatedCostCallCount?: number
   calls: ModelCall[]
 }
 export interface RepositoryFile { relativePath: string; extension: string; sizeBytes: number; lineCount: number; probableRole: string; isTest: boolean; association: string | null; declaredSymbols: string[] }
@@ -86,6 +100,52 @@ export interface ImplementationRevision {
   failureCategory: string | null; failureMessage: string | null; resultFingerprint: string | null; changedFileCount: number
   correctionSubmittedAt: string | null; approvedAt: string | null; isCurrent: boolean; isApproved: boolean
 }
+export type VerificationCaseResult = 'NotStarted' | 'Passed' | 'Failed' | 'Blocked' | 'NotApplicable'
+export interface VerificationTestStep { order: number; instruction: string; approvedValidationCommandId: string | null; expectedObservation: string }
+export interface VerificationTestCase {
+  testCaseId: string; order: number; title: string; objective: string; category: string; isRequired: boolean
+  preconditions: string[]; testData: string[]; orderedSteps: VerificationTestStep[]; expectedResult: string
+  negativeOrEdgeCases: string[]; regressionScope: string[]; evidenceRequirements: string[]; safetyNotes: string[]
+}
+export interface VerificationPlan {
+  planId: string; planNumber: number; implementationRevisionId: string; implementationResultFingerprint: string
+  approvedRequirementFingerprint: string; approvedPlanFingerprint: string; generationContextFingerprint: string
+  generatedAt: string; source: 'DeterministicFake' | 'OpenAI'; model: string | null; reasoningEffort: string | null
+  summary: string; scope: string; preconditions: string[]; testCases: VerificationTestCase[]; risks: string[]
+  limitations: string[]; evidenceGuidance: string[]; planFingerprint: string; status: 'Current' | 'Superseded' | 'Completed'
+  trustLabel: string; executionLabel: string
+}
+export interface VerificationFailureDetails {
+  title: string; expectedResult: string; actualResult: string; reproductionSteps: string[]; environmentNotes: string[]
+  errorMessage: string | null; evidenceDescriptions: string[]; severity: 'Low' | 'Medium' | 'High' | 'Critical'
+}
+export interface ManualCaseResultRevision {
+  resultRevisionId: string; revisionNumber: number; testCaseId: string; result: VerificationCaseResult; recordedAt: string
+  notes: string | null; actualResult: string | null; evidenceDescriptions: string[]; notApplicableReason: string | null
+  failureDetails: VerificationFailureDetails | null; supersedesResultRevisionId: string | null; trustLabel: string
+}
+export interface ManualVerificationAttempt {
+  attemptId: string; attemptNumber: number; verificationPlanId: string; verificationPlanFingerprint: string
+  implementationRevisionId: string; implementationResultFingerprint: string; startedAt: string; completedAt: string | null
+  status: 'InProgress' | 'CompletedPassed' | 'CompletedFailed'; resultRevisions: ManualCaseResultRevision[]
+  currentCaseResults: ManualCaseResultRevision[]; completionConfirmation: boolean | null; summary: string | null
+  attemptFingerprint: string | null; passedAt: string | null; failedAt: string | null; trustLabel: string
+}
+export interface VerificationEligibility {
+  canGenerateVerificationPlan: boolean; canStartVerificationAttempt: boolean; canRecordVerificationResult: boolean
+  canCompleteVerificationPassed: boolean; canCompleteVerificationFailed: boolean; readyForDelivery: boolean
+  ineligibilityReason: string | null
+  isInitialVerificationPlanGeneration: boolean; canRetryVerificationPlanGeneration: boolean
+  verificationGenerationStatus: 'NotStarted' | 'Active' | 'FailedBeforeDispatch' | 'RetryableProviderResponse' | 'AmbiguousAfterDispatch' | 'InterruptedBeforeDispatch' | 'Completed' | null
+  verificationGenerationStatusMessage: string | null
+}
+export interface VerificationProviderResponseTelemetry {
+  logicalCallId: string; startedAt: string; receivedAt: string; providerResponseId: string | null; providerRequestId: string | null
+  status: 'Unknown' | 'Queued' | 'InProgress' | 'Completed' | 'Incomplete' | 'Failed' | 'Cancelled'
+  incompleteReason: string | null; usageAvailability: 'Complete' | 'Partial' | 'Unavailable'; inputTokens: number | null
+  cachedInputTokens: number | null; outputTokens: number | null; reasoningTokens: number | null
+  httpStatusCode: number; dispatchDisposition: 'ResponseReceived'
+}
 export interface EngineeringTask {
   id: string
   repository: string
@@ -121,6 +181,12 @@ export interface EngineeringTask {
   approvedImplementationRevisionId: string | null
   implementationRevisions: ImplementationRevision[]
   telemetry: ModelTelemetry
+  currentVerificationPlanId?: string | null
+  currentVerificationAttemptId?: string | null
+  verificationPlans?: VerificationPlan[]
+  verificationPlanGenerationAttempts?: Array<{ commandId: string; startedAt: string; leaseExpiresAt: string; completedAt: string | null; status: 'Prepared' | 'DispatchMayHaveStarted' | 'ResponseReceived' | 'Completed' | 'FailedBeforeDispatch' | 'RetryableProviderResponse' | 'AmbiguousAfterDispatch' | 'InterruptedBeforeDispatch'; failureCategory: string | null; failureMessage: string | null; resultPlanId: string | null; modelCallIds: string[]; lastLogicalCallId: string | null; logicalCallCount: number; physicalRequestCount: number; possiblyDispatchedRequestCount: number; logicalCalls: Array<{ logicalCallId: string; startedAt: string }>; providerResponses: VerificationProviderResponseTelemetry[] }>
+  manualVerificationAttempts?: ManualVerificationAttempt[]
+  verificationEligibility?: VerificationEligibility
 }
 export interface EngineeringTaskSummary {
   id: string
@@ -129,6 +195,9 @@ export interface EngineeringTaskSummary {
   updatedAt: string
   repository: string
   originalRequirementPreview: string
+  verificationStatus?: string | null
+  verificationProgressSummary?: string | null
+  readyForDelivery?: boolean
 }
 export interface SystemCapabilities {
   aiMode: 'Fake' | 'OpenAI' | string
@@ -159,4 +228,11 @@ export interface SystemCapabilities {
   commitAvailable: boolean
   pushAvailable: boolean
   deliveryPullRequestAvailable: boolean
+  verificationPlanningProvider?: string
+  verificationPlanningModel?: string
+  verificationPlanningReasoningEffort?: string
+  verificationPlanningConfigured?: boolean
+  manualResultRecordingAvailable?: boolean
+  automatedValidationAvailable?: boolean
+  failureAnalysisAvailable?: boolean
 }

@@ -25,6 +25,7 @@ var aiOptions = builder.Configuration.GetSection("Forge:AI").Get<ForgeAiOptions>
 aiOptions.ValidateSyntax();
 var analysisLimits = builder.Configuration.GetSection("Forge:RepositoryAnalysis").Get<RepositoryAnalysisLimits>() ?? new RepositoryAnalysisLimits();
 var implementationLimits = builder.Configuration.GetSection("Forge:Implementation:Limits").Get<ImplementationLimits>() ?? new ImplementationLimits();
+var verificationLimits = builder.Configuration.GetSection("Forge:Verification:Limits").Get<VerificationLimits>() ?? new VerificationLimits();
 var workspaceOptions = builder.Configuration.GetSection("Forge:Implementation").Get<ImplementationWorkspaceOptions>() ?? new ImplementationWorkspaceOptions();
 if (!Path.IsPathFullyQualified(workspaceOptions.WorktreeRoot))
     workspaceOptions.WorktreeRoot = Path.GetFullPath(workspaceOptions.WorktreeRoot, builder.Environment.ContentRootPath);
@@ -38,6 +39,7 @@ builder.Services.AddSingleton(TimeProvider.System);
 builder.Services.AddSingleton(aiOptions);
 builder.Services.AddSingleton(analysisLimits);
 builder.Services.AddSingleton(implementationLimits);
+builder.Services.AddSingleton(verificationLimits);
 builder.Services.AddSingleton(workspaceOptions);
 builder.Services.AddSingleton(gitProcessOptions);
 builder.Services.AddSingleton<ImplementationOperationCoordinator>();
@@ -49,6 +51,7 @@ if (!string.IsNullOrWhiteSpace(apiKey))
     builder.Services.AddSingleton<IOpenAIResponsesGateway>(new SdkOpenAIResponsesGateway(apiKey));
 builder.Services.AddSingleton<IEngineeringTaskPdfExporter, TaskPdfExporter>();
 builder.Services.AddSingleton<IImplementationPlanPdfExporter, ImplementationPlanPdfExporter>();
+builder.Services.AddSingleton<IVerificationPlanPdfExporter, VerificationPlanPdfExporter>();
 builder.Services.AddSingleton<IClarificationEngine>(services => aiOptions.Mode switch
 {
     ForgeAiModes.Fake => new FakeClarificationEngine(),
@@ -79,11 +82,23 @@ builder.Services.AddSingleton<IImplementationEngine>(services => aiOptions.Mode 
         services.GetRequiredService<TimeProvider>()),
     _ => throw new InvalidOperationException($"Unsupported Forge AI mode '{aiOptions.Mode}'. Use 'Fake' or 'OpenAI'.")
 });
+builder.Services.AddSingleton<IVerificationPlanEngine>(services => aiOptions.Mode switch
+{
+    ForgeAiModes.Fake => new FakeVerificationPlanEngine(),
+    ForgeAiModes.OpenAI => new OpenAIVerificationPlanEngine(
+        aiOptions,
+        services.GetService<IOpenAIResponsesGateway>(),
+        services.GetRequiredService<ModelCostCalculator>(),
+        services.GetRequiredService<TimeProvider>()),
+    _ => throw new InvalidOperationException($"Unsupported Forge AI mode '{aiOptions.Mode}'. Use 'Fake' or 'OpenAI'.")
+});
 builder.Services.AddSingleton(services => new SqliteEngineeringTaskRepository(
-    connectionString, implementationLimits, services.GetRequiredService<TimeProvider>()));
+    connectionString, implementationLimits, services.GetRequiredService<TimeProvider>(), verificationLimits));
 builder.Services.AddSingleton<IEngineeringTaskRepository>(services =>
     services.GetRequiredService<SqliteEngineeringTaskRepository>());
 builder.Services.AddSingleton<IImplementationApprovalRepository>(services =>
+    services.GetRequiredService<SqliteEngineeringTaskRepository>());
+builder.Services.AddSingleton<IVerificationRepository>(services =>
     services.GetRequiredService<SqliteEngineeringTaskRepository>());
 builder.Services.AddSingleton<IRepositoryDiscoveryService, RepositoryDiscoveryService>();
 builder.Services.AddSingleton<IEvidenceSelectionService, DeterministicEvidenceSelectionService>();
@@ -94,6 +109,7 @@ builder.Services.AddSingleton<IImplementationWorkspaceManager, GitWorktreeManage
 builder.Services.AddSingleton(new SqliteDatabaseInitializer(connectionString));
 builder.Services.AddScoped<EngineeringTaskService>();
 builder.Services.AddScoped<ImplementationApprovalService>();
+builder.Services.AddScoped<VerificationWorkflowService>();
 
 var app = builder.Build();
 if (app.Environment.IsDevelopment())

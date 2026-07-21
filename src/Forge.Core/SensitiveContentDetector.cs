@@ -4,13 +4,17 @@ namespace Forge.Core;
 
 public static partial class SensitiveContentDetector
 {
+    private const int MaximumInspectedCharacters = 256 * 1024;
+
     public static bool ContainsSensitiveValue(string? value)
     {
         if (string.IsNullOrEmpty(value)) return false;
-        return AuthorizationRegex().IsMatch(value) || PrivateKeyRegex().IsMatch(value) ||
-               CredentialUriRegex().IsMatch(value) || AccessTokenRegex().IsMatch(value) ||
-               PasswordConnectionStringRegex().IsMatch(value) || SecretAssignmentRegex().IsMatch(value) ||
-               HasCredentialGatedEntropy(value);
+        var bounded = value.Length <= MaximumInspectedCharacters ? value : value[..MaximumInspectedCharacters];
+        return AuthorizationRegex().IsMatch(bounded) || PrivateKeyRegex().IsMatch(bounded) ||
+               CredentialUriRegex().IsMatch(bounded) || AccessTokenRegex().IsMatch(bounded) ||
+               JwtRegex().IsMatch(bounded) || HasSignedCredentialQuery(bounded) ||
+               PasswordConnectionStringRegex().IsMatch(bounded) || SecretAssignmentRegex().IsMatch(bounded) ||
+               HasCredentialGatedEntropy(bounded);
     }
 
     [GeneratedRegex(@"(?im)\bauthorization\s*:\s*(?:bearer|basic)\s+[A-Za-z0-9+/._~=-]{8,}", RegexOptions.CultureInvariant)]
@@ -24,6 +28,9 @@ public static partial class SensitiveContentDetector
 
     [GeneratedRegex(@"(?<![A-Za-z0-9])(?:AKIA[0-9A-Z]{16}|(?:gh[pousr]_[A-Za-z0-9]{20,})|(?:sk-[A-Za-z0-9_-]{20,}))(?![A-Za-z0-9])", RegexOptions.CultureInvariant)]
     private static partial Regex AccessTokenRegex();
+
+    [GeneratedRegex(@"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?![A-Za-z0-9_-])", RegexOptions.CultureInvariant)]
+    private static partial Regex JwtRegex();
 
     [GeneratedRegex(@"(?i)(?:^|[;\r\n])\s*(?:password|pwd)\s*=\s*[^;\r\n]{8,}", RegexOptions.CultureInvariant)]
     private static partial Regex PasswordConnectionStringRegex();
@@ -47,4 +54,22 @@ public static partial class SensitiveContentDetector
 
     [GeneratedRegex("""(?im)\b(?:credential|secret|token|api[_-]?key|private[_-]?key)\b\s*[:=]\s*['"]?([A-Za-z0-9+/=_\-.~]{24,})""", RegexOptions.CultureInvariant)]
     private static partial Regex CredentialEntropyRegex();
+
+    private static bool HasSignedCredentialQuery(string value)
+    {
+        var support = SignedQuerySupportRegex().IsMatch(value);
+        if (!support) return false;
+        foreach (Match match in SignedQuerySignatureRegex().Matches(value))
+        {
+            var candidate = match.Groups[1].Value;
+            if (candidate.Length >= 16 && candidate.Distinct().Take(8).Count() >= 8) return true;
+        }
+        return false;
+    }
+
+    [GeneratedRegex("""(?i)(?:[?&]|\\u0026)(?:sig|signature|x-amz-signature)=([^&#\s"']{16,512})""", RegexOptions.CultureInvariant)]
+    private static partial Regex SignedQuerySignatureRegex();
+
+    [GeneratedRegex("""(?i)(?:[?&]|\\u0026)(?:se|sp|sr|sv|expires|permissions|resource|credential|x-amz-credential|x-amz-expires)=[^&#\s"']+""", RegexOptions.CultureInvariant)]
+    private static partial Regex SignedQuerySupportRegex();
 }

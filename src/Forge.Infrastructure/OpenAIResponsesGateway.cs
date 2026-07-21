@@ -30,7 +30,13 @@ public sealed record OpenAIResponseEnvelope(
     OpenAIResponseIncompleteReason? IncompleteReason = null,
     string? ProviderRequestId = null,
     IReadOnlyList<OpenAIResponseOutputItem>? OutputItems = null,
-    bool UsageAvailable = true);
+    bool UsageAvailable = true,
+    int HttpStatusCode = 200,
+    VerificationUsageAvailability? UsageAvailability = null)
+{
+    public VerificationUsageAvailability EffectiveUsageAvailability => UsageAvailability ??
+        VerificationUsage.Classify(InputTokens, CachedInputTokens, OutputTokens, ReasoningTokens);
+}
 
 public sealed record OpenAIResponseOutputItem(
     OpenAIResponseOutputItemKind Kind,
@@ -117,7 +123,7 @@ public sealed class SdkOpenAIResponsesGateway(string apiKey) : IOpenAIResponsesG
             var providerRequestId = GetSafeHeader(response.Headers, "x-request-id");
             if (response.Status is < 200 or >= 300)
                 throw CreateTransportFailure(response.Status, response.Headers);
-            return ParseResponse(response.Content, providerRequestId);
+            return ParseResponse(response.Content, providerRequestId, response.Status);
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
@@ -177,10 +183,12 @@ public sealed class SdkOpenAIResponsesGateway(string apiKey) : IOpenAIResponsesG
         return root.ToJsonString(new JsonSerializerOptions { WriteIndented = false });
     }
 
-    internal static OpenAIResponseEnvelope ParseResponse(BinaryData body, string? providerRequestId)
+    internal static OpenAIResponseEnvelope ParseResponse(BinaryData body, string? providerRequestId,
+        int httpStatusCode = 200)
     {
         try
         {
+            StrictJsonDuplicatePropertyValidator.RejectDuplicates(body.ToString());
             using var document = JsonDocument.Parse(body);
             var root = document.RootElement;
             var id = OpenAIProviderIdentifier.Normalize(String(root, "id")) ?? string.Empty;
@@ -196,10 +204,11 @@ public sealed class SdkOpenAIResponsesGateway(string apiKey) : IOpenAIResponsesG
                 .Where(part => part.Kind == OpenAIResponseContentKind.OutputText)
                 .Select(part => part.Text));
 
-            var usageAvailable = TryParseUsage(root, out var inputTokens, out var cachedTokens,
+            var usageAvailability = ParseUsage(root, out var inputTokens, out var cachedTokens,
                 out var outputTokens, out var reasoningTokens);
             return new OpenAIResponseEnvelope(id, outputText, inputTokens, cachedTokens, outputTokens,
-                reasoningTokens, status, incompleteReason, providerRequestId, outputItems, usageAvailable);
+                reasoningTokens, status, incompleteReason, providerRequestId, outputItems,
+                usageAvailability != VerificationUsageAvailability.Unavailable, httpStatusCode, usageAvailability);
         }
         catch (JsonException exception)
         {
@@ -329,7 +338,7 @@ public sealed class SdkOpenAIResponsesGateway(string apiKey) : IOpenAIResponsesG
             ? item.GetString()
             : null;
 
-    private static bool TryParseUsage(
+    private static VerificationUsageAvailability ParseUsage(
         JsonElement root,
         out int? inputTokens,
         out int? cachedTokens,
@@ -337,42 +346,29 @@ public sealed class SdkOpenAIResponsesGateway(string apiKey) : IOpenAIResponsesG
         out int? reasoningTokens)
     {
         inputTokens = cachedTokens = outputTokens = reasoningTokens = null;
-        if (!root.TryGetProperty("usage", out var usage) || usage.ValueKind != JsonValueKind.Object ||
-            !TryRequiredToken(usage, "input_tokens", out var input) ||
-            !TryRequiredToken(usage, "output_tokens", out var output) ||
-            !TryOptionalNestedToken(usage, "input_tokens_details", "cached_tokens", out var cached) ||
-            !TryOptionalNestedToken(usage, "output_tokens_details", "reasoning_tokens", out var reasoning) ||
-            cached is { } cachedValue && cachedValue > input)
-            return false;
-        inputTokens = input;
-        cachedTokens = cached;
-        outputTokens = output;
-        reasoningTokens = reasoning;
-        return true;
+        if (!root.TryGetProperty("usage", out var usage) || usage.ValueKind != JsonValueKind.Object)
+            return VerificationUsageAvailability.Unavailable;
+        inputTokens = ValidToken(usage, "input_tokens");
+        outputTokens = ValidToken(usage, "output_tokens");
+        cachedTokens = ValidNestedToken(usage, "input_tokens_details", "cached_tokens");
+        reasoningTokens = ValidNestedToken(usage, "output_tokens_details", "reasoning_tokens");
+        var normalized = VerificationUsage.Normalize(inputTokens, cachedTokens, outputTokens, reasoningTokens);
+        inputTokens = normalized.InputTokens;
+        cachedTokens = normalized.CachedInputTokens;
+        outputTokens = normalized.OutputTokens;
+        reasoningTokens = normalized.ReasoningTokens;
+        return normalized.Availability;
     }
 
-    private static bool TryRequiredToken(JsonElement value, string property, out int parsed)
-    {
-        parsed = 0;
-        return value.TryGetProperty(property, out var item) && item.ValueKind == JsonValueKind.Number &&
-               item.TryGetInt32(out parsed) && parsed >= 0;
-    }
+    private static int? ValidToken(JsonElement value, string property) =>
+        value.TryGetProperty(property, out var item) && item.ValueKind == JsonValueKind.Number &&
+        item.TryGetInt32(out var parsed) && parsed >= 0 ? parsed : null;
 
-    private static bool TryOptionalNestedToken(
-        JsonElement value,
-        string detailsProperty,
-        string tokenProperty,
-        out int? parsed)
+    private static int? ValidNestedToken(JsonElement value, string detailsProperty, string tokenProperty)
     {
-        parsed = null;
-        if (!value.TryGetProperty(detailsProperty, out var details)) return true;
-        if (details.ValueKind is JsonValueKind.Null) return true;
-        if (details.ValueKind != JsonValueKind.Object) return false;
-        if (!details.TryGetProperty(tokenProperty, out var token)) return true;
-        if (token.ValueKind is JsonValueKind.Null) return true;
-        if (token.ValueKind != JsonValueKind.Number || !token.TryGetInt32(out var number) || number < 0) return false;
-        parsed = number;
-        return true;
+        if (!value.TryGetProperty(detailsProperty, out var details) || details.ValueKind != JsonValueKind.Object)
+            return null;
+        return ValidToken(details, tokenProperty);
     }
 
     private static string SafeMessage(string category) => category switch

@@ -7,6 +7,9 @@ public sealed class EngineeringTask
     private readonly List<PlanRevisionNote> _planRevisionNotes = [];
     private readonly List<ModelCallRecord> _modelCalls = [];
     private readonly List<ImplementationRevision> _implementationRevisions = [];
+    private readonly List<VerificationPlan> _verificationPlans = [];
+    private readonly List<VerificationPlanGenerationAttempt> _verificationPlanGenerationAttempts = [];
+    private readonly List<ManualVerificationAttempt> _manualVerificationAttempts = [];
 
     private EngineeringTask() { }
 
@@ -19,6 +22,9 @@ public sealed class EngineeringTask
     public IReadOnlyList<PlanRevisionNote> PlanRevisionNotes => _planRevisionNotes;
     public IReadOnlyList<ModelCallRecord> ModelCalls => _modelCalls;
     public IReadOnlyList<ImplementationRevision> ImplementationRevisions => _implementationRevisions;
+    public IReadOnlyList<VerificationPlan> VerificationPlans => _verificationPlans;
+    public IReadOnlyList<VerificationPlanGenerationAttempt> VerificationPlanGenerationAttempts => _verificationPlanGenerationAttempts;
+    public IReadOnlyList<ManualVerificationAttempt> ManualVerificationAttempts => _manualVerificationAttempts;
     public string? CurrentPendingQuestion { get; private set; }
     public string? RequirementSummary { get; private set; }
     public WorkflowStatus Status { get; private set; }
@@ -43,6 +49,9 @@ public sealed class EngineeringTask
     public ImplementationLease? ImplementationLease { get; private set; }
     public Guid? ActiveImplementationRevisionId { get; private set; }
     public Guid? ApprovedImplementationRevisionId { get; private set; }
+    public Guid? CurrentVerificationPlanId { get; private set; }
+    public Guid? CurrentVerificationAttemptId { get; private set; }
+    public int VerificationDataFormatVersion { get; private set; }
     public long RowVersion { get; private set; }
     public Guid? ExpectedImplementationLeaseIdForSave { get; private set; }
 
@@ -526,6 +535,383 @@ public sealed class EngineeringTask
         return true;
     }
 
+    public void BeginVerificationPlanGeneration(
+        VerificationPlanGenerationCommand command,
+        DateTimeOffset now)
+    {
+        ArgumentNullException.ThrowIfNull(command);
+        if (Status is not (WorkflowStatus.ImplementationApproved or WorkflowStatus.VerificationPlanning))
+            throw new WorkflowException($"Verification-plan generation requires ImplementationApproved or VerificationPlanning status; current status is {Status}.");
+        if (VerificationDataFormatVersion == VerificationDataFormatVersions.Legacy)
+        {
+            if (_verificationPlans.Count > 0 || _verificationPlanGenerationAttempts.Count > 0 ||
+                _manualVerificationAttempts.Count > 0)
+                throw new VerificationException("verification_format_migration_required",
+                    "Stored legacy verification data requires an explicit migration before new verification records can be added.");
+            VerificationDataFormatVersion = VerificationDataFormatVersions.Current;
+        }
+        else if (VerificationDataFormatVersion != VerificationDataFormatVersions.Current)
+            throw new VerificationException("verification_format_unsupported",
+                "The stored verification-data format is not supported.");
+        if (command.TaskId != Id || RowVersion != command.ExpectedRowVersion)
+            throw new TaskConcurrencyException("The task changed after the approved implementation was loaded. Reload it before generating verification guidance.");
+        var approved = ApprovedImplementationRevisionId is { } approvedId
+            ? _implementationRevisions.SingleOrDefault(revision => revision.RevisionId == approvedId)
+            : null;
+        if (approved?.ResultFingerprint is null || approved.RevisionId != command.ExpectedImplementationRevisionId ||
+            !string.Equals(approved.ResultFingerprint, command.ExpectedImplementationResultFingerprint, StringComparison.Ordinal))
+            throw new TaskConcurrencyException("The approved implementation revision changed. Reload it before generating verification guidance.");
+        if (_verificationPlans.Count >= 6)
+            throw new VerificationException("verification_history_limit", "The task has reached its verification-plan history limit.");
+        if (_verificationPlanGenerationAttempts.Any(attempt => attempt.CommandId == command.CommandId))
+            throw new WorkflowException("The verification-plan generation command has already been recorded.");
+        var latestIndex = _verificationPlanGenerationAttempts.Count - 1;
+        if (latestIndex >= 0 && Status == WorkflowStatus.VerificationPlanning)
+        {
+            var latest = _verificationPlanGenerationAttempts[latestIndex];
+            if (latest.Status == VerificationGenerationAttemptStatus.Prepared &&
+                now >= latest.LeaseExpiresAt)
+            {
+                _verificationPlanGenerationAttempts[latestIndex] = latest with
+                {
+                    CompletedAt = now,
+                    Status = VerificationGenerationAttemptStatus.InterruptedBeforeDispatch,
+                    FailureCategory = "verification_interrupted_before_dispatch",
+                    FailureMessage = "The prior verification-plan generation ended before provider dispatch and requires an explicit retry."
+                };
+            }
+            else if (latest.Status is VerificationGenerationAttemptStatus.Prepared or
+                     VerificationGenerationAttemptStatus.DispatchMayHaveStarted or
+                     VerificationGenerationAttemptStatus.ResponseReceived)
+                throw new WorkflowException("A verification-plan generation attempt is already active.");
+            else if (latest.Status == VerificationGenerationAttemptStatus.AmbiguousAfterDispatch)
+                throw new WorkflowException("The prior provider dispatch is ambiguous and cannot be retried safely.");
+            else if (latest.Status is not (VerificationGenerationAttemptStatus.FailedBeforeDispatch or
+                     VerificationGenerationAttemptStatus.RetryableProviderResponse or
+                     VerificationGenerationAttemptStatus.InterruptedBeforeDispatch))
+                throw new WorkflowException("The prior verification-plan generation is not retry eligible.");
+        }
+        _verificationPlanGenerationAttempts.Add(new VerificationPlanGenerationAttempt(
+            command.CommandId, Id, command.ExpectedRowVersion, command.ExpectedImplementationRevisionId,
+            command.ExpectedImplementationResultFingerprint, now, now.AddMinutes(5), null,
+            VerificationGenerationAttemptStatus.Prepared,
+            null, null, null, [], null, 0, 0, 0, [], []));
+        Status = WorkflowStatus.VerificationPlanning;
+        UpdatedAt = now;
+    }
+
+    public void StoreVerificationPlan(
+        Guid generationCommandId,
+        VerificationPlan plan,
+        DateTimeOffset now)
+    {
+        EnsureStatus(WorkflowStatus.VerificationPlanning);
+        ArgumentNullException.ThrowIfNull(plan);
+        var index = _verificationPlanGenerationAttempts.FindIndex(attempt => attempt.CommandId == generationCommandId);
+        if (index < 0 || _verificationPlanGenerationAttempts[index].Status is not
+            (VerificationGenerationAttemptStatus.Prepared or VerificationGenerationAttemptStatus.ResponseReceived))
+            throw new WorkflowException("An active verification-plan generation attempt is required.");
+        if (_verificationPlans.Any(existing => existing.PlanId == plan.PlanId))
+            throw new WorkflowException("The verification plan identity already exists.");
+        var approved = ApprovedImplementationRevisionId is { } approvedId
+            ? _implementationRevisions.SingleOrDefault(revision => revision.RevisionId == approvedId)
+            : null;
+        if (approved?.ResultFingerprint is null || plan.ImplementationRevisionId != approved.RevisionId ||
+            !string.Equals(plan.ImplementationResultFingerprint, approved.ResultFingerprint, StringComparison.Ordinal))
+            throw new VerificationException("verification_stale_binding", "The verification plan does not match the approved implementation revision.");
+        _verificationPlans.Add(plan);
+        CurrentVerificationPlanId = plan.PlanId;
+        CurrentVerificationAttemptId = null;
+        _verificationPlanGenerationAttempts[index] = _verificationPlanGenerationAttempts[index] with
+        {
+            CompletedAt = now,
+            Status = VerificationGenerationAttemptStatus.Completed,
+            ResultPlanId = plan.PlanId,
+            ModelCallIds = plan.ModelCallIds
+        };
+        Status = WorkflowStatus.AwaitingManualVerification;
+        UpdatedAt = now;
+    }
+
+    public void RecordVerificationPlanFailure(
+        Guid generationCommandId,
+        string category,
+        string safeMessage,
+        IReadOnlyList<Guid> modelCallIds,
+        VerificationGenerationAttemptStatus durableStatus,
+        DateTimeOffset now)
+    {
+        EnsureStatus(WorkflowStatus.VerificationPlanning);
+        var index = _verificationPlanGenerationAttempts.FindIndex(attempt => attempt.CommandId == generationCommandId);
+        if (index < 0 || durableStatus is not (VerificationGenerationAttemptStatus.FailedBeforeDispatch or
+            VerificationGenerationAttemptStatus.RetryableProviderResponse or
+            VerificationGenerationAttemptStatus.AmbiguousAfterDispatch or
+            VerificationGenerationAttemptStatus.InterruptedBeforeDispatch))
+            throw new WorkflowException("An active verification-plan generation attempt is required.");
+        var current = _verificationPlanGenerationAttempts[index];
+        if (current.Status == VerificationGenerationAttemptStatus.Completed)
+            throw new WorkflowException("A completed verification-plan generation attempt is immutable.");
+        if ((current.Status is VerificationGenerationAttemptStatus.DispatchMayHaveStarted or
+             VerificationGenerationAttemptStatus.ResponseReceived) &&
+            (durableStatus is VerificationGenerationAttemptStatus.FailedBeforeDispatch or
+             VerificationGenerationAttemptStatus.InterruptedBeforeDispatch))
+            durableStatus = VerificationGenerationAttemptStatus.AmbiguousAfterDispatch;
+        if (current.Status == VerificationGenerationAttemptStatus.AmbiguousAfterDispatch)
+            durableStatus = VerificationGenerationAttemptStatus.AmbiguousAfterDispatch;
+        _verificationPlanGenerationAttempts[index] = _verificationPlanGenerationAttempts[index] with
+        {
+            CompletedAt = now,
+            Status = durableStatus,
+            FailureCategory = category,
+            FailureMessage = safeMessage,
+            ModelCallIds = modelCallIds.ToArray()
+        };
+        UpdatedAt = now;
+    }
+
+    public void RecordVerificationGenerationCheckpoint(
+        Guid generationCommandId,
+        VerificationDispatchCheckpoint checkpoint,
+        Guid logicalCallId,
+        DateTimeOffset now,
+        DateTimeOffset? logicalCallStartedAt = null)
+    {
+        EnsureStatus(WorkflowStatus.VerificationPlanning);
+        if (logicalCallId == Guid.Empty) throw new WorkflowException("A logical provider-call identity is required.");
+        var index = _verificationPlanGenerationAttempts.FindIndex(attempt => attempt.CommandId == generationCommandId);
+        if (index < 0) throw new WorkflowException("The verification-plan generation attempt was not found.");
+        var attempt = _verificationPlanGenerationAttempts[index];
+        var callStartedAt = logicalCallStartedAt ?? now;
+        if (checkpoint == VerificationDispatchCheckpoint.DispatchMayHaveStarted &&
+            (callStartedAt == default || callStartedAt.Offset != TimeSpan.Zero || callStartedAt > now ||
+             attempt.LogicalCalls is null || attempt.LogicalCalls.Any(call => call.LogicalCallId == logicalCallId)))
+            throw new WorkflowException("The verification logical-call timing is invalid.");
+        var next = checkpoint switch
+        {
+            VerificationDispatchCheckpoint.DispatchMayHaveStarted when attempt.Status is
+                VerificationGenerationAttemptStatus.Prepared or VerificationGenerationAttemptStatus.FailedBeforeDispatch or
+                VerificationGenerationAttemptStatus.RetryableProviderResponse => VerificationGenerationAttemptStatus.DispatchMayHaveStarted,
+            VerificationDispatchCheckpoint.FailedBeforeDispatch when attempt.Status == VerificationGenerationAttemptStatus.DispatchMayHaveStarted =>
+                VerificationGenerationAttemptStatus.FailedBeforeDispatch,
+            VerificationDispatchCheckpoint.RetryableProviderResponse when attempt.Status is
+                VerificationGenerationAttemptStatus.DispatchMayHaveStarted or VerificationGenerationAttemptStatus.ResponseReceived =>
+                VerificationGenerationAttemptStatus.RetryableProviderResponse,
+            VerificationDispatchCheckpoint.AmbiguousAfterDispatch when attempt.Status is
+                VerificationGenerationAttemptStatus.DispatchMayHaveStarted or VerificationGenerationAttemptStatus.ResponseReceived =>
+                VerificationGenerationAttemptStatus.AmbiguousAfterDispatch,
+            _ => throw new WorkflowException("The verification provider checkpoint transition is invalid.")
+        };
+        var alreadyCounted = attempt.ProviderResponses.Any(response => response.LogicalCallId == logicalCallId) ||
+            attempt.ModelCallIds.Contains(logicalCallId);
+        _verificationPlanGenerationAttempts[index] = attempt with
+        {
+            Status = next,
+            LastLogicalCallId = logicalCallId,
+            LogicalCalls = checkpoint == VerificationDispatchCheckpoint.DispatchMayHaveStarted
+                ? attempt.LogicalCalls!.Append(new VerificationLogicalCallRecord(logicalCallId, callStartedAt)).ToArray()
+                : attempt.LogicalCalls,
+            LogicalCallCount = attempt.LogicalCallCount +
+                (checkpoint == VerificationDispatchCheckpoint.DispatchMayHaveStarted ? 1 : 0),
+            PossiblyDispatchedRequestCount = attempt.PossiblyDispatchedRequestCount +
+                (checkpoint == VerificationDispatchCheckpoint.AmbiguousAfterDispatch && !alreadyCounted ? 1 : 0),
+            CompletedAt = next is VerificationGenerationAttemptStatus.FailedBeforeDispatch or
+                VerificationGenerationAttemptStatus.RetryableProviderResponse or
+                VerificationGenerationAttemptStatus.AmbiguousAfterDispatch ? now : null
+        };
+        UpdatedAt = now;
+    }
+
+    public void RecordVerificationGenerationModelCall(
+        Guid generationCommandId,
+        Guid logicalCallId,
+        ModelCallRecord modelCall,
+        DateTimeOffset now)
+    {
+        EnsureStatus(WorkflowStatus.VerificationPlanning);
+        ArgumentNullException.ThrowIfNull(modelCall);
+        var index = _verificationPlanGenerationAttempts.FindIndex(attempt => attempt.CommandId == generationCommandId);
+        if (index < 0) throw new WorkflowException("The verification-plan generation attempt was not found.");
+        var attempt = _verificationPlanGenerationAttempts[index];
+        if (logicalCallId == Guid.Empty || modelCall.Id != logicalCallId ||
+            attempt.LastLogicalCallId != logicalCallId || modelCall.Stage != ModelCallStage.VerificationPlanning ||
+            attempt.LogicalCalls?.SingleOrDefault(call => call.LogicalCallId == logicalCallId)?.StartedAt !=
+                modelCall.StartedAt)
+            throw new WorkflowException("The verification model call does not match the durable provider dispatch.");
+        if (!_modelCalls.Any(existing => existing.Id == modelCall.Id)) RecordModelCall(modelCall, now);
+        if (!attempt.ModelCallIds.Contains(modelCall.Id))
+            _verificationPlanGenerationAttempts[index] = attempt with
+            { ModelCallIds = attempt.ModelCallIds.Append(modelCall.Id).ToArray() };
+        UpdatedAt = now;
+    }
+
+    public void RecordVerificationProviderResponse(
+        Guid generationCommandId,
+        VerificationProviderResponseTelemetry response,
+        DateTimeOffset now)
+    {
+        EnsureStatus(WorkflowStatus.VerificationPlanning);
+        ArgumentNullException.ThrowIfNull(response);
+        var index = _verificationPlanGenerationAttempts.FindIndex(attempt => attempt.CommandId == generationCommandId);
+        if (index < 0) throw new WorkflowException("The verification-plan generation attempt was not found.");
+        var attempt = _verificationPlanGenerationAttempts[index];
+        if (attempt.Status != VerificationGenerationAttemptStatus.DispatchMayHaveStarted ||
+            attempt.LastLogicalCallId != response.LogicalCallId ||
+            attempt.LogicalCalls?.SingleOrDefault(call => call.LogicalCallId == response.LogicalCallId)?.StartedAt !=
+                response.StartedAt ||
+            response.LogicalCallId == Guid.Empty || response.DispatchDisposition != VerificationCallDispatchDisposition.ResponseReceived ||
+            response.HttpStatusCode is < 200 or >= 300 || attempt.ProviderResponses.Any(item => item.LogicalCallId == response.LogicalCallId))
+            throw new WorkflowException("The verification provider response does not match the durable dispatch intent.");
+        if (response.FormatVersion is not null &&
+            response.FormatVersion != VerificationDataFormatVersions.Current)
+            throw new WorkflowException("The verification provider-response format is invalid.");
+        var normalizedAvailability = VerificationUsage.Classify(response.InputTokens, response.CachedInputTokens,
+            response.OutputTokens, response.ReasoningTokens);
+        var currentResponse = response with
+        {
+            FormatVersion = VerificationDataFormatVersions.Current,
+            UsageAvailability = normalizedAvailability,
+            UsageAvailable = normalizedAvailability != VerificationUsageAvailability.Unavailable,
+            TelemetryFingerprint = null
+        };
+        var fingerprint = VerificationFingerprint.ComputeProviderResponse(Id, generationCommandId,
+            currentResponse);
+        if (response.TelemetryFingerprint is { } suppliedFingerprint &&
+            !string.Equals(suppliedFingerprint, fingerprint, StringComparison.Ordinal))
+            throw new WorkflowException("The verification provider-response fingerprint is invalid.");
+        var recordedResponse = currentResponse with { TelemetryFingerprint = fingerprint };
+        _verificationPlanGenerationAttempts[index] = attempt with
+        {
+            Status = VerificationGenerationAttemptStatus.ResponseReceived,
+            PhysicalRequestCount = attempt.PhysicalRequestCount + 1,
+            ProviderResponses = attempt.ProviderResponses.Append(recordedResponse).ToArray(),
+            CompletedAt = null
+        };
+        UpdatedAt = now;
+    }
+
+    public void RecordVerificationTransportFailure(
+        Guid generationCommandId,
+        Guid logicalCallId,
+        VerificationDispatchCheckpoint checkpoint,
+        ModelCallRecord modelCall,
+        VerificationCallDispatchDisposition disposition,
+        string safeFailureMessage,
+        DateTimeOffset now)
+    {
+        EnsureStatus(WorkflowStatus.VerificationPlanning);
+        ArgumentNullException.ThrowIfNull(modelCall);
+        var index = _verificationPlanGenerationAttempts.FindIndex(attempt => attempt.CommandId == generationCommandId);
+        if (index < 0) throw new WorkflowException("The verification-plan generation attempt was not found.");
+        var attempt = _verificationPlanGenerationAttempts[index];
+        var valid = attempt.Status == VerificationGenerationAttemptStatus.DispatchMayHaveStarted &&
+                    attempt.LastLogicalCallId == logicalCallId && modelCall.Id == logicalCallId &&
+                    attempt.LogicalCalls?.SingleOrDefault(call => call.LogicalCallId == logicalCallId)?.StartedAt ==
+                        modelCall.StartedAt &&
+                    modelCall.Stage == ModelCallStage.VerificationPlanning &&
+                    modelCall.VerificationDispatchDisposition == disposition &&
+                    disposition switch
+                    {
+                        VerificationCallDispatchDisposition.DefinitelyNotDispatched =>
+                            checkpoint == VerificationDispatchCheckpoint.FailedBeforeDispatch && modelCall.ProviderHttpStatusCode is null,
+                        VerificationCallDispatchDisposition.PossiblyDispatched =>
+                            checkpoint == VerificationDispatchCheckpoint.AmbiguousAfterDispatch && modelCall.ProviderHttpStatusCode is null,
+                        VerificationCallDispatchDisposition.ResponseReceived =>
+                            (checkpoint is VerificationDispatchCheckpoint.RetryableProviderResponse or
+                                VerificationDispatchCheckpoint.AmbiguousAfterDispatch) &&
+                            modelCall.ProviderHttpStatusCode is >= 100 and <= 599,
+                        _ => false
+                    };
+        if (!valid || string.IsNullOrWhiteSpace(modelCall.FailureCategory) ||
+            string.IsNullOrWhiteSpace(safeFailureMessage) || SensitiveContentDetector.ContainsSensitiveValue(safeFailureMessage))
+            throw new WorkflowException("The verification transport outcome is invalid.");
+        if (!_modelCalls.Any(existing => existing.Id == modelCall.Id)) RecordModelCall(modelCall, now);
+        var status = checkpoint switch
+        {
+            VerificationDispatchCheckpoint.FailedBeforeDispatch => VerificationGenerationAttemptStatus.FailedBeforeDispatch,
+            VerificationDispatchCheckpoint.RetryableProviderResponse => VerificationGenerationAttemptStatus.RetryableProviderResponse,
+            _ => VerificationGenerationAttemptStatus.AmbiguousAfterDispatch
+        };
+        _verificationPlanGenerationAttempts[index] = attempt with
+        {
+            Status = status,
+            CompletedAt = now,
+            FailureCategory = modelCall.FailureCategory,
+            FailureMessage = safeFailureMessage,
+            PhysicalRequestCount = attempt.PhysicalRequestCount +
+                (disposition == VerificationCallDispatchDisposition.ResponseReceived ? 1 : 0),
+            PossiblyDispatchedRequestCount = attempt.PossiblyDispatchedRequestCount +
+                (disposition == VerificationCallDispatchDisposition.PossiblyDispatched ? 1 : 0),
+            ModelCallIds = attempt.ModelCallIds.Append(modelCall.Id).ToArray()
+        };
+        UpdatedAt = now;
+    }
+
+    public void StartManualVerification(ManualVerificationAttempt attempt, DateTimeOffset now)
+    {
+        EnsureCurrentVerificationFormat();
+        EnsureStatus(WorkflowStatus.AwaitingManualVerification);
+        ArgumentNullException.ThrowIfNull(attempt);
+        if (CurrentVerificationPlanId != attempt.VerificationPlanId ||
+            _verificationPlans.SingleOrDefault(plan => plan.PlanId == attempt.VerificationPlanId) is not { Status: VerificationPlanStatus.Current } plan ||
+            !string.Equals(plan.PlanFingerprint, attempt.VerificationPlanFingerprint, StringComparison.Ordinal) ||
+            ApprovedImplementationRevisionId != attempt.ImplementationRevisionId ||
+            !string.Equals(plan.ImplementationResultFingerprint, attempt.ImplementationResultFingerprint, StringComparison.Ordinal))
+            throw new VerificationException("verification_stale_binding", "The manual verification attempt does not match the current approved revision and plan.");
+        if (_manualVerificationAttempts.Any(existing => existing.Status == ManualVerificationAttemptStatus.InProgress))
+            throw new WorkflowException("A manual verification attempt is already in progress.");
+        _manualVerificationAttempts.Add(attempt);
+        CurrentVerificationAttemptId = attempt.AttemptId;
+        UpdatedAt = now;
+    }
+
+    public void AppendManualCaseResult(ManualCaseResultRevision result, DateTimeOffset now)
+    {
+        EnsureCurrentVerificationFormat();
+        EnsureStatus(WorkflowStatus.AwaitingManualVerification);
+        var index = _manualVerificationAttempts.FindIndex(attempt => attempt.AttemptId == result.AttemptId);
+        if (index < 0 || _manualVerificationAttempts[index].Status != ManualVerificationAttemptStatus.InProgress ||
+            CurrentVerificationAttemptId != result.AttemptId)
+            throw new WorkflowException("The current manual verification attempt is not available for updates.");
+        var attempt = _manualVerificationAttempts[index];
+        _manualVerificationAttempts[index] = attempt with
+        {
+            ResultRevisions = attempt.ResultRevisions.Concat([result]).ToArray()
+        };
+        UpdatedAt = now;
+    }
+
+    public void CompleteManualVerification(
+        Guid attemptId,
+        Guid commandId,
+        bool passed,
+        bool confirmedByHuman,
+        string? summary,
+        DateTimeOffset now)
+    {
+        EnsureCurrentVerificationFormat();
+        EnsureStatus(WorkflowStatus.AwaitingManualVerification);
+        var index = _manualVerificationAttempts.FindIndex(attempt => attempt.AttemptId == attemptId);
+        if (index < 0 || _manualVerificationAttempts[index].Status != ManualVerificationAttemptStatus.InProgress ||
+            CurrentVerificationAttemptId != attemptId)
+            throw new WorkflowException("The current manual verification attempt is not available for completion.");
+        var attempt = _manualVerificationAttempts[index] with
+        {
+            CompletedAt = now,
+            Status = passed ? ManualVerificationAttemptStatus.CompletedPassed : ManualVerificationAttemptStatus.CompletedFailed,
+            CompletionConfirmation = confirmedByHuman,
+            Summary = summary?.Trim(),
+            PassedAt = passed ? now : null,
+            FailedAt = passed ? null : now,
+            CompletedByCommandId = commandId
+        };
+        attempt = attempt with { AttemptFingerprint = VerificationFingerprint.ComputeAttempt(Id, attempt) };
+        _manualVerificationAttempts[index] = attempt;
+        var planIndex = _verificationPlans.FindIndex(plan => plan.PlanId == attempt.VerificationPlanId);
+        if (planIndex >= 0) _verificationPlans[planIndex] = _verificationPlans[planIndex] with { Status = VerificationPlanStatus.Completed };
+        Status = passed ? WorkflowStatus.ReadyForDelivery : WorkflowStatus.ManualVerificationFailed;
+        UpdatedAt = now;
+    }
+
     public void RequestPlanRevision(string correction, DateTimeOffset now)
     {
         EnsurePlanRevisionCanBeRequested(correction);
@@ -638,7 +1024,13 @@ public sealed class EngineeringTask
         long rowVersion = 0,
         IEnumerable<ImplementationRevision>? implementationRevisions = null,
         Guid? activeImplementationRevisionId = null,
-        Guid? approvedImplementationRevisionId = null)
+        Guid? approvedImplementationRevisionId = null,
+        IEnumerable<VerificationPlan>? verificationPlans = null,
+        IEnumerable<VerificationPlanGenerationAttempt>? verificationPlanGenerationAttempts = null,
+        IEnumerable<ManualVerificationAttempt>? manualVerificationAttempts = null,
+        Guid? currentVerificationPlanId = null,
+        Guid? currentVerificationAttemptId = null,
+        int verificationDataFormatVersion = VerificationDataFormatVersions.Legacy)
     {
         var task = new EngineeringTask
         {
@@ -672,6 +1064,9 @@ public sealed class EngineeringTask
             ImplementationLease = implementationLease,
             ActiveImplementationRevisionId = activeImplementationRevisionId,
             ApprovedImplementationRevisionId = approvedImplementationRevisionId,
+            CurrentVerificationPlanId = currentVerificationPlanId,
+            CurrentVerificationAttemptId = currentVerificationAttemptId,
+            VerificationDataFormatVersion = verificationDataFormatVersion,
             RowVersion = rowVersion
         };
         task._clarificationAnswers.AddRange(answers);
@@ -679,6 +1074,9 @@ public sealed class EngineeringTask
         task._planRevisionNotes.AddRange(planRevisionNotes ?? []);
         task._modelCalls.AddRange(modelCalls);
         task._implementationRevisions.AddRange(implementationRevisions ?? []);
+        task._verificationPlans.AddRange(verificationPlans ?? []);
+        task._verificationPlanGenerationAttempts.AddRange(verificationPlanGenerationAttempts ?? []);
+        task._manualVerificationAttempts.AddRange(manualVerificationAttempts ?? []);
         if (task._implementationRevisions.Count == 0)
             task.SynthesizeLegacyInitialRevision();
         return task;
@@ -701,6 +1099,13 @@ public sealed class EngineeringTask
         if (!allowExpired && !ImplementationLease.IsActive(now))
             throw new ImplementationException("implementation_lease_expired",
                 "The implementation lease expired before this operation could continue.");
+    }
+
+    private void EnsureCurrentVerificationFormat()
+    {
+        if (VerificationDataFormatVersion != VerificationDataFormatVersions.Current)
+            throw new VerificationException("verification_format_migration_required",
+                "Stored legacy verification data requires an explicit migration before new verification records can be added.");
     }
 
     private ImplementationRevision? GetActiveRevision() => ActiveImplementationRevisionId is { } id

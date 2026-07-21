@@ -198,6 +198,17 @@ public sealed class DeterministicEvidenceSelectionService(RepositoryAnalysisLimi
             (rawPath.EndsWith("app.tsx") || rawPath.EndsWith("app.ts")) ? 260 : prefersFrontendLayer ? 90 : 0;
         var taskSurfaceBonus = signals.Terms.Contains("task") && rawPath.Contains("engineeringtask") &&
             module is "API" or "Core" or "Infrastructure" ? 80 : 0;
+        var domainRecordBonus = module == "Core" && rawPath.EndsWith("record.cs", StringComparison.Ordinal) &&
+            (prioritySignals?.Terms.Contains("record") == true || signals.Terms.Contains("domain")) ? 240 : 0;
+        var modelCostSurfaceBonus = module == "Infrastructure" && rawPath.Contains("modelcost") &&
+            prioritySignals?.Terms.Any(term => term is "cost" or "pricing" or "snapshot" or "snapshots") == true
+                ? 700
+                : 0;
+        var persistenceSurfaceBonus = rawPath.Contains("sqlite") &&
+            (rawPath.Contains("repository") || rawPath.Contains("persistence")) &&
+            prioritySignals?.Terms.Any(term => term is "sqlite" or "migration" or "persistence") == true
+                ? 700
+                : 0;
         var companionBonus = IsCompanion(file.Metadata, rawPath) && (phraseContent + contentMatches + strongSymbols > 0) ? 7 : 0;
         var docsPenalty = module == "Docs" && phrasePath == 0 && phraseContent == 0 ? 14 : 0;
         var clarificationPenalty = !seeksClarificationWork && (rawPath.Contains("clarification") || symbols.Contains("clarification")) ? 300 : 0;
@@ -206,7 +217,9 @@ public sealed class DeterministicEvidenceSelectionService(RepositoryAnalysisLimi
         var score = phrasePath * 34 + phraseSymbols * 28 + phraseContent * 9 + strongPath * 15 +
             strongSymbols * 12 + contentMatches * 2 + priorityPhrasePath * 50 + priorityPhraseSymbols * 40 +
             priorityPhraseContent * 12 + priorityStrongPath * 20 + priorityStrongSymbols * 16 + priorityContent * 3 +
-            Math.Min(5, priorityCoverage) * 20 + roleBonus + frontendLayerBonus + taskSurfaceBonus + companionBonus + (file.Metadata.IsTest ? 3 : 0) -
+            Math.Min(5, priorityCoverage) * 20 + roleBonus + frontendLayerBonus + taskSurfaceBonus +
+            domainRecordBonus + modelCostSurfaceBonus + persistenceSurfaceBonus + companionBonus +
+            (file.Metadata.IsTest ? 3 : 0) -
             docsPenalty - clarificationPenalty - planningPenalty;
         var reasons = new List<string>();
         if (phrasePath + phraseSymbols > 0) reasons.Add("strong requirement phrase in path or symbol");
@@ -218,6 +231,9 @@ public sealed class DeterministicEvidenceSelectionService(RepositoryAnalysisLimi
         if (companionBonus > 0) reasons.Add("related contract, entry point, or test companion");
         if (frontendLayerBonus > 0) reasons.Add("frontend requirement layer preference");
         if (taskSurfaceBonus > 0) reasons.Add("task API/domain surface preference");
+        if (domainRecordBonus > 0) reasons.Add("explicit domain-record correction preference");
+        if (modelCostSurfaceBonus > 0) reasons.Add("explicit model-cost correction preference");
+        if (persistenceSurfaceBonus > 0) reasons.Add("explicit SQLite/persistence correction preference");
         reasons.Add($"{module.ToLowerInvariant()} layer");
         if (docsPenalty > 0) reasons.Add("generic documentation de-prioritized");
         if (clarificationPenalty > 0) reasons.Add("unrelated clarification subsystem de-prioritized");

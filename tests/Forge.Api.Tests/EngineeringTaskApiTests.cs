@@ -54,7 +54,7 @@ public sealed class EngineeringTaskApiTests : IClassFixture<FakeModeFactory>
         var summary = Assert.Single(json.EnumerateArray());
 
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-        Assert.Equal(["createdAt", "id", "originalRequirementPreview", "repository", "status", "updatedAt"],
+        Assert.Equal(["createdAt", "id", "originalRequirementPreview", "readyForDelivery", "repository", "status", "updatedAt", "verificationProgressSummary", "verificationStatus"],
             summary.EnumerateObject().Select(property => property.Name).Order().ToArray());
         Assert.Equal(id, summary.GetProperty("id").GetGuid());
         Assert.StartsWith("Repository ", summary.GetProperty("repository").GetString());
@@ -215,6 +215,101 @@ public sealed class EngineeringTaskApiTests : IClassFixture<FakeModeFactory>
 
         Assert.False(Directory.Exists(firstDirectory));
         Assert.False(Directory.Exists(secondDirectory));
+    }
+
+    [Theory]
+    [InlineData("/api/tasks/{0}")]
+    [InlineData("/api/tasks/{0}/export/pdf")]
+    public async Task Malformed_persisted_model_call_history_returns_safe_problem_without_breaking_other_tasks(
+        string routeTemplate)
+    {
+        await using var factory = new FakeModeFactory();
+        using var client = factory.CreateClient();
+        var repository = factory.Services.GetRequiredService<IEngineeringTaskRepository>();
+        var now = DateTimeOffset.UtcNow;
+        var malformed = EngineeringTask.Create("C:/malformed", "Malformed task", now);
+        malformed.RecordModelCall(new ModelCallRecord(Guid.NewGuid(), ModelCallStage.Clarification,
+            "OpenAI", "model", "low", now, now, true, "response", 1, 0, 1, 0, 0m, null), now);
+        var healthy = EngineeringTask.Create("C:/healthy", "Healthy task", now);
+        await repository.SaveAsync(malformed);
+        await repository.SaveAsync(healthy);
+        await using (var connection = new SqliteConnection($"Data Source={factory.DatabasePath}"))
+        {
+            await connection.OpenAsync();
+            await using var update = connection.CreateCommand();
+            update.CommandText = "UPDATE EngineeringTasks SET ModelCalls = json_insert(ModelCalls, '$[#]', json_extract(ModelCalls, '$[0]')) WHERE Id = $id;";
+            update.Parameters.AddWithValue("$id", malformed.Id.ToString("D"));
+            Assert.Equal(1, await update.ExecuteNonQueryAsync());
+        }
+
+        var response = await client.GetAsync(string.Format(CultureInfo.InvariantCulture, routeTemplate, malformed.Id));
+        var body = await response.Content.ReadAsStringAsync();
+        var problem = JsonDocument.Parse(body).RootElement;
+
+        Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+        Assert.Equal("task_data_corrupt", problem.GetProperty("code").GetString());
+        Assert.DoesNotContain(factory.DatabasePath, body, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(HttpStatusCode.OK, (await client.GetAsync($"/api/tasks/{healthy.Id}")).StatusCode);
+        var history = (await client.GetFromJsonAsync<JsonElement[]>("/api/tasks"))!;
+        Assert.Contains(history, item => item.GetProperty("id").GetGuid() == healthy.Id);
+    }
+
+    [Fact]
+    public async Task Malformed_main_task_json_is_contained_across_detail_pdf_eligibility_and_mutation_routes()
+    {
+        await using var factory = new FakeModeFactory();
+        using var client = factory.CreateClient();
+        var repository = factory.Services.GetRequiredService<IEngineeringTaskRepository>();
+        var malformed = EngineeringTask.Create("C:/malformed-main-json", "Malformed task", DateTimeOffset.UtcNow);
+        var healthy = EngineeringTask.Create("C:/healthy-main-json", "Healthy task", DateTimeOffset.UtcNow);
+        await repository.SaveAsync(malformed);
+        await repository.SaveAsync(healthy);
+        await using (var connection = new SqliteConnection($"Data Source={factory.DatabasePath}"))
+        {
+            await connection.OpenAsync();
+            await using var update = connection.CreateCommand();
+            update.CommandText = "UPDATE EngineeringTasks SET ClarificationAnswers = '{' WHERE Id = $id;";
+            update.Parameters.AddWithValue("$id", malformed.Id.ToString("D"));
+            Assert.Equal(1, await update.ExecuteNonQueryAsync());
+        }
+
+        var requests = new[]
+        {
+            new HttpRequestMessage(HttpMethod.Get, $"/api/tasks/{malformed.Id}"),
+            new HttpRequestMessage(HttpMethod.Get, $"/api/tasks/{malformed.Id}/export/pdf"),
+            new HttpRequestMessage(HttpMethod.Get,
+                $"/api/tasks/{malformed.Id}/verification-plans/{Guid.NewGuid()}/export/pdf"),
+            new HttpRequestMessage(HttpMethod.Post, $"/api/tasks/{malformed.Id}/verification-plans")
+            {
+                Content = JsonContent.Create(new
+                {
+                    commandId = Guid.NewGuid(), expectedRowVersion = 1,
+                    expectedImplementationRevisionId = Guid.NewGuid(),
+                    expectedImplementationResultFingerprint = new string('a', 64)
+                })
+            }
+        };
+
+        foreach (var request in requests)
+        {
+            using (request)
+            using (var response = await client.SendAsync(request))
+            {
+                var body = await response.Content.ReadAsStringAsync();
+                var problem = JsonDocument.Parse(body).RootElement;
+                Assert.True(response.StatusCode == HttpStatusCode.Conflict,
+                    $"{request.Method} {request.RequestUri} returned {(int)response.StatusCode}: {body}");
+                Assert.Equal("task_data_corrupt", problem.GetProperty("code").GetString());
+                Assert.DoesNotContain("ClarificationAnswers", body, StringComparison.OrdinalIgnoreCase);
+                Assert.DoesNotContain(factory.DatabasePath, body, StringComparison.OrdinalIgnoreCase);
+                Assert.DoesNotContain("Sqlite", body, StringComparison.OrdinalIgnoreCase);
+            }
+        }
+
+        Assert.Equal(HttpStatusCode.OK, (await client.GetAsync($"/api/tasks/{healthy.Id}")).StatusCode);
+        var history = (await client.GetFromJsonAsync<JsonElement[]>("/api/tasks"))!;
+        Assert.Contains(history, item => item.GetProperty("id").GetGuid() == healthy.Id);
+        Assert.Contains(history, item => item.GetProperty("id").GetGuid() == malformed.Id);
     }
 
     [Fact]
@@ -575,6 +670,349 @@ public sealed class EngineeringTaskApiTests : IClassFixture<FakeModeFactory>
         Assert.DoesNotContain(branch, json, StringComparison.OrdinalIgnoreCase);
         Assert.Contains(ImplementationBranchDisplay.SafeLabel, json, StringComparison.Ordinal);
         Assert.Contains("\"workspaceAvailable\":false", json, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("verification_refusal", 502)]
+    [InlineData("verification_output_truncated", 502)]
+    [InlineData("verification_content_filter", 502)]
+    [InlineData("verification_empty_response", 502)]
+    [InlineData("verification_unexpected_output", 502)]
+    [InlineData("verification_incomplete_response", 502)]
+    [InlineData("verification_invalid_structured_output", 502)]
+    [InlineData("verification_validation_rejected", 502)]
+    [InlineData("verification_configuration", 503)]
+    [InlineData("verification_authentication", 503)]
+    [InlineData("verification_permission", 503)]
+    [InlineData("verification_model_unavailable", 503)]
+    [InlineData("verification_rate_limit", 503)]
+    [InlineData("verification_timeout", 503)]
+    [InlineData("verification_provider_error", 503)]
+    [InlineData("verification_validation", 422)]
+    [InlineData("verification_context_limit", 422)]
+    [InlineData("verification_workflow", 409)]
+    [InlineData("verification_stale_binding", 409)]
+    public void Verification_failure_categories_have_safe_rfc7807_status_mapping(string category, int status)
+    {
+        var mapped = ForgeExceptionHandler.MapVerificationFailure(new VerificationException(category, "Safe failure."));
+        Assert.Equal(status, mapped.Status);
+        Assert.Equal(category, mapped.Code);
+        Assert.Equal("Safe failure.", mapped.Detail);
+    }
+
+    [Fact]
+    public async Task Verification_generation_projection_disables_active_and_ambiguous_dispatch_but_allows_safe_retry()
+    {
+        static EngineeringTask Prepare()
+        {
+            var task = CreatePersistedImplementationReview(activeCheckoutVerified: true);
+            var revision = Assert.Single(task.ImplementationRevisions);
+            task.ApproveImplementation(Guid.NewGuid(), task.RowVersion, revision.RevisionId,
+                revision.ResultFingerprint!, DateTimeOffset.UtcNow);
+            return task;
+        }
+        static VerificationPlanGenerationCommand Begin(EngineeringTask task)
+        {
+            var revision = task.ImplementationRevisions.Single(item => item.RevisionId == task.ApprovedImplementationRevisionId);
+            var command = new VerificationPlanGenerationCommand(Guid.NewGuid(), task.Id, task.RowVersion,
+                revision.RevisionId, revision.ResultFingerprint!);
+            task.BeginVerificationPlanGeneration(command, DateTimeOffset.UtcNow);
+            return command;
+        }
+        static VerificationEligibilityResponse Project(EngineeringTask task) => EngineeringTaskResponse.FromDomain(task,
+            new ModelCostResolver(new ModelCostCalculator(new Dictionary<string, ModelPricing>()))).VerificationEligibility;
+
+        var initial = Prepare();
+        Assert.True(Project(initial).CanGenerateVerificationPlan);
+        Assert.True(Project(initial).IsInitialVerificationPlanGeneration);
+        Assert.False(Project(initial).CanRetryVerificationPlanGeneration);
+        Assert.Equal(VerificationGenerationRuntimeStatus.NotStarted, Project(initial).VerificationGenerationStatus);
+
+        var prepared = Prepare();
+        Begin(prepared);
+        Assert.False(Project(prepared).CanRetryVerificationPlanGeneration);
+        Assert.Equal(VerificationGenerationRuntimeStatus.Active, Project(prepared).VerificationGenerationStatus);
+
+        var expired = Prepare();
+        var expiredRevision = expired.ImplementationRevisions.Single(item => item.RevisionId == expired.ApprovedImplementationRevisionId);
+        expired.BeginVerificationPlanGeneration(new VerificationPlanGenerationCommand(Guid.NewGuid(), expired.Id,
+            expired.RowVersion, expiredRevision.RevisionId, expiredRevision.ResultFingerprint!), DateTimeOffset.UtcNow.AddMinutes(-6));
+        Assert.True(Project(expired).CanRetryVerificationPlanGeneration);
+        Assert.Equal(VerificationGenerationRuntimeStatus.InterruptedBeforeDispatch, Project(expired).VerificationGenerationStatus);
+        Assert.Equal(VerificationGenerationAttemptStatus.Prepared,
+            Assert.Single(expired.VerificationPlanGenerationAttempts).Status);
+
+        var active = Prepare();
+        var activeCommand = Begin(active);
+        active.RecordVerificationGenerationCheckpoint(activeCommand.CommandId,
+            VerificationDispatchCheckpoint.DispatchMayHaveStarted, Guid.NewGuid(), DateTimeOffset.UtcNow);
+        Assert.False(Project(active).CanGenerateVerificationPlan);
+        Assert.Equal(VerificationGenerationRuntimeStatus.Active, Project(active).VerificationGenerationStatus);
+
+        var expiredDispatch = Prepare();
+        var expiredDispatchRevision = expiredDispatch.ImplementationRevisions.Single(item =>
+            item.RevisionId == expiredDispatch.ApprovedImplementationRevisionId);
+        var expiredDispatchCommand = new VerificationPlanGenerationCommand(Guid.NewGuid(), expiredDispatch.Id,
+            expiredDispatch.RowVersion, expiredDispatchRevision.RevisionId, expiredDispatchRevision.ResultFingerprint!);
+        expiredDispatch.BeginVerificationPlanGeneration(expiredDispatchCommand, DateTimeOffset.UtcNow.AddMinutes(-6));
+        expiredDispatch.RecordVerificationGenerationCheckpoint(expiredDispatchCommand.CommandId,
+            VerificationDispatchCheckpoint.DispatchMayHaveStarted, Guid.NewGuid(), DateTimeOffset.UtcNow.AddMinutes(-6));
+        var expiredDispatchProjection = Project(expiredDispatch);
+        Assert.Equal(VerificationGenerationRuntimeStatus.AmbiguousAfterDispatch,
+            expiredDispatchProjection.VerificationGenerationStatus);
+        Assert.False(expiredDispatchProjection.CanRetryVerificationPlanGeneration);
+        Assert.Contains("duplicate billable request", expiredDispatchProjection.VerificationGenerationStatusMessage,
+            StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(VerificationGenerationAttemptStatus.DispatchMayHaveStarted,
+            Assert.Single(expiredDispatch.VerificationPlanGenerationAttempts).Status);
+
+        var expiredResponse = Prepare();
+        var expiredResponseRevision = expiredResponse.ImplementationRevisions.Single(item =>
+            item.RevisionId == expiredResponse.ApprovedImplementationRevisionId);
+        var expiredResponseCommand = new VerificationPlanGenerationCommand(Guid.NewGuid(), expiredResponse.Id,
+            expiredResponse.RowVersion, expiredResponseRevision.RevisionId, expiredResponseRevision.ResultFingerprint!);
+        expiredResponse.BeginVerificationPlanGeneration(expiredResponseCommand, DateTimeOffset.UtcNow.AddMinutes(-6));
+        var responseCallId = Guid.NewGuid();
+        expiredResponse.RecordVerificationGenerationCheckpoint(expiredResponseCommand.CommandId,
+            VerificationDispatchCheckpoint.DispatchMayHaveStarted, responseCallId, DateTimeOffset.UtcNow.AddMinutes(-6));
+        var responseStartedAt = Assert.Single(Assert.Single(expiredResponse.VerificationPlanGenerationAttempts).LogicalCalls!).StartedAt;
+        expiredResponse.RecordVerificationProviderResponse(expiredResponseCommand.CommandId,
+            new VerificationProviderResponseTelemetry(responseCallId, responseStartedAt,
+                DateTimeOffset.UtcNow.AddMinutes(-6),
+                "resp_safe", "req_safe", VerificationProviderResponseStatus.Completed, null, false,
+                null, null, null, null, 200, VerificationCallDispatchDisposition.ResponseReceived), DateTimeOffset.UtcNow.AddMinutes(-6));
+        var expiredResponseProjection = Project(expiredResponse);
+        Assert.Equal(VerificationGenerationRuntimeStatus.AmbiguousAfterDispatch,
+            expiredResponseProjection.VerificationGenerationStatus);
+        Assert.False(expiredResponseProjection.CanRetryVerificationPlanGeneration);
+        Assert.Single(Assert.Single(expiredResponse.VerificationPlanGenerationAttempts).ProviderResponses);
+        Assert.Equal(VerificationGenerationAttemptStatus.ResponseReceived,
+            Assert.Single(expiredResponse.VerificationPlanGenerationAttempts).Status);
+
+        var liveResponse = Prepare();
+        var liveResponseCommand = Begin(liveResponse);
+        var liveResponseCall = Guid.NewGuid();
+        var liveResponseStarted = DateTimeOffset.UtcNow;
+        liveResponse.RecordVerificationGenerationCheckpoint(liveResponseCommand.CommandId,
+            VerificationDispatchCheckpoint.DispatchMayHaveStarted, liveResponseCall, liveResponseStarted,
+            liveResponseStarted);
+        liveResponse.RecordVerificationProviderResponse(liveResponseCommand.CommandId,
+            new VerificationProviderResponseTelemetry(liveResponseCall, liveResponseStarted,
+                liveResponseStarted.AddSeconds(1), "resp_live", "req_live",
+                VerificationProviderResponseStatus.Completed, null, false, null, null, null, null, 200,
+                VerificationCallDispatchDisposition.ResponseReceived), liveResponseStarted.AddSeconds(1));
+        Assert.Equal(VerificationGenerationRuntimeStatus.Active,
+            Project(liveResponse).VerificationGenerationStatus);
+        Assert.Contains("finalizing", Project(liveResponse).VerificationGenerationStatusMessage,
+            StringComparison.OrdinalIgnoreCase);
+
+        var ambiguous = Prepare();
+        var ambiguousCommand = Begin(ambiguous);
+        var ambiguousCall = Guid.NewGuid();
+        ambiguous.RecordVerificationGenerationCheckpoint(ambiguousCommand.CommandId,
+            VerificationDispatchCheckpoint.DispatchMayHaveStarted, ambiguousCall, DateTimeOffset.UtcNow);
+        ambiguous.RecordVerificationGenerationCheckpoint(ambiguousCommand.CommandId,
+            VerificationDispatchCheckpoint.AmbiguousAfterDispatch, ambiguousCall, DateTimeOffset.UtcNow);
+        Assert.False(Project(ambiguous).CanRetryVerificationPlanGeneration);
+        Assert.Contains("billed", Project(ambiguous).VerificationGenerationStatusMessage, StringComparison.OrdinalIgnoreCase);
+
+        var safe = Prepare();
+        var safeCommand = Begin(safe);
+        var safeCall = Guid.NewGuid();
+        safe.RecordVerificationGenerationCheckpoint(safeCommand.CommandId,
+            VerificationDispatchCheckpoint.DispatchMayHaveStarted, safeCall, DateTimeOffset.UtcNow);
+        safe.RecordVerificationGenerationCheckpoint(safeCommand.CommandId,
+            VerificationDispatchCheckpoint.FailedBeforeDispatch, safeCall, DateTimeOffset.UtcNow);
+        Assert.True(Project(safe).CanRetryVerificationPlanGeneration);
+        Assert.Equal(VerificationGenerationRuntimeStatus.FailedBeforeDispatch, Project(safe).VerificationGenerationStatus);
+
+        var retryable = Prepare();
+        var retryableCommand = Begin(retryable);
+        var retryableCall = Guid.NewGuid();
+        retryable.RecordVerificationGenerationCheckpoint(retryableCommand.CommandId,
+            VerificationDispatchCheckpoint.DispatchMayHaveStarted, retryableCall, DateTimeOffset.UtcNow);
+        retryable.RecordVerificationGenerationCheckpoint(retryableCommand.CommandId,
+            VerificationDispatchCheckpoint.RetryableProviderResponse, retryableCall, DateTimeOffset.UtcNow);
+        Assert.True(Project(retryable).CanRetryVerificationPlanGeneration);
+        Assert.Equal(VerificationGenerationRuntimeStatus.RetryableProviderResponse,
+            Project(retryable).VerificationGenerationStatus);
+
+        var interrupted = Prepare();
+        var interruptedCommand = Begin(interrupted);
+        interrupted.RecordVerificationPlanFailure(interruptedCommand.CommandId,
+            "verification_interrupted_before_dispatch", "The attempt stopped before dispatch.", [],
+            VerificationGenerationAttemptStatus.InterruptedBeforeDispatch, DateTimeOffset.UtcNow);
+        Assert.True(Project(interrupted).CanRetryVerificationPlanGeneration);
+        Assert.Equal(VerificationGenerationRuntimeStatus.InterruptedBeforeDispatch,
+            Project(interrupted).VerificationGenerationStatus);
+
+        var completed = Prepare();
+        var completedCommand = Begin(completed);
+        var context = VerificationWorkflowService.CreateContext(completed, DateTimeOffset.UtcNow);
+        var candidate = (await new FakeVerificationPlanEngine().GenerateAsync(context)).Candidate;
+        var plan = VerificationValidator.FinalizeCandidate(context, candidate, 1, Guid.NewGuid(), [],
+            new VerificationLimits());
+        completed.StoreVerificationPlan(completedCommand.CommandId, plan, DateTimeOffset.UtcNow);
+        Assert.Equal(VerificationGenerationRuntimeStatus.Completed,
+            Project(completed).VerificationGenerationStatus);
+        Assert.False(Project(completed).CanGenerateVerificationPlan);
+        Assert.Contains("completed", Project(completed).VerificationGenerationStatusMessage,
+            StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task Task_detail_serializes_initial_and_expired_response_generation_fields_with_exact_json_names()
+    {
+        await using var factory = new FakeModeFactory();
+        using var client = factory.CreateClient();
+        var repository = factory.Services.GetRequiredService<IEngineeringTaskRepository>();
+        var approvalRepository = factory.Services.GetRequiredService<IImplementationApprovalRepository>();
+        var verificationRepository = factory.Services.GetRequiredService<IVerificationRepository>();
+        var initial = CreatePersistedImplementationReview(activeCheckoutVerified: true);
+        var initialRevision = Assert.Single(initial.ImplementationRevisions);
+        await repository.SaveAsync(initial);
+        initial = await approvalRepository.ApproveImplementationAsync(
+            new ImplementationApprovalCommand(Guid.NewGuid(), initial.Id, initial.RowVersion,
+                initialRevision.RevisionId, initialRevision.ResultFingerprint!),
+            DateTimeOffset.UtcNow);
+
+        using var initialDocument = JsonDocument.Parse(await client.GetStringAsync($"/api/tasks/{initial.Id}"));
+        var initialEligibility = initialDocument.RootElement.GetProperty("verificationEligibility");
+        Assert.True(initialEligibility.GetProperty("canGenerateVerificationPlan").GetBoolean());
+        Assert.True(initialEligibility.GetProperty("isInitialVerificationPlanGeneration").GetBoolean());
+        Assert.False(initialEligibility.GetProperty("canRetryVerificationPlanGeneration").GetBoolean());
+        Assert.Equal("NotStarted", initialEligibility.GetProperty("verificationGenerationStatus").GetString());
+
+        var timeline = DateTimeOffset.UtcNow;
+        var responseTask = CreatePersistedImplementationReview(activeCheckoutVerified: true,
+            createdAt: timeline.AddMinutes(-30));
+        var pendingResponseRevision = Assert.Single(responseTask.ImplementationRevisions);
+        await repository.SaveAsync(responseTask);
+        responseTask = await approvalRepository.ApproveImplementationAsync(
+            new ImplementationApprovalCommand(Guid.NewGuid(), responseTask.Id, responseTask.RowVersion,
+                pendingResponseRevision.RevisionId, pendingResponseRevision.ResultFingerprint!),
+            timeline.AddMinutes(-20));
+        var revision = responseTask.ImplementationRevisions.Single(item =>
+            item.RevisionId == responseTask.ApprovedImplementationRevisionId);
+        var startedAt = timeline.AddMinutes(-6);
+        var command = new VerificationPlanGenerationCommand(Guid.NewGuid(), responseTask.Id,
+            responseTask.RowVersion, revision.RevisionId, revision.ResultFingerprint!);
+        responseTask = (await verificationRepository.BeginPlanGenerationAsync(command, startedAt)).Task;
+        var callId = Guid.NewGuid();
+        responseTask = await verificationRepository.RecordPlanGenerationCheckpointAsync(responseTask.Id,
+            command.CommandId, VerificationDispatchCheckpoint.DispatchMayHaveStarted, callId, startedAt,
+            logicalCallStartedAt: startedAt);
+        responseTask = await verificationRepository.RecordVerificationProviderResponseAsync(responseTask.Id,
+            command.CommandId,
+            new VerificationProviderResponseTelemetry(callId, startedAt, startedAt.AddSeconds(1), "resp-safe",
+                "req-safe", VerificationProviderResponseStatus.Completed, null, true, 12, null, 7, null, 200,
+                VerificationCallDispatchDisposition.ResponseReceived, VerificationUsageAvailability.Partial),
+            startedAt.AddSeconds(1));
+        responseTask = await verificationRepository.RecordPlanGenerationModelCallAsync(responseTask.Id,
+            command.CommandId, callId,
+            new ModelCallRecord(callId, ModelCallStage.VerificationPlanning, "OpenAI", "gpt-5.6-sol", "medium",
+                startedAt, startedAt.AddSeconds(2), true, "resp-safe", 12, null, 7, null, 0.0002m, null,
+                new ModelPricingSnapshot(10m, 2m, 20m), "req-safe",
+                VerificationCallDispatchDisposition.ResponseReceived, 200, true,
+                VerificationUsageAvailability.Partial), startedAt.AddSeconds(2));
+
+        var restarted = await new SqliteEngineeringTaskRepository($"Data Source={factory.DatabasePath}")
+            .GetAsync(responseTask.Id);
+        var restartedCall = Assert.Single(restarted!.ModelCalls);
+        Assert.Equal(VerificationUsageAvailability.Partial, restartedCall.ProviderUsageAvailability);
+        Assert.Equal(12, restartedCall.InputTokens);
+        Assert.Null(restartedCall.CachedInputTokens);
+        Assert.Equal(7, restartedCall.OutputTokens);
+        Assert.Equal(0.0002m, restartedCall.EstimatedCostUsd);
+        Assert.NotNull(restartedCall.PricingSnapshot);
+
+        using var responseDocument = JsonDocument.Parse(await client.GetStringAsync($"/api/tasks/{responseTask.Id}"));
+        var responseEligibility = responseDocument.RootElement.GetProperty("verificationEligibility");
+        Assert.False(responseEligibility.GetProperty("canGenerateVerificationPlan").GetBoolean());
+        Assert.False(responseEligibility.GetProperty("isInitialVerificationPlanGeneration").GetBoolean());
+        Assert.False(responseEligibility.GetProperty("canRetryVerificationPlanGeneration").GetBoolean());
+        Assert.Equal("AmbiguousAfterDispatch",
+            responseEligibility.GetProperty("verificationGenerationStatus").GetString());
+        Assert.Contains("duplicate billable request",
+            responseEligibility.GetProperty("verificationGenerationStatusMessage").GetString(),
+            StringComparison.OrdinalIgnoreCase);
+        var response = responseDocument.RootElement.GetProperty("verificationPlanGenerationAttempts")[0]
+            .GetProperty("providerResponses")[0];
+        Assert.Equal("Partial", response.GetProperty("usageAvailability").GetString());
+        Assert.Equal(12, response.GetProperty("inputTokens").GetInt32());
+        Assert.Equal(7, response.GetProperty("outputTokens").GetInt32());
+        Assert.Equal(startedAt, response.GetProperty("startedAt").GetDateTimeOffset());
+        Assert.Equal(startedAt.AddSeconds(1), response.GetProperty("receivedAt").GetDateTimeOffset());
+        var telemetry = responseDocument.RootElement.GetProperty("telemetry");
+        Assert.Equal(1, telemetry.GetProperty("verificationLogicalAttemptCount").GetInt32());
+        Assert.Equal(1, telemetry.GetProperty("verificationPhysicalRequestCount").GetInt32());
+        Assert.Equal(0, telemetry.GetProperty("verificationPossiblyDispatchedRequestCount").GetInt32());
+        Assert.Equal(0, telemetry.GetProperty("verificationDefinitelyUndispatchedAttemptCount").GetInt32());
+        Assert.Equal(JsonValueKind.Null, telemetry.GetProperty("completeEstimatedSubtotalUsd").ValueKind);
+        Assert.Equal(0.00026m, telemetry.GetProperty("partialEstimatedSubtotalUsd").GetDecimal());
+        Assert.Equal(0.00026m, telemetry.GetProperty("availableEstimatedSubtotalUsd").GetDecimal());
+        Assert.True(telemetry.GetProperty("hasPartialEstimates").GetBoolean());
+        Assert.Equal(JsonValueKind.Null, telemetry.GetProperty("totalEstimatedCostUsd").ValueKind);
+        Assert.Equal(0, telemetry.GetProperty("costUnavailableCallCount").GetInt32());
+        var apiCall = Assert.Single(telemetry.GetProperty("calls").EnumerateArray());
+        Assert.Equal("Partial", apiCall.GetProperty("providerUsageAvailability").GetString());
+        Assert.True(apiCall.GetProperty("usageAvailable").GetBoolean());
+        Assert.True(apiCall.GetProperty("isPartialEstimate").GetBoolean());
+        Assert.Equal(0.00026m, apiCall.GetProperty("estimatedCostUsd").GetDecimal());
+        Assert.Equal("stored pricing snapshot", apiCall.GetProperty("pricingProvenance").GetString());
+        var pdfText = ExtractPdf(await client.GetByteArrayAsync($"/api/tasks/{responseTask.Id}/export/pdf"));
+        Assert.Contains("Conservative partial estimated cost", pdfText, StringComparison.Ordinal);
+        Assert.Contains("$0.00026000 USD", pdfText, StringComparison.Ordinal);
+        Assert.DoesNotContain("All recorded model calls have an available estimated cost.", pdfText,
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Persisted_current_unavailable_verification_usage_stays_unavailable_after_restart_api_and_pdf()
+    {
+        await using var factory = new FakeModeFactory();
+        using var client = factory.CreateClient();
+        var repository = factory.Services.GetRequiredService<IEngineeringTaskRepository>();
+        var approvalRepository = factory.Services.GetRequiredService<IImplementationApprovalRepository>();
+        var verificationRepository = factory.Services.GetRequiredService<IVerificationRepository>();
+        var task = CreatePersistedImplementationReview(activeCheckoutVerified: true);
+        var pending = Assert.Single(task.ImplementationRevisions);
+        await repository.SaveAsync(task);
+        task = await approvalRepository.ApproveImplementationAsync(new ImplementationApprovalCommand(
+            Guid.NewGuid(), task.Id, task.RowVersion, pending.RevisionId, pending.ResultFingerprint!),
+            DateTimeOffset.UtcNow.AddMinutes(-2));
+        var revision = task.ImplementationRevisions.Single(item => item.RevisionId == task.ApprovedImplementationRevisionId);
+        var startedAt = DateTimeOffset.UtcNow.AddMinutes(-1);
+        var command = new VerificationPlanGenerationCommand(Guid.NewGuid(), task.Id, task.RowVersion,
+            revision.RevisionId, revision.ResultFingerprint!);
+        task = (await verificationRepository.BeginPlanGenerationAsync(command, startedAt)).Task;
+        var callId = Guid.NewGuid();
+        task = await verificationRepository.RecordPlanGenerationCheckpointAsync(task.Id, command.CommandId,
+            VerificationDispatchCheckpoint.DispatchMayHaveStarted, callId, startedAt,
+            logicalCallStartedAt: startedAt);
+        task = await verificationRepository.RecordVerificationProviderResponseAsync(task.Id, command.CommandId,
+            new VerificationProviderResponseTelemetry(callId, startedAt, startedAt.AddSeconds(1), "resp-safe",
+                "req-safe", VerificationProviderResponseStatus.Completed, null, false, null, null, null, null, 200,
+                VerificationCallDispatchDisposition.ResponseReceived, VerificationUsageAvailability.Unavailable),
+            startedAt.AddSeconds(1));
+        await verificationRepository.RecordPlanGenerationModelCallAsync(task.Id, command.CommandId, callId,
+            new ModelCallRecord(callId, ModelCallStage.VerificationPlanning, "OpenAI", "gpt-5.6-sol", "medium",
+                startedAt, startedAt.AddSeconds(2), true, "resp-safe", null, null, null, null, null, null,
+                new ModelPricingSnapshot(10m, 2m, 20m), "req-safe",
+                VerificationCallDispatchDisposition.ResponseReceived, 200, false,
+                VerificationUsageAvailability.Unavailable), startedAt.AddSeconds(2));
+
+        var restarted = await new SqliteEngineeringTaskRepository($"Data Source={factory.DatabasePath}").GetAsync(task.Id);
+        Assert.Equal(VerificationUsageAvailability.Unavailable, Assert.Single(restarted!.ModelCalls).ProviderUsageAvailability);
+        using var document = JsonDocument.Parse(await client.GetStringAsync($"/api/tasks/{task.Id}"));
+        var telemetry = document.RootElement.GetProperty("telemetry");
+        Assert.Equal("Unavailable", telemetry.GetProperty("usageAvailability").GetString());
+        Assert.Equal(JsonValueKind.Null, telemetry.GetProperty("totalEstimatedCostUsd").ValueKind);
+        Assert.Equal(1, telemetry.GetProperty("costUnavailableCallCount").GetInt32());
+        var pdfText = ExtractPdf(await client.GetByteArrayAsync($"/api/tasks/{task.Id}/export/pdf"));
+        Assert.Contains("Usage unavailable", pdfText, StringComparison.Ordinal);
+        Assert.Contains("Estimated cost: unavailable", pdfText, StringComparison.Ordinal);
+        Assert.DoesNotContain("$0.00000000 USD", pdfText, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -1430,6 +1868,9 @@ public sealed class EngineeringTaskApiTests : IClassFixture<FakeModeFactory>
         Assert.Null(unavailable.EstimatedCostUsd);
         Assert.True(response.Telemetry.IsPartialEstimate);
         Assert.Equal(1, response.Telemetry.CostUnavailableCallCount);
+        Assert.Equal(0.0018m, response.Telemetry.CompleteEstimatedSubtotalUsd);
+        Assert.Null(response.Telemetry.PartialEstimatedSubtotalUsd);
+        Assert.Equal(0.0018m, response.Telemetry.AvailableEstimatedSubtotalUsd);
     }
 
     [Fact]
@@ -1559,9 +2000,9 @@ public sealed class EngineeringTaskApiTests : IClassFixture<FakeModeFactory>
         - Compare the target repository branch, HEAD, status, index, and file hashes before and after implementation.
         """;
 
-    private static EngineeringTask CreatePersistedImplementationAttempt()
+    private static EngineeringTask CreatePersistedImplementationAttempt(DateTimeOffset? createdAt = null)
     {
-        var now = DateTimeOffset.UtcNow.AddMinutes(-10);
+        var now = createdAt ?? DateTimeOffset.UtcNow.AddMinutes(-10);
         var task = EngineeringTask.Create("C:/persisted/source-repository", "Generate a safe report.", now);
         task.ApplyClarificationEvaluation(ClarificationEvaluation.Summarize("Generate a safe report."), now);
         task.ApproveRequirementSummary(now.AddMinutes(1));
@@ -1592,9 +2033,11 @@ public sealed class EngineeringTaskApiTests : IClassFixture<FakeModeFactory>
         return task;
     }
 
-    private static EngineeringTask CreatePersistedImplementationReview(bool activeCheckoutVerified)
+    private static EngineeringTask CreatePersistedImplementationReview(
+        bool activeCheckoutVerified,
+        DateTimeOffset? createdAt = null)
     {
-        var task = CreatePersistedImplementationAttempt();
+        var task = CreatePersistedImplementationAttempt(createdAt);
         var workspace = task.ImplementationWorkspace!;
         var lease = task.ImplementationLease!;
         const string diff = "diff --git a/src/App.cs b/src/App.cs";
@@ -1769,6 +2212,486 @@ public sealed class EngineeringTaskApiTests : IClassFixture<FakeModeFactory>
                 return Directory.Exists(path) ? $"D|{relative}" : $"F|{relative}|{FileIdentity(path)}";
             }));
     }
+    [Fact]
+    public async Task Fake_verification_plan_manual_results_completion_and_pdf_flow()
+    {
+        await using var factory = new FakeModeFactory();
+        using var client = factory.CreateClient();
+        var task = CreatePersistedImplementationReview(activeCheckoutVerified: true);
+        await factory.Services.GetRequiredService<IEngineeringTaskRepository>().SaveAsync(task);
+        var revision = Assert.Single(task.ImplementationRevisions);
+        var approval = await client.PostAsJsonAsync($"/api/tasks/{task.Id}/implementation-approval", new
+        {
+            commandId = Guid.NewGuid(), expectedRowVersion = task.RowVersion,
+            expectedRevisionId = revision.RevisionId, expectedResultFingerprint = revision.ResultFingerprint
+        });
+        approval.EnsureSuccessStatusCode();
+        var approved = await approval.Content.ReadFromJsonAsync<JsonElement>();
+
+        var generation = await client.PostAsJsonAsync($"/api/tasks/{task.Id}/verification-plans", new
+        {
+            commandId = Guid.NewGuid(), expectedRowVersion = approved.GetProperty("rowVersion").GetInt64(),
+            expectedImplementationRevisionId = revision.RevisionId,
+            expectedImplementationResultFingerprint = revision.ResultFingerprint
+        });
+        generation.EnsureSuccessStatusCode();
+        var generated = await generation.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Equal("AwaitingManualVerification", generated.GetProperty("status").GetString());
+        Assert.Equal(JsonValueKind.String, generated.GetProperty("currentVerificationPlanId").ValueKind);
+        Assert.Equal(JsonValueKind.Null, generated.GetProperty("currentVerificationAttemptId").ValueKind);
+        AssertManualEligibility(generated, canStart: true, canRecord: false, canPass: false, canFail: false);
+        var plan = Assert.Single(generated.GetProperty("verificationPlans").EnumerateArray());
+        Assert.Equal("FORGE GENERATED", plan.GetProperty("trustLabel").GetString());
+        Assert.Equal("MANUAL — NOT EXECUTED BY FORGE", plan.GetProperty("executionLabel").GetString());
+        var planId = plan.GetProperty("planId").GetGuid();
+        var planFingerprint = plan.GetProperty("planFingerprint").GetString()!;
+        var pdf = await client.GetAsync($"/api/tasks/{task.Id}/verification-plans/{planId}/export/pdf");
+        Assert.Equal(HttpStatusCode.OK, pdf.StatusCode);
+        Assert.Equal("application/pdf", pdf.Content.Headers.ContentType?.MediaType);
+        using (var document = PdfDocument.Open(await pdf.Content.ReadAsByteArrayAsync()))
+        {
+            var text = string.Join("\n", document.GetPages().Select(page => page.Text));
+            Assert.Contains("FORGE GENERATED", text, StringComparison.Ordinal);
+            Assert.Contains("MANUAL — NOT EXECUTED BY FORGE", text, StringComparison.Ordinal);
+            Assert.DoesNotContain(factory.DatabasePath, text, StringComparison.OrdinalIgnoreCase);
+            Assert.DoesNotContain(factory.WorktreeRoot, text, StringComparison.OrdinalIgnoreCase);
+        }
+        var missingPlan = await client.GetAsync($"/api/tasks/{task.Id}/verification-plans/{Guid.NewGuid()}/export/pdf");
+        Assert.Equal(HttpStatusCode.NotFound, missingPlan.StatusCode);
+        Assert.Equal("verification_plan_not_found", (await missingPlan.Content.ReadFromJsonAsync<JsonElement>())
+            .GetProperty("code").GetString());
+
+        var start = await client.PostAsJsonAsync($"/api/tasks/{task.Id}/verification-attempts", new
+        {
+            commandId = Guid.NewGuid(), expectedRowVersion = generated.GetProperty("rowVersion").GetInt64(),
+            expectedVerificationPlanId = planId, expectedVerificationPlanFingerprint = planFingerprint,
+            expectedImplementationRevisionId = revision.RevisionId,
+            expectedImplementationResultFingerprint = revision.ResultFingerprint
+        });
+        start.EnsureSuccessStatusCode();
+        var current = await start.Content.ReadFromJsonAsync<JsonElement>();
+        var attemptId = current.GetProperty("currentVerificationAttemptId").GetGuid();
+        Assert.Equal("InProgress", Assert.Single(current.GetProperty("manualVerificationAttempts").EnumerateArray())
+            .GetProperty("status").GetString());
+        AssertManualEligibility(current, canStart: false, canRecord: true, canPass: false, canFail: false);
+        foreach (var testCase in plan.GetProperty("testCases").EnumerateArray()
+                     .Where(item => item.GetProperty("isRequired").GetBoolean()))
+        {
+            var update = await client.PutAsJsonAsync(
+                $"/api/tasks/{task.Id}/verification-attempts/{attemptId}/cases/{testCase.GetProperty("testCaseId").GetGuid()}", new
+                {
+                    commandId = Guid.NewGuid(), expectedRowVersion = current.GetProperty("rowVersion").GetInt64(),
+                    expectedVerificationPlanId = planId, expectedVerificationPlanFingerprint = planFingerprint,
+                    expectedImplementationRevisionId = revision.RevisionId,
+                    expectedImplementationResultFingerprint = revision.ResultFingerprint,
+                    result = "Passed", notes = "Observed manually.", actualResult = "Expected behavior observed.",
+                    evidenceDescriptions = new[] { "Safe textual observation recorded by the user." },
+                    notApplicableReason = (string?)null, failureDetails = (object?)null
+                });
+            update.EnsureSuccessStatusCode();
+            current = await update.Content.ReadFromJsonAsync<JsonElement>();
+        }
+        AssertManualEligibility(current, canStart: false, canRecord: true, canPass: true, canFail: false);
+        var completion = await client.PostAsJsonAsync(
+            $"/api/tasks/{task.Id}/verification-attempts/{attemptId}/complete-passed", new
+            {
+                commandId = Guid.NewGuid(), expectedRowVersion = current.GetProperty("rowVersion").GetInt64(),
+                expectedVerificationPlanId = planId, expectedVerificationPlanFingerprint = planFingerprint,
+                expectedImplementationRevisionId = revision.RevisionId,
+                expectedImplementationResultFingerprint = revision.ResultFingerprint,
+                confirmedByHuman = true, summary = "Manual pass confirmed."
+            });
+        completion.EnsureSuccessStatusCode();
+        var completed = await completion.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Equal("ReadyForDelivery", completed.GetProperty("status").GetString());
+        Assert.True(completed.GetProperty("verificationEligibility").GetProperty("readyForDelivery").GetBoolean());
+        AssertManualEligibility(completed, canStart: false, canRecord: false, canPass: false, canFail: false);
+        Assert.Equal("CompletedPassed", Assert.Single(completed.GetProperty("manualVerificationAttempts").EnumerateArray())
+            .GetProperty("status").GetString());
+    }
+
+    [Fact]
+    public async Task Failed_manual_verification_serializes_authoritative_eligibility_and_terminal_state()
+    {
+        await using var factory = new FakeModeFactory();
+        using var client = factory.CreateClient();
+        var task = CreatePersistedImplementationReview(activeCheckoutVerified: true);
+        await factory.Services.GetRequiredService<IEngineeringTaskRepository>().SaveAsync(task);
+        var revision = Assert.Single(task.ImplementationRevisions);
+        var approval = await client.PostAsJsonAsync($"/api/tasks/{task.Id}/implementation-approval", new
+        {
+            commandId = Guid.NewGuid(), expectedRowVersion = task.RowVersion,
+            expectedRevisionId = revision.RevisionId, expectedResultFingerprint = revision.ResultFingerprint
+        });
+        approval.EnsureSuccessStatusCode();
+        var approved = await approval.Content.ReadFromJsonAsync<JsonElement>();
+        var generation = await client.PostAsJsonAsync($"/api/tasks/{task.Id}/verification-plans", new
+        {
+            commandId = Guid.NewGuid(), expectedRowVersion = approved.GetProperty("rowVersion").GetInt64(),
+            expectedImplementationRevisionId = revision.RevisionId,
+            expectedImplementationResultFingerprint = revision.ResultFingerprint
+        });
+        generation.EnsureSuccessStatusCode();
+        var generated = await generation.Content.ReadFromJsonAsync<JsonElement>();
+        var plan = Assert.Single(generated.GetProperty("verificationPlans").EnumerateArray());
+        var planId = plan.GetProperty("planId").GetGuid();
+        var planFingerprint = plan.GetProperty("planFingerprint").GetString()!;
+        var testCaseId = plan.GetProperty("testCases")[0].GetProperty("testCaseId").GetGuid();
+        var start = await client.PostAsJsonAsync($"/api/tasks/{task.Id}/verification-attempts", new
+        {
+            commandId = Guid.NewGuid(), expectedRowVersion = generated.GetProperty("rowVersion").GetInt64(),
+            expectedVerificationPlanId = planId, expectedVerificationPlanFingerprint = planFingerprint,
+            expectedImplementationRevisionId = revision.RevisionId,
+            expectedImplementationResultFingerprint = revision.ResultFingerprint
+        });
+        start.EnsureSuccessStatusCode();
+        var active = await start.Content.ReadFromJsonAsync<JsonElement>();
+        var attemptId = active.GetProperty("currentVerificationAttemptId").GetGuid();
+        var result = await client.PutAsJsonAsync(
+            $"/api/tasks/{task.Id}/verification-attempts/{attemptId}/cases/{testCaseId}", new
+            {
+                commandId = Guid.NewGuid(), expectedRowVersion = active.GetProperty("rowVersion").GetInt64(),
+                expectedVerificationPlanId = planId, expectedVerificationPlanFingerprint = planFingerprint,
+                expectedImplementationRevisionId = revision.RevisionId,
+                expectedImplementationResultFingerprint = revision.ResultFingerprint,
+                result = "Failed", notes = "Observed manually.", actualResult = "Unexpected behavior.",
+                evidenceDescriptions = Array.Empty<string>(), notApplicableReason = (string?)null,
+                failureDetails = new
+                {
+                    title = "Manual mismatch", expectedResult = "Expected behavior.",
+                    actualResult = "Unexpected behavior.", reproductionSteps = new[] { "Inspect manually." },
+                    environmentNotes = Array.Empty<string>(), errorMessage = (string?)null,
+                    evidenceDescriptions = Array.Empty<string>(), severity = "High"
+                }
+            });
+        result.EnsureSuccessStatusCode();
+        var failEligible = await result.Content.ReadFromJsonAsync<JsonElement>();
+        AssertManualEligibility(failEligible, canStart: false, canRecord: true, canPass: false, canFail: true);
+        var completion = await client.PostAsJsonAsync(
+            $"/api/tasks/{task.Id}/verification-attempts/{attemptId}/complete-failed", new
+            {
+                commandId = Guid.NewGuid(), expectedRowVersion = failEligible.GetProperty("rowVersion").GetInt64(),
+                expectedVerificationPlanId = planId, expectedVerificationPlanFingerprint = planFingerprint,
+                expectedImplementationRevisionId = revision.RevisionId,
+                expectedImplementationResultFingerprint = revision.ResultFingerprint,
+                confirmedByHuman = true, summary = "Manual failure confirmed."
+            });
+        completion.EnsureSuccessStatusCode();
+        var completed = await completion.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Equal("ManualVerificationFailed", completed.GetProperty("status").GetString());
+        Assert.Equal(planId, completed.GetProperty("currentVerificationPlanId").GetGuid());
+        Assert.Equal(attemptId, completed.GetProperty("currentVerificationAttemptId").GetGuid());
+        Assert.Equal("CompletedFailed", Assert.Single(completed.GetProperty("manualVerificationAttempts").EnumerateArray())
+            .GetProperty("status").GetString());
+        AssertManualEligibility(completed, canStart: false, canRecord: false, canPass: false, canFail: false);
+    }
+
+    private static void AssertManualEligibility(
+        JsonElement task,
+        bool canStart,
+        bool canRecord,
+        bool canPass,
+        bool canFail)
+    {
+        var eligibility = task.GetProperty("verificationEligibility");
+        Assert.Equal(canStart, eligibility.GetProperty("canStartVerificationAttempt").GetBoolean());
+        Assert.Equal(canRecord, eligibility.GetProperty("canRecordVerificationResult").GetBoolean());
+        Assert.Equal(canPass, eligibility.GetProperty("canCompleteVerificationPassed").GetBoolean());
+        Assert.Equal(canFail, eligibility.GetProperty("canCompleteVerificationFailed").GetBoolean());
+    }
+
+    [Fact]
+    public async Task Coordinated_verification_downgrade_is_contained_across_read_and_mutation_endpoint_families()
+    {
+        await using var factory = new CorruptionNoIoFactory();
+        using var client = factory.CreateClient();
+        var repository = factory.Services.GetRequiredService<IEngineeringTaskRepository>();
+        var task = CreatePersistedImplementationReview(activeCheckoutVerified: true);
+        var healthy = EngineeringTask.Create("C:/healthy", "Healthy unrelated task", DateTimeOffset.UtcNow);
+        await repository.SaveAsync(task);
+        await repository.SaveAsync(healthy);
+        var revision = Assert.Single(task.ImplementationRevisions);
+        var approval = await client.PostAsJsonAsync($"/api/tasks/{task.Id}/implementation-approval", new
+        {
+            commandId = Guid.NewGuid(), expectedRowVersion = task.RowVersion,
+            expectedRevisionId = revision.RevisionId, expectedResultFingerprint = revision.ResultFingerprint
+        });
+        approval.EnsureSuccessStatusCode();
+        var approved = await approval.Content.ReadFromJsonAsync<JsonElement>();
+        var generation = await client.PostAsJsonAsync($"/api/tasks/{task.Id}/verification-plans", new
+        {
+            commandId = Guid.NewGuid(), expectedRowVersion = approved.GetProperty("rowVersion").GetInt64(),
+            expectedImplementationRevisionId = revision.RevisionId,
+            expectedImplementationResultFingerprint = revision.ResultFingerprint
+        });
+        generation.EnsureSuccessStatusCode();
+        var generated = await generation.Content.ReadFromJsonAsync<JsonElement>();
+        var plan = Assert.Single(generated.GetProperty("verificationPlans").EnumerateArray());
+        var planId = plan.GetProperty("planId").GetGuid();
+        var planFingerprint = plan.GetProperty("planFingerprint").GetString()!;
+        await using (var connection = new SqliteConnection($"Data Source={factory.DatabasePath}"))
+        {
+            await connection.OpenAsync();
+            await using var update = connection.CreateCommand();
+            update.CommandText = """
+                UPDATE EngineeringTasks SET VerificationDataFormatVersion = 0 WHERE Id = $taskId;
+                UPDATE VerificationPlanGenerationCommands SET Json = json_remove(Json,
+                  '$.providerResponses[0].usageAvailability', '$.providerResponses[0].telemetryFingerprint',
+                  '$.providerResponses[0].formatVersion') WHERE TaskId = $taskId;
+                """;
+            update.Parameters.AddWithValue("$taskId", task.Id.ToString("D"));
+            Assert.True(await update.ExecuteNonQueryAsync() >= 1);
+        }
+
+        var persistedFailure = await Record.ExceptionAsync(() => repository.GetAsync(task.Id));
+        Assert.IsType<TaskDataCorruptException>(persistedFailure);
+
+        var requests = new List<HttpRequestMessage>
+        {
+            new(HttpMethod.Get, $"/api/tasks/{task.Id}"),
+            new(HttpMethod.Get, "/api/tasks"),
+            new(HttpMethod.Get, $"/api/tasks/{task.Id}/export/pdf"),
+            new(HttpMethod.Get, $"/api/tasks/{task.Id}/verification-plans/{planId}/export/pdf"),
+            new(HttpMethod.Post, $"/api/tasks/{task.Id}/verification-plans")
+            {
+                Content = JsonContent.Create(new { commandId = Guid.NewGuid(),
+                    expectedRowVersion = generated.GetProperty("rowVersion").GetInt64(),
+                    expectedImplementationRevisionId = revision.RevisionId,
+                    expectedImplementationResultFingerprint = revision.ResultFingerprint })
+            },
+            new(HttpMethod.Post, $"/api/tasks/{task.Id}/verification-attempts")
+            {
+                Content = JsonContent.Create(new { commandId = Guid.NewGuid(),
+                    expectedRowVersion = generated.GetProperty("rowVersion").GetInt64(),
+                    expectedVerificationPlanId = planId, expectedVerificationPlanFingerprint = planFingerprint,
+                    expectedImplementationRevisionId = revision.RevisionId,
+                    expectedImplementationResultFingerprint = revision.ResultFingerprint })
+            },
+            new(HttpMethod.Put, $"/api/tasks/{task.Id}/verification-attempts/{Guid.NewGuid()}/cases/{Guid.NewGuid()}")
+            {
+                Content = JsonContent.Create(new { commandId = Guid.NewGuid(),
+                    expectedRowVersion = generated.GetProperty("rowVersion").GetInt64(),
+                    expectedVerificationPlanId = planId, expectedVerificationPlanFingerprint = planFingerprint,
+                    expectedImplementationRevisionId = revision.RevisionId,
+                    expectedImplementationResultFingerprint = revision.ResultFingerprint,
+                    result = "Passed", notes = (string?)null, actualResult = "Observed.",
+                    evidenceDescriptions = Array.Empty<string>(), notApplicableReason = (string?)null,
+                    failureDetails = (object?)null })
+            }
+        };
+        foreach (var request in requests)
+        {
+            using (request)
+            using (var response = await client.SendAsync(request))
+            {
+                var body = await response.Content.ReadAsStringAsync();
+                Assert.True(response.StatusCode == HttpStatusCode.Conflict,
+                    $"{request.Method} {request.RequestUri} returned {(int)response.StatusCode}: {body}");
+                Assert.True(body.Length < 2_000);
+                Assert.Equal("task_data_corrupt", JsonDocument.Parse(body).RootElement.GetProperty("code").GetString());
+                Assert.DoesNotContain(factory.DatabasePath, body, StringComparison.OrdinalIgnoreCase);
+                Assert.DoesNotContain("Sqlite", body, StringComparison.OrdinalIgnoreCase);
+                Assert.DoesNotContain("TaskDataCorruptException", body, StringComparison.Ordinal);
+                Assert.DoesNotContain("SELECT ", body, StringComparison.OrdinalIgnoreCase);
+            }
+        }
+
+        Assert.Equal(HttpStatusCode.OK, (await client.GetAsync($"/api/tasks/{healthy.Id}")).StatusCode);
+        Assert.Equal(0, factory.GitRunner.Calls);
+        Assert.False(Directory.Exists(factory.WorktreeRoot));
+    }
+
+    [Theory]
+    [InlineData("main-aggregate", "detail")]
+    [InlineData("model-calls", "task-pdf")]
+    [InlineData("implementation-revision", "generation-mutation")]
+    [InlineData("verification-generation", "detail")]
+    [InlineData("verification-generation", "attempt-mutation")]
+    [InlineData("verification-plan", "verification-pdf")]
+    [InlineData("manual-attempt", "completion-passed-mutation")]
+    [InlineData("result-revision", "result-mutation")]
+    [InlineData("result-revision", "completion-failed-mutation")]
+    [InlineData("pricing-snapshot", "task-pdf")]
+    [InlineData("command-semantic", "detail")]
+    [InlineData("parent-format", "history")]
+    public async Task Representative_persisted_corruption_families_use_the_bounded_contract(
+        string family, string endpoint)
+    {
+        await using var factory = new CorruptionNoIoFactory();
+        using var client = factory.CreateClient();
+        var repository = factory.Services.GetRequiredService<IEngineeringTaskRepository>();
+        var task = CreatePersistedImplementationReview(activeCheckoutVerified: true);
+        var healthy = EngineeringTask.Create("C:/healthy-matrix", "Healthy matrix task", DateTimeOffset.UtcNow);
+        await repository.SaveAsync(task);
+        await repository.SaveAsync(healthy);
+        var revision = Assert.Single(task.ImplementationRevisions);
+        var approval = await client.PostAsJsonAsync($"/api/tasks/{task.Id}/implementation-approval", new
+        {
+            commandId = Guid.NewGuid(), expectedRowVersion = task.RowVersion,
+            expectedRevisionId = revision.RevisionId, expectedResultFingerprint = revision.ResultFingerprint
+        });
+        approval.EnsureSuccessStatusCode();
+        var approved = await approval.Content.ReadFromJsonAsync<JsonElement>();
+        var generation = await client.PostAsJsonAsync($"/api/tasks/{task.Id}/verification-plans", new
+        {
+            commandId = Guid.NewGuid(), expectedRowVersion = approved.GetProperty("rowVersion").GetInt64(),
+            expectedImplementationRevisionId = revision.RevisionId,
+            expectedImplementationResultFingerprint = revision.ResultFingerprint
+        });
+        generation.EnsureSuccessStatusCode();
+        var generated = await generation.Content.ReadFromJsonAsync<JsonElement>();
+        var plan = Assert.Single(generated.GetProperty("verificationPlans").EnumerateArray());
+        var planId = plan.GetProperty("planId").GetGuid();
+        var planFingerprint = plan.GetProperty("planFingerprint").GetString()!;
+        var testCaseId = plan.GetProperty("testCases")[0].GetProperty("testCaseId").GetGuid();
+        var start = await client.PostAsJsonAsync($"/api/tasks/{task.Id}/verification-attempts", new
+        {
+            commandId = Guid.NewGuid(), expectedRowVersion = generated.GetProperty("rowVersion").GetInt64(),
+            expectedVerificationPlanId = planId, expectedVerificationPlanFingerprint = planFingerprint,
+            expectedImplementationRevisionId = revision.RevisionId,
+            expectedImplementationResultFingerprint = revision.ResultFingerprint
+        });
+        start.EnsureSuccessStatusCode();
+        var started = await start.Content.ReadFromJsonAsync<JsonElement>();
+        var attemptId = started.GetProperty("currentVerificationAttemptId").GetGuid();
+        var recorded = await client.PutAsJsonAsync(
+            $"/api/tasks/{task.Id}/verification-attempts/{attemptId}/cases/{testCaseId}", new
+            {
+                commandId = Guid.NewGuid(), expectedRowVersion = started.GetProperty("rowVersion").GetInt64(),
+                expectedVerificationPlanId = planId, expectedVerificationPlanFingerprint = planFingerprint,
+                expectedImplementationRevisionId = revision.RevisionId,
+                expectedImplementationResultFingerprint = revision.ResultFingerprint,
+                result = "Passed", notes = (string?)null, actualResult = "Observed manually.",
+                evidenceDescriptions = Array.Empty<string>(), notApplicableReason = (string?)null,
+                failureDetails = (object?)null
+            });
+        recorded.EnsureSuccessStatusCode();
+        var recordedTask = await recorded.Content.ReadFromJsonAsync<JsonElement>();
+        if (family == "pricing-snapshot")
+        {
+            var loaded = (await repository.GetAsync(task.Id))!;
+            var now = DateTimeOffset.UtcNow;
+            loaded.RecordModelCall(new ModelCallRecord(Guid.NewGuid(), ModelCallStage.Clarification,
+                "Fake", "fake", "none", now, now, true, "response", 1, 0, 1, 0, 0m, null,
+                new ModelPricingSnapshot(0m, 0m, 0m)), now);
+            await repository.SaveAsync(loaded);
+        }
+        await using (var connection = new SqliteConnection($"Data Source={factory.DatabasePath}"))
+        {
+            await connection.OpenAsync();
+            await using var mutation = connection.CreateCommand();
+            mutation.CommandText = family switch
+            {
+                "main-aggregate" => "UPDATE EngineeringTasks SET ClarificationAnswers = '{' WHERE Id = $taskId;",
+                "model-calls" => "UPDATE EngineeringTasks SET ModelCalls = '{' WHERE Id = $taskId;",
+                "implementation-revision" => "UPDATE EngineeringTasks SET ImplementationRevisions = '{' WHERE Id = $taskId;",
+                "verification-generation" => "UPDATE VerificationPlanGenerationCommands SET Json = '{' WHERE TaskId = $taskId;",
+                "verification-plan" => "UPDATE VerificationPlans SET Json = '{' WHERE TaskId = $taskId;",
+                "manual-attempt" => "UPDATE ManualVerificationAttempts SET Json = '{' WHERE TaskId = $taskId;",
+                "result-revision" => "UPDATE ManualCaseResultRevisions SET Json = '{' WHERE TaskId = $taskId;",
+                "pricing-snapshot" => "UPDATE EngineeringTasks SET ModelCalls = json_set(ModelCalls, '$[#-1].pricingSnapshot', 'malformed') WHERE Id = $taskId;",
+                "command-semantic" => "UPDATE VerificationCommandBindings SET SemanticFingerprint = $invalid WHERE TaskId = $taskId;",
+                "parent-format" => "UPDATE EngineeringTasks SET VerificationDataFormatVersion = 0 WHERE Id = $taskId;",
+                _ => throw new InvalidOperationException("Unknown corruption family.")
+            };
+            mutation.Parameters.AddWithValue("$taskId", task.Id.ToString("D"));
+            mutation.Parameters.AddWithValue("$invalid", new string('A', 64));
+            Assert.True(await mutation.ExecuteNonQueryAsync() >= 1);
+        }
+
+        using var request = endpoint switch
+        {
+            "detail" => new HttpRequestMessage(HttpMethod.Get, $"/api/tasks/{task.Id}"),
+            "history" => new HttpRequestMessage(HttpMethod.Get, "/api/tasks"),
+            "task-pdf" => new HttpRequestMessage(HttpMethod.Get, $"/api/tasks/{task.Id}/export/pdf"),
+            "verification-pdf" => new HttpRequestMessage(HttpMethod.Get,
+                $"/api/tasks/{task.Id}/verification-plans/{planId}/export/pdf"),
+            "generation-mutation" => new HttpRequestMessage(HttpMethod.Post, $"/api/tasks/{task.Id}/verification-plans")
+            {
+                Content = JsonContent.Create(new { commandId = Guid.NewGuid(),
+                    expectedRowVersion = recordedTask.GetProperty("rowVersion").GetInt64(),
+                    expectedImplementationRevisionId = revision.RevisionId,
+                    expectedImplementationResultFingerprint = revision.ResultFingerprint })
+            },
+            "attempt-mutation" => new HttpRequestMessage(HttpMethod.Post, $"/api/tasks/{task.Id}/verification-attempts")
+            {
+                Content = JsonContent.Create(new { commandId = Guid.NewGuid(),
+                    expectedRowVersion = recordedTask.GetProperty("rowVersion").GetInt64(),
+                    expectedVerificationPlanId = planId, expectedVerificationPlanFingerprint = planFingerprint,
+                    expectedImplementationRevisionId = revision.RevisionId,
+                    expectedImplementationResultFingerprint = revision.ResultFingerprint })
+            },
+            "completion-passed-mutation" => new HttpRequestMessage(HttpMethod.Post,
+                $"/api/tasks/{task.Id}/verification-attempts/{attemptId}/complete-passed")
+            {
+                Content = JsonContent.Create(new { commandId = Guid.NewGuid(),
+                    expectedRowVersion = recordedTask.GetProperty("rowVersion").GetInt64(),
+                    expectedVerificationPlanId = planId, expectedVerificationPlanFingerprint = planFingerprint,
+                    expectedImplementationRevisionId = revision.RevisionId,
+                    expectedImplementationResultFingerprint = revision.ResultFingerprint,
+                    confirmedByHuman = true, summary = "Human result." })
+            },
+            "completion-failed-mutation" => new HttpRequestMessage(HttpMethod.Post,
+                $"/api/tasks/{task.Id}/verification-attempts/{attemptId}/complete-failed")
+            {
+                Content = JsonContent.Create(new { commandId = Guid.NewGuid(),
+                    expectedRowVersion = recordedTask.GetProperty("rowVersion").GetInt64(),
+                    expectedVerificationPlanId = planId, expectedVerificationPlanFingerprint = planFingerprint,
+                    expectedImplementationRevisionId = revision.RevisionId,
+                    expectedImplementationResultFingerprint = revision.ResultFingerprint,
+                    confirmedByHuman = true, summary = "Human result." })
+            },
+            "result-mutation" => new HttpRequestMessage(HttpMethod.Put,
+                $"/api/tasks/{task.Id}/verification-attempts/{attemptId}/cases/{testCaseId}")
+            {
+                Content = JsonContent.Create(new { commandId = Guid.NewGuid(),
+                    expectedRowVersion = recordedTask.GetProperty("rowVersion").GetInt64(),
+                    expectedVerificationPlanId = planId, expectedVerificationPlanFingerprint = planFingerprint,
+                    expectedImplementationRevisionId = revision.RevisionId,
+                    expectedImplementationResultFingerprint = revision.ResultFingerprint,
+                    result = "Passed", notes = (string?)null, actualResult = "Observed.",
+                    evidenceDescriptions = Array.Empty<string>(), notApplicableReason = (string?)null,
+                    failureDetails = (object?)null })
+            },
+            _ => throw new InvalidOperationException("Unknown endpoint family.")
+        };
+        using var response = await client.SendAsync(request);
+        var body = await response.Content.ReadAsStringAsync();
+        Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+        Assert.True(body.Length < 2_000);
+        Assert.Equal("task_data_corrupt", JsonDocument.Parse(body).RootElement.GetProperty("code").GetString());
+        Assert.DoesNotContain(factory.DatabasePath, body, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("Sqlite", body, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("TaskDataCorruptException", body, StringComparison.Ordinal);
+        Assert.DoesNotContain("SELECT ", body, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(HttpStatusCode.OK, (await client.GetAsync($"/api/tasks/{healthy.Id}")).StatusCode);
+        Assert.Equal(0, factory.GitRunner.Calls);
+        Assert.False(Directory.Exists(factory.WorktreeRoot));
+    }
+
+    [Fact]
+    public void Task_api_exposes_conservative_partial_call_and_distinct_subtotals()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var task = EngineeringTask.Create("C:/repo", "Report partial usage", now);
+        task.RecordModelCall(new ModelCallRecord(Guid.NewGuid(), ModelCallStage.VerificationPlanning,
+            "OpenAI", "model", "medium", now, now, true, "response", 1_000, null, 500, null,
+            999m, null, new ModelPricingSnapshot(10m, 2m, 20m), "request",
+            VerificationCallDispatchDisposition.ResponseReceived, 200, true,
+            VerificationUsageAvailability.Partial), now);
+        var response = EngineeringTaskResponse.FromDomain(task, new ModelCostResolver(new ModelCostCalculator(
+            new Dictionary<string, ModelPricing> { ["model"] = new(10m, 2m, 20m) })));
+
+        var call = Assert.Single(response.Telemetry.Calls);
+        Assert.Equal(0.02m, call.EstimatedCostUsd);
+        Assert.True(call.IsPartialEstimate);
+        Assert.Equal("stored pricing snapshot", call.PricingProvenance);
+        Assert.Null(response.Telemetry.CompleteEstimatedSubtotalUsd);
+        Assert.Equal(0.02m, response.Telemetry.PartialEstimatedSubtotalUsd);
+        Assert.Equal(0.02m, response.Telemetry.AvailableEstimatedSubtotalUsd);
+        Assert.True(response.Telemetry.HasPartialEstimates);
+        Assert.Null(response.Telemetry.TotalEstimatedCostUsd);
+    }
 }
 
 public class FakeModeFactory : WebApplicationFactory<Program>
@@ -1866,6 +2789,35 @@ public sealed class ApprovalOnlyNoIoFactory : FakeModeFactory
         {
             Calls++;
             throw new InvalidOperationException("The approval dependency graph resolved Git unexpectedly.");
+        }
+    }
+}
+
+public sealed class CorruptionNoIoFactory : FakeModeFactory
+{
+    public CountingRejectingGitRunner GitRunner { get; } = new();
+
+    protected override void ConfigureWebHost(IWebHostBuilder builder)
+    {
+        base.ConfigureWebHost(builder);
+        builder.ConfigureServices(services =>
+        {
+            services.RemoveAll<IGitProcessRunner>();
+            services.AddSingleton<IGitProcessRunner>(GitRunner);
+        });
+    }
+
+    public sealed class CountingRejectingGitRunner : IGitProcessRunner
+    {
+        public int Calls { get; private set; }
+
+        public Task<GitProcessResult> RunAsync(string workingDirectory, IReadOnlyList<string> arguments,
+            string? standardInput = null, int? maximumOutputCharacters = null,
+            CancellationToken cancellationToken = default, GitCommandKind commandKind = GitCommandKind.ReadOnly)
+        {
+            Calls++;
+            return Task.FromException<GitProcessResult>(
+                new InvalidOperationException("Corrupt task unexpectedly reached Git execution."));
         }
     }
 }

@@ -42,6 +42,20 @@
 .approval-dialog h2 { margin: 0 0 10px; }
 .approval-dialog p { overflow-wrap: anywhere; }
 .approval-dialog ul { margin: 16px 0 22px; padding-left: 20px; color: var(--muted); }
+.verification-panel { margin-top: 1.5rem; padding: clamp(1rem, 3vw, 2rem); border: 1px solid var(--line); border-radius: 1rem; background: #fffdf8; }
+.verification-panel h2 { margin-top: .35rem; }
+.verification-trust { display: flex; flex-wrap: wrap; gap: .65rem 1rem; align-items: center; margin: 1rem 0; padding: .8rem; border-left: 4px solid #bc6c25; background: #fff7e8; }
+.verification-trust small { flex-basis: 100%; }
+.verification-panel dl { display: grid; gap: .5rem; }
+.verification-panel dl div { display: grid; grid-template-columns: minmax(8rem, 12rem) 1fr; gap: 1rem; }
+.verification-panel dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+.verification-case-tabs { display: grid; gap: .5rem; margin: 1rem 0; }
+.verification-case-tabs button { padding: .75rem; text-align: left; border: 1px solid #cbc5b9; border-radius: .5rem; background: white; }
+.verification-case-tabs button[aria-current="true"] { border-color: #7f4f24; box-shadow: inset 4px 0 #7f4f24; }
+.verification-case fieldset, .verification-completion { display: grid; gap: 1rem; margin: 1rem 0; padding: 1rem; border: 1px solid #cbc5b9; border-radius: .75rem; }
+.verification-case label, .verification-completion label { display: grid; gap: .35rem; }
+.verification-case textarea, .verification-completion textarea, .verification-case input, .verification-case select { width: 100%; box-sizing: border-box; }
+.verification-case li small, .verification-case li code { display: block; margin-top: .25rem; }
 
 @media (max-width: 640px) {
   .progress { grid-template-columns: repeat(9, 92px); }
@@ -52,4 +66,5 @@
   .changed-file-review summary { grid-template-columns: minmax(0, 1fr) auto; }
   .changed-file-review summary .diff-counts { grid-column: 1 / -1; }
   .diff-truncation-banner.compact { display: grid; }
+  .verification-panel dl div { grid-template-columns: 1fr; gap: .15rem; }
 }

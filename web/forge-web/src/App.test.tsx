@@ -18,6 +18,7 @@ const apiModule = vi.hoisted(() => {
 
   return {
     ForgeApiError: MockForgeApiError,
+    invalidVerificationEligibilityMessage: 'Verification generation state could not be validated. Reload the task before taking action.',
     forgeApi: {
       listTasks: vi.fn(),
       getTask: vi.fn(),
@@ -32,6 +33,11 @@ const apiModule = vi.hoisted(() => {
       approvePlan: vi.fn(),
       generateImplementation: vi.fn(),
       approveImplementation: vi.fn(),
+      generateVerificationPlan: vi.fn(),
+      startVerificationAttempt: vi.fn(),
+      updateVerificationCase: vi.fn(),
+      completeVerification: vi.fn(),
+      exportVerificationPlanPdf: vi.fn(),
       exportTaskPdf: vi.fn(),
       exportPlanPdf: vi.fn(),
       getCapabilities: vi.fn(),
@@ -122,6 +128,11 @@ describe('App task navigation hardening', () => {
     forgeApi.approvePlan.mockRejectedValue(new Error('approvePlan was not configured for this test.'))
     forgeApi.generateImplementation.mockRejectedValue(new Error('generateImplementation was not configured for this test.'))
     forgeApi.approveImplementation.mockRejectedValue(new Error('approveImplementation was not configured for this test.'))
+    forgeApi.generateVerificationPlan.mockRejectedValue(new Error('generateVerificationPlan was not configured for this test.'))
+    forgeApi.startVerificationAttempt.mockRejectedValue(new Error('startVerificationAttempt was not configured for this test.'))
+    forgeApi.updateVerificationCase.mockRejectedValue(new Error('updateVerificationCase was not configured for this test.'))
+    forgeApi.completeVerification.mockRejectedValue(new Error('completeVerification was not configured for this test.'))
+    forgeApi.exportVerificationPlanPdf.mockRejectedValue(new Error('exportVerificationPlanPdf was not configured for this test.'))
     taskPdfDownloader.run.mockResolvedValue(undefined)
     planPdfDownloader.run.mockResolvedValue(undefined)
     requirementCopier.run.mockResolvedValue(undefined)
@@ -330,7 +341,14 @@ describe('App task navigation hardening', () => {
       totalCalls: 2, usageAvailability: 'Partial', usageUnavailableCallCount: 1,
       totalInputTokens: null, totalCachedInputTokens: null, totalOutputTokens: null, totalReasoningTokens: null,
       totalEstimatedCostUsd: null, costUnavailableCallCount: 1, isPartialEstimate: true,
-      calls: [buildModelCall('Implementation'), buildModelCall('Implementation', {
+      completeEstimatedSubtotalUsd: null, partialEstimatedSubtotalUsd: 0.00026,
+      availableEstimatedSubtotalUsd: 0.00026, hasPartialEstimates: true,
+      possiblyDispatchedUnavailableEstimatedCostCallCount: 1,
+      calls: [buildModelCall('VerificationPlanning', {
+        providerUsageAvailability: 'Partial', inputTokens: 12, cachedInputTokens: null,
+        uncachedInputTokens: 12, outputTokens: 7, reasoningTokens: null,
+        estimatedCostUsd: 0.00026, isPartialEstimate: true,
+      }), buildModelCall('Implementation', {
         id: '22222222-2222-4222-8222-222222222222', succeeded: false, providerResponseId: null,
         usageAvailable: false, inputTokens: null, cachedInputTokens: null, uncachedInputTokens: null,
         outputTokens: null, reasoningTokens: null, estimatedCostUsd: null,
@@ -346,7 +364,12 @@ describe('App task navigation hardening', () => {
     expect(text).toContain('Partial usage — aggregate totals unavailable because some calls lack telemetry')
     expect(text).not.toContain('INPUT TOKENS')
     expect(text).not.toContain('OUTPUT TOKENS')
+    expect(text).toContain('CONSERVATIVE PARTIAL SUBTOTAL$0.000260')
+    expect(text).toContain('AVAILABLE COST SUBTOTAL$0.000260')
+    expect(text).toContain('Usage partial')
+    expect(text).toContain('Conservative partial est. $0.000260')
     expect(text).toContain('Cost unavailable')
+    expect(text).not.toContain('Configured est. $0.000260')
   })
 
   it('renders complete aggregate usage and preserves explicit provider-reported zero', async () => {
@@ -876,7 +899,7 @@ describe('App task navigation hardening', () => {
     expect(forgeApi.approvePlan).not.toHaveBeenCalled()
   })
 
-  it('keeps the current task error when an older selection fails later', async () => {
+  it('keeps the current task error when an older malformed decoded response fails later', async () => {
     const taskA = buildTask(firstId, 'AwaitingRequirementApproval', { requirementSummary: 'Approve summary A' })
     const taskB = buildTask(secondId, 'AwaitingRequirementApproval', { requirementSummary: 'Approve summary B' })
     const staleFailure = deferred<EngineeringTask>()
@@ -899,11 +922,154 @@ describe('App task navigation hardening', () => {
     await settle()
     expect(rendered.container.textContent).toContain('Current task failure')
 
-    staleFailure.reject(new Error('Old task failure'))
+    staleFailure.reject(new Error('The task response could not be validated safely.'))
     await settle()
 
     expect(rendered.container.textContent).toContain('Current task failure')
-    expect(rendered.container.textContent).not.toContain('Old task failure')
+    expect(rendered.container.textContent).not.toContain('could not be validated safely')
+  })
+
+  it.each([
+    ['valid', false],
+    ['malformed', true],
+  ])('discards a stale %s verification recovery after a newer task is selected', async (_label, malformed) => {
+    const taskA = buildVerificationReadyTask(firstId)
+    const taskB = buildTask(secondId, 'AwaitingRequirementApproval', { requirementSummary: 'Current task B' })
+    const recovery = deferred<EngineeringTask>()
+    let firstTaskLoads = 0
+    forgeApi.getTask.mockImplementation((id: string) => {
+      if (id === secondId) return Promise.resolve(taskB)
+      firstTaskLoads += 1
+      return firstTaskLoads === 1 ? Promise.resolve(taskA) : recovery.promise
+    })
+    forgeApi.generateVerificationPlan.mockRejectedValue(new Error('Old verification generation failed.'))
+
+    await navigate(taskUrl(firstId))
+    const rendered = await renderApp()
+    await expectText(rendered.container, 'Generate manual verification plan')
+    await click(findButton(rendered.container, 'Generate manual verification plan'))
+    await settle()
+    expect(firstTaskLoads).toBe(2)
+
+    await navigate(taskUrl(secondId))
+    await expectText(rendered.container, 'Current task B')
+    if (malformed) recovery.reject(new Error('The task response could not be validated safely.'))
+    else recovery.resolve(taskA)
+    await settle()
+
+    expect(rendered.container.textContent).toContain('Current task B')
+    expect(rendered.container.textContent).not.toContain('Old verification generation failed.')
+    expect(rendered.container.textContent).not.toContain('could not be validated safely')
+    expect(forgeApi.generateVerificationPlan).toHaveBeenCalledTimes(1)
+  })
+
+  it('shows a bounded load error and enables no mutation after malformed full-task JSON is rejected', async () => {
+    forgeApi.getTask.mockRejectedValue(new Error('The task response could not be validated safely.'))
+
+    await navigate(taskUrl(firstId))
+    const rendered = await renderApp()
+    await expectText(rendered.container, 'The requested task could not be loaded.')
+
+    expect(rendered.container.textContent).not.toContain('Generate manual verification plan')
+    expect(forgeApi.generateVerificationPlan).not.toHaveBeenCalled()
+    expect(forgeApi.startVerificationAttempt).not.toHaveBeenCalled()
+    expect(forgeApi.updateVerificationCase).not.toHaveBeenCalled()
+    expect(forgeApi.completeVerification).not.toHaveBeenCalled()
+    expect(rendered.container.textContent).not.toContain('The task response could not be validated safely.')
+  })
+
+  it('rechecks the latest eligibility before a stale Start handler can dispatch', async () => {
+    const eligible = buildManualVerificationTask(firstId, true)
+    const ineligible = buildManualVerificationTask(firstId, false)
+    forgeApi.getTask.mockResolvedValueOnce(eligible).mockResolvedValueOnce(ineligible)
+
+    await navigate(taskUrl(firstId))
+    const rendered = await renderApp()
+    const initialButton = findButton(rendered.container, 'Start verification')
+    expect(initialButton.disabled).toBe(false)
+
+    await navigate(taskUrl(firstId))
+    await settle()
+    const currentButton = findButton(rendered.container, 'Start verification')
+    expect(currentButton.disabled).toBe(true)
+    await act(async () => initialButton.dispatchEvent(new MouseEvent('click', { bubbles: true })))
+    await act(async () => currentButton.dispatchEvent(new MouseEvent('click', { bubbles: true })))
+
+    expect(forgeApi.startVerificationAttempt).not.toHaveBeenCalled()
+  })
+
+  it('rejects a stale Start handler when attempt history appears without a current pointer', async () => {
+    const eligible = buildManualVerificationTask(firstId, true)
+    const contradictory = { ...eligible, manualVerificationAttempts: [buildHistoricalManualAttempt(eligible)] }
+    forgeApi.getTask.mockResolvedValueOnce(eligible).mockResolvedValueOnce(contradictory)
+
+    await navigate(taskUrl(firstId))
+    const rendered = await renderApp()
+    const staleButton = findButton(rendered.container, 'Start verification')
+    await navigate(taskUrl(firstId))
+    await settle()
+    const currentButton = findButton(rendered.container, 'Start verification')
+    expect(currentButton.disabled).toBe(true)
+    await act(async () => {
+      currentButton.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }))
+      staleButton.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+      currentButton.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+
+    expect(forgeApi.startVerificationAttempt).not.toHaveBeenCalled()
+    expect(rendered.container.textContent).toContain('Manual verification plan.')
+  })
+
+  it('preserves the last valid manual task when a mutation response fails decoding', async () => {
+    const eligible = buildManualVerificationTask(firstId, true)
+    forgeApi.getTask.mockResolvedValue(eligible)
+    forgeApi.startVerificationAttempt.mockRejectedValue(
+      new Error('The task response could not be validated safely. Reload the task before taking action.'))
+    await navigate(taskUrl(firstId))
+    const rendered = await renderApp()
+    await click(findButton(rendered.container, 'Start verification'))
+    await settle()
+
+    expect(rendered.container.textContent).toContain('Manual verification plan.')
+    expect(rendered.container.textContent).toContain('could not be validated safely. Reload the task')
+    expect(forgeApi.startVerificationAttempt).toHaveBeenCalledTimes(1)
+    expect(forgeApi.updateVerificationCase).not.toHaveBeenCalled()
+    expect(forgeApi.completeVerification).not.toHaveBeenCalled()
+  })
+
+  it('dispatches at most one Start request for rapid activation', async () => {
+    const eligible = buildManualVerificationTask(firstId, true)
+    const pending = deferred<EngineeringTask>()
+    forgeApi.getTask.mockResolvedValue(eligible)
+    forgeApi.startVerificationAttempt.mockReturnValue(pending.promise)
+    await navigate(taskUrl(firstId))
+    const rendered = await renderApp()
+    const start = findButton(rendered.container, 'Start verification')
+    await act(async () => {
+      start.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }))
+      start.click()
+      start.click()
+    })
+    expect(forgeApi.startVerificationAttempt).toHaveBeenCalledTimes(1)
+
+    await click(findButton(rendered.container, 'New task'))
+    pending.resolve(eligible)
+    await settle()
+    expect(rendered.container.textContent).toContain('What are we building?')
+    expect(forgeApi.startVerificationAttempt).toHaveBeenCalledTimes(1)
+  })
+
+  it('never treats the latest plan history entry as actionable without a current pointer', async () => {
+    const historicalOnly = { ...buildManualVerificationTask(firstId, false), currentVerificationPlanId: null }
+    forgeApi.getTask.mockResolvedValue(historicalOnly)
+    await navigate(taskUrl(firstId))
+    const rendered = await renderApp()
+    await settle()
+
+    expect(rendered.container.textContent).not.toContain('Manual verification plan.')
+    expect(Array.from(rendered.container.querySelectorAll('button')).some(button =>
+      button.textContent === 'Start verification')).toBe(false)
+    expect(forgeApi.startVerificationAttempt).not.toHaveBeenCalled()
   })
 
   it('still applies the result for the current selection action', async () => {
@@ -1158,6 +1324,85 @@ function buildTask(id: string, status: WorkflowStatus, overrides: Partial<Engine
       calls: [],
     },
     ...overrides,
+  }
+}
+
+function buildVerificationReadyTask(id: string): EngineeringTask {
+  const revisionId = '22222222-2222-4222-8222-222222222222'
+  return buildTask(id, 'ImplementationApproved', {
+    approvedImplementationRevisionId: revisionId,
+    implementationRevisions: [{
+      revisionId, revisionNumber: 1, kind: 'Initial', previousRevisionId: null,
+      planFingerprint: 'a'.repeat(64), baseCommitSha: 'b'.repeat(40),
+      generationStartedAt: '2026-07-18T11:00:00.000Z', generationCompletedAt: '2026-07-18T11:10:00.000Z',
+      generationState: 'Succeeded', reviewState: 'Approved', failureCategory: null, failureMessage: null,
+      resultFingerprint: 'c'.repeat(64), changedFileCount: 1, correctionSubmittedAt: null,
+      approvedAt: '2026-07-18T11:20:00.000Z', isCurrent: false, isApproved: true,
+    }],
+    verificationPlans: [], verificationPlanGenerationAttempts: [], manualVerificationAttempts: [],
+    currentVerificationPlanId: null, currentVerificationAttemptId: null,
+    verificationEligibility: {
+      canGenerateVerificationPlan: true, canStartVerificationAttempt: false, canRecordVerificationResult: false,
+      canCompleteVerificationPassed: false, canCompleteVerificationFailed: false, readyForDelivery: false,
+      ineligibilityReason: null, isInitialVerificationPlanGeneration: true,
+      canRetryVerificationPlanGeneration: false, verificationGenerationStatus: 'NotStarted',
+      verificationGenerationStatusMessage: 'Verification-plan generation is ready to start.',
+    },
+  })
+}
+
+function buildManualVerificationTask(id: string, canStart: boolean): EngineeringTask {
+  const revisionId = '22222222-2222-4222-8222-222222222222'
+  const resultFingerprint = 'c'.repeat(64)
+  const planId = '11111111-1111-4111-8111-111111111111'
+  return buildTask(id, 'AwaitingManualVerification', {
+    activeImplementationRevisionId: revisionId,
+    approvedImplementationRevisionId: revisionId,
+    implementationRevisions: [{
+      revisionId, revisionNumber: 1, kind: 'Initial', previousRevisionId: null,
+      planFingerprint: 'a'.repeat(64), baseCommitSha: 'b'.repeat(40),
+      generationStartedAt: '2026-07-18T11:00:00.000Z', generationCompletedAt: '2026-07-18T11:10:00.000Z',
+      generationState: 'Succeeded', reviewState: 'Approved', failureCategory: null, failureMessage: null,
+      resultFingerprint, changedFileCount: 1, correctionSubmittedAt: null,
+      approvedAt: '2026-07-18T11:20:00.000Z', isCurrent: true, isApproved: true,
+    }],
+    currentVerificationPlanId: planId,
+    currentVerificationAttemptId: null,
+    verificationPlans: [{
+      planId, planNumber: 1, implementationRevisionId: revisionId, implementationResultFingerprint: resultFingerprint,
+      approvedRequirementFingerprint: 'd'.repeat(64), approvedPlanFingerprint: 'e'.repeat(64),
+      generationContextFingerprint: 'f'.repeat(64), generatedAt: '2026-07-18T11:30:00.000Z',
+      source: 'DeterministicFake', model: null, reasoningEffort: null, summary: 'Manual verification plan.',
+      scope: 'Approved revision.', preconditions: [], testCases: [{
+        testCaseId: '33333333-3333-4333-8333-333333333333', order: 1, title: 'Manual check',
+        objective: 'Inspect safely.', category: 'ManualBehavior', isRequired: true, preconditions: [], testData: [],
+        orderedSteps: [{ order: 1, instruction: 'Inspect manually.', approvedValidationCommandId: null,
+          expectedObservation: 'Expected behavior.' }], expectedResult: 'Expected behavior.', negativeOrEdgeCases: [],
+        regressionScope: [], evidenceRequirements: [], safetyNotes: [],
+      }], risks: [], limitations: [], evidenceGuidance: [], planFingerprint: '9'.repeat(64), status: 'Current',
+      trustLabel: 'FORGE GENERATED', executionLabel: 'MANUAL — NOT EXECUTED BY FORGE',
+    }],
+    verificationPlanGenerationAttempts: [], manualVerificationAttempts: [],
+    verificationEligibility: {
+      canGenerateVerificationPlan: false, canStartVerificationAttempt: canStart,
+      canRecordVerificationResult: false, canCompleteVerificationPassed: false,
+      canCompleteVerificationFailed: false, readyForDelivery: false, ineligibilityReason: null,
+      isInitialVerificationPlanGeneration: false, canRetryVerificationPlanGeneration: false,
+      verificationGenerationStatus: 'Completed', verificationGenerationStatusMessage: 'Verification plan ready.',
+    },
+  })
+}
+
+function buildHistoricalManualAttempt(task: EngineeringTask) {
+  const plan = task.verificationPlans![0]
+  return {
+    attemptId: '55555555-5555-4555-8555-555555555555', attemptNumber: 1,
+    verificationPlanId: plan.planId, verificationPlanFingerprint: plan.planFingerprint,
+    implementationRevisionId: plan.implementationRevisionId,
+    implementationResultFingerprint: plan.implementationResultFingerprint,
+    startedAt: '2026-07-18T11:40:00.000Z', completedAt: null, status: 'InProgress' as const,
+    resultRevisions: [], currentCaseResults: [], completionConfirmation: null, summary: null,
+    attemptFingerprint: null, passedAt: null, failedAt: null, trustLabel: 'USER REPORTED',
   }
 }
 

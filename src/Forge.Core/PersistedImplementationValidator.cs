@@ -69,6 +69,10 @@ public static class PersistedImplementationValidator
                     implementationCompletedAt, allowLegacyEmpty: false);
                 break;
             case WorkflowStatus.ImplementationApproved:
+            case WorkflowStatus.VerificationPlanning:
+            case WorkflowStatus.AwaitingManualVerification:
+            case WorkflowStatus.ManualVerificationFailed:
+            case WorkflowStatus.ReadyForDelivery:
                 ValidateCompletedArtifacts(workspace, result, failure, lease, implementationStartedAt,
                     implementationCompletedAt, allowLegacyEmpty: false);
                 break;
@@ -106,7 +110,7 @@ public static class PersistedImplementationValidator
         if (revisions.Count == 0)
         {
             if (activeRevisionId is not null || approvedRevisionId is not null ||
-                status == WorkflowStatus.ImplementationApproved) Corrupt();
+                IsImplementationApprovedOrLater(status)) Corrupt();
             return;
         }
         if (taskId is null || taskId == Guid.Empty || plan is null || revisions.Count > limits.MaximumImplementationRevisions)
@@ -182,7 +186,7 @@ public static class PersistedImplementationValidator
         if (revisions.Count(revision => revision.ReviewState == ImplementationReviewState.Approved) > 1 ||
             (approvedRevisionId is null) != (approved is null)) Corrupt();
 
-        if (status == WorkflowStatus.ImplementationApproved)
+        if (IsImplementationApprovedOrLater(status))
         {
             if (approved is null || active.RevisionId != approved.RevisionId ||
                 active.ReviewState != ImplementationReviewState.Approved ||
@@ -211,6 +215,11 @@ public static class PersistedImplementationValidator
             if (!string.Equals(projectionFingerprint, active.ResultFingerprint, StringComparison.Ordinal)) Corrupt();
         }
     }
+
+    private static bool IsImplementationApprovedOrLater(WorkflowStatus status) => status is
+        WorkflowStatus.ImplementationApproved or WorkflowStatus.VerificationPlanning or
+        WorkflowStatus.AwaitingManualVerification or WorkflowStatus.ManualVerificationFailed or
+        WorkflowStatus.ReadyForDelivery;
 
     private static void ValidateImplementing(
         ImplementationWorkspace? workspace,
@@ -344,7 +353,8 @@ public static class PersistedImplementationValidator
         if (value.Model?.Length > 160) Corrupt();
         Required(value.Summary, limits.MaximumSummaryCharacters);
         if (SensitiveContentDetector.ContainsSensitiveValue(value.Summary)) Corrupt();
-        if (value.Warnings is null || value.ChangedFiles is null || value.Warnings.Count > limits.MaximumWarnings ||
+        if (value.Warnings is null || value.ChangedFiles is null || value.Warnings.Any(item => item is null) ||
+            value.ChangedFiles.Any(item => item is null) || value.Warnings.Count > limits.MaximumWarnings ||
             value.ChangedFiles.Count is < 1 || value.ChangedFiles.Count > limits.MaximumApprovedOperations) Corrupt();
         foreach (var warning in value.Warnings)
         {

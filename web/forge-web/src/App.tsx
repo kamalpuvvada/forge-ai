@@ -7,13 +7,16 @@ import { RequirementCopyButton } from './RequirementCopyButton'
 import { createRequirementCopier } from './requirementCopy'
 import type { RequirementCopyState } from './requirementCopy'
 import { TaskHistory } from './TaskHistory'
+import { VerificationPanel } from './VerificationPanel'
+import { isCaseFormValueValid } from './verificationForm'
+import type { CaseFormValue } from './verificationForm'
 import { TaskSelectionCoordinator, newTaskUrl, parseTaskSelection, taskUrl } from './taskNavigation'
-import type { EngineeringTask, EngineeringTaskSummary, ModelCall, SystemCapabilities, WorkflowStatus } from './types'
+import type { EngineeringTask, EngineeringTaskSummary, ModelCall, ModelTelemetry, SystemCapabilities, VerificationTestCase, WorkflowStatus } from './types'
 import './App.css'
 import './implementation.css'
 
 const stages = ['Understand', 'Clarify', 'Confirm', 'Plan', 'Implement', 'Diff review', 'Validate', 'Review', 'Pull Request']
-const stageByStatus: Record<WorkflowStatus, number> = { Draft: 0, Clarifying: 1, RequirementSummaryReady: 2, AwaitingRequirementApproval: 2, ReadyForPlanning: 3, Planning: 3, AwaitingPlanApproval: 3, PlanApproved: 3, Implementing: 4, AwaitingImplementationReview: 5, ImplementationApproved: 5, Validating: 6, Reviewing: 7, Completed: 8, Failed: 0 }
+const stageByStatus: Record<WorkflowStatus, number> = { Draft: 0, Clarifying: 1, RequirementSummaryReady: 2, AwaitingRequirementApproval: 2, ReadyForPlanning: 3, Planning: 3, AwaitingPlanApproval: 3, PlanApproved: 3, Implementing: 4, AwaitingImplementationReview: 5, ImplementationApproved: 5, VerificationPlanning: 6, AwaitingManualVerification: 6, ManualVerificationFailed: 6, ReadyForDelivery: 6, Validating: 6, Reviewing: 7, Completed: 8, Failed: 0 }
 
 function App() {
   const [repository, setRepository] = useState('')
@@ -55,6 +58,11 @@ function App() {
   const approvalDialog = useRef<HTMLDialogElement | null>(null)
   const approvalCancelButton = useRef<HTMLButtonElement | null>(null)
   const approvalSubmissionActive = useRef(false)
+  const verificationActionActive = useRef(false)
+  const currentTask = useRef<EngineeringTask | null>(null)
+  const currentBusy = useRef(false)
+  currentTask.current = task
+  currentBusy.current = busy
   const selectedTaskId = task?.id ?? null
   const activeStage = task ? stageByStatus[task.status] : 0
   const answeredCount = task?.clarificationAnswers.length ?? 0
@@ -423,6 +431,131 @@ function App() {
       }
     }
   }
+  function verificationBinding(selectedTask: EngineeringTask) {
+    const plan = (selectedTask.verificationPlans ?? []).find(item => item.planId === selectedTask.currentVerificationPlanId)
+    const revision = selectedTask.implementationRevisions.find(item => item.revisionId === selectedTask.approvedImplementationRevisionId)
+    if (!revision?.resultFingerprint || plan && (plan.implementationRevisionId !== revision.revisionId ||
+      plan.implementationResultFingerprint !== revision.resultFingerprint)) return null
+    return { plan, revision }
+  }
+  async function generateVerificationPlan() {
+    if (!task) return
+    const binding = verificationBinding(task)
+    if (!binding) return
+    const token = captureTaskSelection(task.id)
+    if (!token) return
+    setBusy(true); setError(null)
+    try {
+      const updated = await forgeApi.generateVerificationPlan(task.id, {
+        commandId: crypto.randomUUID(), expectedRowVersion: task.rowVersion,
+        expectedImplementationRevisionId: binding.revision.revisionId,
+        expectedImplementationResultFingerprint: binding.revision.resultFingerprint!,
+      })
+      if (selectionCoordinator.current.matches(token)) setTask(updated)
+    } catch (caught) {
+      if (!selectionCoordinator.current.matches(token)) return
+      try {
+        const refreshed = await forgeApi.getTask(task.id)
+        if (!selectionCoordinator.current.matches(token) || refreshed.id !== token.taskId) return
+        setTask(refreshed)
+      } catch { /* Preserve the safe generation error. */ }
+      if (selectionCoordinator.current.matches(token)) setError(caught instanceof Error ? caught.message : 'Verification-plan generation failed safely.')
+    } finally { if (selectionCoordinator.current.matches(token)) setBusy(false) }
+  }
+  async function runManualVerificationAction(selectedTask: EngineeringTask, action: () => Promise<EngineeringTask>) {
+    if (verificationActionActive.current || currentBusy.current) return
+    verificationActionActive.current = true
+    try { await runTaskAction(selectedTask.id, action) }
+    finally { verificationActionActive.current = false }
+  }
+  function startVerificationAttempt() {
+    const selectedTask = currentTask.current
+    if (!selectedTask || currentBusy.current ||
+      selectedTask.status !== 'AwaitingManualVerification' ||
+      selectedTask.verificationEligibility?.canStartVerificationAttempt !== true ||
+      selectedTask.verificationEligibility.canRecordVerificationResult !== false ||
+      selectedTask.verificationEligibility.canCompleteVerificationPassed !== false ||
+      selectedTask.verificationEligibility.canCompleteVerificationFailed !== false ||
+      selectedTask.currentVerificationAttemptId !== null ||
+      (selectedTask.manualVerificationAttempts?.length ?? 0) !== 0 ||
+      selectedTask.manualVerificationAttempts?.some(attempt =>
+        attempt.status === 'InProgress' || attempt.status === 'CompletedPassed' ||
+        attempt.status === 'CompletedFailed')) return
+    const binding = verificationBinding(selectedTask)
+    if (!binding?.plan || binding.plan.planId !== selectedTask.currentVerificationPlanId ||
+      binding.plan.status !== 'Current') return
+    const plan = binding.plan
+    void runManualVerificationAction(selectedTask, () => forgeApi.startVerificationAttempt(selectedTask.id, {
+      commandId: crypto.randomUUID(), expectedRowVersion: selectedTask.rowVersion,
+      expectedVerificationPlanId: plan.planId, expectedVerificationPlanFingerprint: plan.planFingerprint,
+      expectedImplementationRevisionId: binding.revision.revisionId,
+      expectedImplementationResultFingerprint: binding.revision.resultFingerprint!,
+    }))
+  }
+  function saveVerificationCase(testCase: VerificationTestCase, value: CaseFormValue) {
+    const selectedTask = currentTask.current
+    if (!selectedTask?.currentVerificationAttemptId || currentBusy.current ||
+      selectedTask.status !== 'AwaitingManualVerification' ||
+      selectedTask.verificationEligibility?.canRecordVerificationResult !== true ||
+      !isCaseFormValueValid(value)) return
+    const binding = verificationBinding(selectedTask)
+    const attempt = selectedTask.manualVerificationAttempts?.find(item =>
+      item.attemptId === selectedTask.currentVerificationAttemptId)
+    if (!binding?.plan || attempt?.status !== 'InProgress' || attempt.verificationPlanId !== binding.plan.planId ||
+      attempt.verificationPlanFingerprint !== binding.plan.planFingerprint ||
+      attempt.implementationRevisionId !== binding.revision.revisionId ||
+      attempt.implementationResultFingerprint !== binding.revision.resultFingerprint ||
+      !binding.plan.testCases.some(item => item.testCaseId === testCase.testCaseId)) return
+    const plan = binding.plan
+    void runManualVerificationAction(selectedTask, () => forgeApi.updateVerificationCase(selectedTask.id,
+      selectedTask.currentVerificationAttemptId!, testCase.testCaseId, {
+      commandId: crypto.randomUUID(), expectedRowVersion: selectedTask.rowVersion,
+      expectedVerificationPlanId: plan.planId, expectedVerificationPlanFingerprint: plan.planFingerprint,
+      expectedImplementationRevisionId: binding.revision.revisionId,
+      expectedImplementationResultFingerprint: binding.revision.resultFingerprint!,
+      result: value.result, notes: value.notes || null, actualResult: value.actualResult || null,
+      evidenceDescriptions: value.evidenceDescriptions, notApplicableReason: value.notApplicableReason || null,
+      failureDetails: value.failureDetails,
+    }))
+  }
+  function completeVerification(passed: boolean, summary: string, confirmedByHuman: boolean) {
+    const selectedTask = currentTask.current
+    const allowed = passed ? selectedTask?.verificationEligibility?.canCompleteVerificationPassed :
+      selectedTask?.verificationEligibility?.canCompleteVerificationFailed
+    if (!selectedTask?.currentVerificationAttemptId || currentBusy.current || !confirmedByHuman || allowed !== true ||
+      selectedTask.status !== 'AwaitingManualVerification') return
+    const binding = verificationBinding(selectedTask)
+    const attempt = selectedTask.manualVerificationAttempts?.find(item =>
+      item.attemptId === selectedTask.currentVerificationAttemptId)
+    if (!binding?.plan || attempt?.status !== 'InProgress' || attempt.verificationPlanId !== binding.plan.planId ||
+      attempt.verificationPlanFingerprint !== binding.plan.planFingerprint ||
+      attempt.implementationRevisionId !== binding.revision.revisionId ||
+      attempt.implementationResultFingerprint !== binding.revision.resultFingerprint) return
+    const plan = binding.plan
+    void runManualVerificationAction(selectedTask, () => forgeApi.completeVerification(selectedTask.id,
+      selectedTask.currentVerificationAttemptId!, passed, {
+      commandId: crypto.randomUUID(), expectedRowVersion: selectedTask.rowVersion,
+      expectedVerificationPlanId: plan.planId, expectedVerificationPlanFingerprint: plan.planFingerprint,
+      expectedImplementationRevisionId: binding.revision.revisionId,
+      expectedImplementationResultFingerprint: binding.revision.resultFingerprint!, confirmedByHuman,
+      summary: summary || null,
+    }))
+  }
+  async function exportVerificationPlan() {
+    if (!task?.currentVerificationPlanId) return
+    const token = captureTaskSelection(task.id)
+    if (!token) return
+    setBusy(true); setPdfExportError(null)
+    try {
+      const download = await forgeApi.exportVerificationPlanPdf(task.id, task.currentVerificationPlanId)
+      if (!selectionCoordinator.current.matches(token)) return
+      const url = URL.createObjectURL(download.blob)
+      const anchor = document.createElement('a'); anchor.href = url; anchor.download = download.filename; anchor.click()
+      URL.revokeObjectURL(url)
+    } catch (caught) {
+      if (selectionCoordinator.current.matches(token)) setPdfExportError(exportErrorMessage(caught))
+    } finally { if (selectionCoordinator.current.matches(token)) setBusy(false) }
+  }
   async function exportPdf(documentType: 'task' | 'plan') {
     const approvedPlanState = task?.implementationPlan && task.planApprovedAt
     if (!task || exportingPdf || (documentType === 'task' && !approvedPlanState)) return
@@ -468,7 +601,13 @@ function App() {
     navigateTo(newTaskUrl())
   }
 
-  const telemetry = task?.telemetry ?? { totalCalls: 0, usageAvailability: 'Complete' as const, usageUnavailableCallCount: 0, totalInputTokens: 0, totalCachedInputTokens: 0, totalOutputTokens: 0, totalReasoningTokens: 0, totalEstimatedCostUsd: 0, costUnavailableCallCount: 0, isPartialEstimate: false, calls: [] }
+  const telemetry: ModelTelemetry = task?.telemetry ?? {
+    totalCalls: 0, usageAvailability: 'Unavailable', usageUnavailableCallCount: 0,
+    totalInputTokens: null, totalCachedInputTokens: null, totalOutputTokens: null, totalReasoningTokens: null,
+    totalEstimatedCostUsd: null, costUnavailableCallCount: 0, isPartialEstimate: false,
+    completeEstimatedSubtotalUsd: null, partialEstimatedSubtotalUsd: null, availableEstimatedSubtotalUsd: null,
+    hasPartialEstimates: false, possiblyDispatchedUnavailableEstimatedCostCallCount: 0, calls: [],
+  }
   const clarificationCalls = telemetry.calls.filter(call => call.stage === 'Clarification')
   const planningCalls = telemetry.calls.filter(call => call.stage === 'Planning')
   const implementationCalls = telemetry.calls.filter(call => call.stage === 'Implementation')
@@ -493,13 +632,12 @@ function App() {
     <ul><li>Validation was not run.</li><li>No files were staged.</li><li>No commit or push occurred.</li><li>Approval accepts the persisted review only.</li></ul>
     <div className="approval-actions"><button ref={approvalCancelButton} type="button" className="secondary-button" onClick={closeApprovalDialog}>Cancel</button><button type="button" className="primary-button compact" onClick={() => void approveImplementation()} disabled={approvalInFlight}>{approvalInFlight ? 'Approving…' : 'Confirm approval'}</button></div>
   </>
-  const planningCost = planningCalls.reduce((total, call) => total + (call.estimatedCostUsd ?? 0), 0)
   const implementationCost = implementationCalls.reduce((total, call) => total + (call.estimatedCostUsd ?? 0), 0)
-  const planningCostLabel = formatCallCost(planningCalls, planningCost)
   const implementationCostLabel = formatCallCost(implementationCalls, implementationCost)
-  const totalCostLabel = telemetry.totalEstimatedCostUsd === null
+  const availableEstimatedSubtotal = telemetry.availableEstimatedSubtotalUsd ?? telemetry.totalEstimatedCostUsd
+  const totalCostLabel = availableEstimatedSubtotal === null
     ? 'Cost unavailable'
-    : `$${telemetry.totalEstimatedCostUsd.toFixed(6)}`
+    : `$${availableEstimatedSubtotal.toFixed(6)}${telemetry.hasPartialEstimates || telemetry.costUnavailableCallCount > 0 ? ' available subtotal' : ''}`
   const aggregateUsageLabel = telemetry.usageAvailability === 'Partial'
     ? 'Partial usage — aggregate totals unavailable because some calls lack telemetry'
     : 'Usage unavailable'
@@ -629,6 +767,7 @@ function App() {
               : approvalDialogOpen && <div className="approval-dialog approval-dialog-fallback" role="dialog" aria-modal="true" aria-labelledby="implementation-approval-title" aria-describedby="implementation-approval-description" onKeyDown={event => { if (event.key === 'Escape') { event.preventDefault(); closeApprovalDialog() } }}>{approvalDialogContents}</div>}
             <div className="export-actions"><button className="secondary-button" onClick={() => void exportPdf('plan')} disabled={exportingPdf !== null}>Download approved plan</button><button className="secondary-button" onClick={() => void exportPdf('task')} disabled={exportingPdf !== null}>Download task report PDF</button></div>{pdfExportError && <p className="export-error" role="alert">{pdfExportError}</p>}
           </div>}
+          {task && ['ImplementationApproved', 'VerificationPlanning', 'AwaitingManualVerification', 'ManualVerificationFailed', 'ReadyForDelivery'].includes(task.status) && <VerificationPanel task={task} capabilities={capabilities} busy={busy} onGenerate={() => void generateVerificationPlan()} onStart={startVerificationAttempt} onSaveCase={saveVerificationCase} onComplete={completeVerification} onExportPlan={() => void exportVerificationPlan()} />}
           {task && hasApprovedPlan && !approvedPlanControlsRenderedInState && <div className="semantic-plan-actions"><div><strong>Approved plan documents</strong><p>The persisted plan approval remains valid in this later workflow state.</p></div><div className="export-actions"><button className="secondary-button" onClick={() => void exportPdf('plan')} disabled={exportingPdf !== null}>Download approved plan</button><button className="secondary-button" onClick={() => void exportPdf('task')} disabled={exportingPdf !== null}>Download task report PDF</button></div></div>}
           {task && task.evidenceItems.length > 0 && <section className="evidence-view"><div className="evidence-heading"><div><p className="eyebrow">SELECTED REPOSITORY EVIDENCE</p><h3>{task.evidenceFilesSelected} files · {task.totalEvidenceCharacters.toLocaleString()} characters</h3></div><span>{task.evidenceFilesInspected} eligible files inspected</span></div>{task.evidenceItems.map(item => <details className="evidence-item" key={item.id}><summary><b>{item.id}</b><code>{item.relativePath}:{item.startLine}-{item.endLine}</code><span>score {item.score}</span></summary><p>{item.reasonSelected}</p><pre>{item.excerpt}</pre></details>)}</section>}
         </section>
@@ -636,7 +775,14 @@ function App() {
           <section className="context-card"><div className="aside-title"><span>Repository context</span><i>{task?.repositorySnapshot ? 'READ-ONLY SNAPSHOT' : task ? 'IDENTIFIER ONLY' : 'WAITING'}</i></div>{task ? <><code>{task.repository}</code>{task.repositorySnapshot ? <div className="repository-map"><dl><div><dt>Branch</dt><dd>{task.repositorySnapshot.branch ?? 'n/a'}</dd></div><div><dt>HEAD</dt><dd>{task.repositorySnapshot.shortHeadSha ?? 'n/a'}</dd></div><div><dt>State</dt><dd>{task.repositorySnapshot.workingTreeStatus}</dd></div><div><dt>Files</dt><dd>{task.repositorySnapshot.totalDiscoveredFiles}</dd></div><div><dt>Eligible</dt><dd>{task.repositorySnapshot.eligibleTextFileCount}</dd></div><div><dt>Excluded</dt><dd>{task.repositorySnapshot.excludedFileCount}</dd></div></dl><p><strong>Detected stack</strong><br />{task.repositorySnapshot.detectedLanguages.join(' · ') || 'No supported stack detected'}</p><p><strong>Projects/packages</strong><br />{task.repositorySnapshot.projectFiles.join(', ') || 'None detected'}</p><p><strong>Snapshot freshness</strong><br />{new Date(task.repositorySnapshot.analyzedAt).toLocaleString()}</p>{task.repositorySnapshot.warnings.map(warning => <p className="snapshot-warning" key={warning}>! {warning}</p>)}</div> : <p className="truth-note"><span>!</span> Files are not inspected until requirement approval.</p>}</> : <div className="empty-context"><span>⌘</span><p>Repository details appear after task creation.</p></div>}</section>
           <section className="context-card history-card"><div className="aside-title"><span>Clarification history</span><b>{answeredCount}</b></div>{task && answeredCount > 0 ? task.clarificationAnswers.map((item, index) => <details key={item.answeredAt} open={index === answeredCount - 1}><summary><span>{String(index + 1).padStart(2, '0')}</span>{item.question}</summary><p>{item.answer}</p></details>) : <div className="empty-context compact"><p>Answers are preserved here.</p></div>}</section>
           {task && task.requirementRevisionNotes.length > 0 && <section className="context-card history-card"><div className="aside-title"><span>Summary revisions</span><b>{task.requirementRevisionNotes.length}</b></div>{task.requirementRevisionNotes.map((revision, index) => <details key={revision.submittedAt}><summary><span>R{index + 1}</span>{revision.correction}</summary><p><strong>Previous summary</strong><br />{revision.previousSummary}</p></details>)}</section>}
-          <section className="telemetry-card expanded"><div><span>CLARIFICATION CALLS</span><strong>{clarificationCalls.length}</strong></div><div><span>PLANNING CALLS</span><strong>{planningCalls.length}</strong></div><div><span>IMPLEMENTATION CALLS</span><strong>{implementationCalls.length}</strong></div>{telemetry.usageAvailability === 'Complete' ? <><div><span>INPUT TOKENS</span><strong>{formatTokens(telemetry.totalInputTokens!)}</strong></div><div><span>OUTPUT TOKENS</span><strong>{formatTokens(telemetry.totalOutputTokens!)}</strong></div></> : <div className="usage-unavailable"><span>USAGE</span><strong>{aggregateUsageLabel}</strong></div>}<div><span>PLANNING EST. COST</span><strong>{planningCostLabel}</strong></div><div><span>IMPLEMENTATION EST. COST</span><strong>{implementationCostLabel}</strong></div><div><span>TOTAL EST. COST</span><strong>{totalCostLabel}</strong></div><p><i />{providerLabel}</p>{telemetry.calls.length > 0 && <details className="call-history"><summary>Model call details</summary>{telemetry.calls.map(call => <article key={call.id}><strong>{call.stage} · {call.model}</strong><span className={call.succeeded ? 'call-success' : 'call-failure'}>{call.succeeded ? 'Succeeded' : 'Failed'}</span>{(call.usageAvailable ?? (call.inputTokens !== null && call.outputTokens !== null)) ? <small>Reasoning: {call.reasoningEffort} · In {call.inputTokens ?? 'unavailable'} ({call.cachedInputTokens ?? 'unavailable'} cached) · Out {call.outputTokens ?? 'unavailable'} ({call.reasoningTokens ?? 'unavailable'} reasoning) · {call.estimatedCostUsd === null ? 'Cost unavailable' : `Configured est. $${call.estimatedCostUsd.toFixed(6)}`} · {call.pricingProvenance}</small> : <small>Reasoning: {call.reasoningEffort} · Usage unavailable · Cost unavailable · {call.pricingProvenance}</small>}</article>)}</details>}</section>
+          <section className="telemetry-card expanded">
+            <div><span>CLARIFICATION CALLS</span><strong>{clarificationCalls.length}</strong></div><div><span>PLANNING CALLS</span><strong>{planningCalls.length}</strong></div><div><span>IMPLEMENTATION CALLS</span><strong>{implementationCalls.length}</strong></div>
+            {telemetry.usageAvailability === 'Complete' ? <><div><span>INPUT TOKENS</span><strong>{formatTokens(telemetry.totalInputTokens!)}</strong></div><div><span>OUTPUT TOKENS</span><strong>{formatTokens(telemetry.totalOutputTokens!)}</strong></div></> : <div className="usage-unavailable"><span>USAGE</span><strong>{aggregateUsageLabel}</strong></div>}
+            <div><span>COMPLETE COST SUBTOTAL</span><strong>{telemetry.completeEstimatedSubtotalUsd == null ? 'Unavailable' : `$${telemetry.completeEstimatedSubtotalUsd.toFixed(6)}`}</strong></div>
+            <div><span>CONSERVATIVE PARTIAL SUBTOTAL</span><strong>{telemetry.partialEstimatedSubtotalUsd == null ? 'Unavailable' : `$${telemetry.partialEstimatedSubtotalUsd.toFixed(6)}`}</strong></div>
+            <div><span>AVAILABLE COST SUBTOTAL</span><strong>{totalCostLabel}</strong></div><p><i />{providerLabel}</p>
+            {telemetry.calls.length > 0 && <details className="call-history"><summary>Model call details</summary>{telemetry.calls.map(call => <article key={call.id}><strong>{call.stage} · {call.model}</strong><span className={call.succeeded ? 'call-success' : 'call-failure'}>{call.succeeded ? 'Succeeded' : 'Failed'}</span>{call.providerUsageAvailability === 'Partial' || (call.usageAvailable ?? (call.inputTokens !== null && call.outputTokens !== null)) ? <small>{call.providerUsageAvailability === 'Partial' ? 'Usage partial · ' : ''}Reasoning: {call.reasoningEffort} · In {call.inputTokens ?? 'unavailable'} ({call.cachedInputTokens ?? 'unavailable'} cached) · Out {call.outputTokens ?? 'unavailable'} ({call.reasoningTokens ?? 'unavailable'} reasoning) · {call.estimatedCostUsd === null ? 'Cost unavailable' : `${call.isPartialEstimate ? 'Conservative partial est.' : 'Configured est.'} $${call.estimatedCostUsd.toFixed(6)}`} · {call.pricingProvenance}</small> : <small>Reasoning: {call.reasoningEffort} · Usage unavailable · Cost unavailable · {call.pricingProvenance}</small>}</article>)}</details>}
+          </section>
         </aside>
       </div>
     </main>
@@ -649,7 +795,7 @@ function formatTokens(tokens: number) { return tokens.toLocaleString() }
 function formatCallCost(calls: ModelCall[], total: number) {
   if (calls.length === 0) return 'No calls'
   if (calls.some(call => call.estimatedCostUsd === null)) return 'Cost unavailable'
-  return `$${total.toFixed(6)}`
+  return `$${total.toFixed(6)}${calls.some(call => call.isPartialEstimate) ? ' conservative partial estimate' : ''}`
 }
 function formatCallOutputUsage(call: ModelCall) {
   return call.outputTokens === null ? 'Output token usage unavailable' : `${call.outputTokens.toLocaleString()} output tokens`

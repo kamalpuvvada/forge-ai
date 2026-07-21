@@ -50,6 +50,7 @@ public sealed class OpenAIResponsesGatewayTests
         Assert.Equal(2, result.CachedInputTokens);
         Assert.Equal(1, result.ReasoningTokens);
         Assert.True(result.UsageAvailable);
+        Assert.Equal(VerificationUsageAvailability.Complete, result.EffectiveUsageAvailability);
     }
 
     [Fact]
@@ -62,37 +63,45 @@ public sealed class OpenAIResponsesGatewayTests
         var result = SdkOpenAIResponsesGateway.ParseResponse(body, null);
 
         Assert.False(result.UsageAvailable);
+        Assert.Equal(VerificationUsageAvailability.Unavailable, result.EffectiveUsageAvailability);
         Assert.Equal(OpenAIResponseContentKind.Refusal, Assert.Single(Assert.Single(result.OutputItems!).Content).Kind);
         Assert.Empty(result.OutputText);
     }
 
-    public static TheoryData<string> UnavailableUsage => new()
+    public static TheoryData<string, VerificationUsageAvailability, int?, int?, int?, int?> UsageCases => new()
     {
-        "null",
-        "{}",
-        "{\"input_tokens\":1}",
-        "{\"output_tokens\":1}",
-        "{\"input_tokens\":null,\"output_tokens\":1}",
-        "{\"input_tokens\":1,\"output_tokens\":null}",
-        "{\"input_tokens\":\"1\",\"output_tokens\":1}",
-        "{\"input_tokens\":1.5,\"output_tokens\":1}",
-        "{\"input_tokens\":-1,\"output_tokens\":1}",
-        "{\"input_tokens\":2147483648,\"output_tokens\":1}",
-        "{\"input_tokens\":1,\"output_tokens\":1,\"input_tokens_details\":{\"cached_tokens\":-1}}",
-        "{\"input_tokens\":1,\"output_tokens\":1,\"output_tokens_details\":{\"reasoning_tokens\":1.5}}"
+        { "null", VerificationUsageAvailability.Unavailable, null, null, null, null },
+        { "{}", VerificationUsageAvailability.Unavailable, null, null, null, null },
+        { "{\"input_tokens\":1}", VerificationUsageAvailability.Partial, 1, null, null, null },
+        { "{\"input_tokens_details\":{\"cached_tokens\":1}}", VerificationUsageAvailability.Partial, null, 1, null, null },
+        { "{\"output_tokens\":1}", VerificationUsageAvailability.Partial, null, null, 1, null },
+        { "{\"output_tokens_details\":{\"reasoning_tokens\":1}}", VerificationUsageAvailability.Partial, null, null, null, 1 },
+        { "{\"input_tokens\":null,\"output_tokens\":1}", VerificationUsageAvailability.Partial, null, null, 1, null },
+        { "{\"input_tokens\":1,\"output_tokens\":null}", VerificationUsageAvailability.Partial, 1, null, null, null },
+        { "{\"input_tokens\":\"1\",\"output_tokens\":1}", VerificationUsageAvailability.Partial, null, null, 1, null },
+        { "{\"input_tokens\":1.5,\"output_tokens\":1}", VerificationUsageAvailability.Partial, null, null, 1, null },
+        { "{\"input_tokens\":-1,\"output_tokens\":1}", VerificationUsageAvailability.Partial, null, null, 1, null },
+        { "{\"input_tokens\":2147483648,\"output_tokens\":1}", VerificationUsageAvailability.Partial, null, null, 1, null },
+        { "{\"input_tokens\":1,\"output_tokens\":1,\"input_tokens_details\":{\"cached_tokens\":-1}}", VerificationUsageAvailability.Partial, 1, null, 1, null },
+        { "{\"input_tokens\":1,\"output_tokens\":1,\"output_tokens_details\":{\"reasoning_tokens\":1.5}}", VerificationUsageAvailability.Partial, 1, null, 1, null },
+        { "{\"input_tokens\":2,\"output_tokens\":1,\"input_tokens_details\":{\"cached_tokens\":3},\"output_tokens_details\":{\"reasoning_tokens\":1}}", VerificationUsageAvailability.Partial, 2, null, 1, 1 },
+        { "{\"output_tokens\":1,\"output_tokens_details\":{\"reasoning_tokens\":2}}", VerificationUsageAvailability.Partial, null, null, 1, null },
+        { "{\"input_tokens\":0,\"output_tokens\":0,\"input_tokens_details\":{\"cached_tokens\":0},\"output_tokens_details\":{\"reasoning_tokens\":0}}", VerificationUsageAvailability.Complete, 0, 0, 0, 0 },
+        { "{\"input_tokens\":2147483647,\"output_tokens\":2147483647,\"input_tokens_details\":{\"cached_tokens\":2147483647},\"output_tokens_details\":{\"reasoning_tokens\":2147483647}}", VerificationUsageAvailability.Complete, int.MaxValue, int.MaxValue, int.MaxValue, int.MaxValue }
     };
 
     [Theory]
-    [MemberData(nameof(UnavailableUsage))]
-    public void Partial_or_malformed_usage_is_unavailable_without_zero_coercion(string usage)
+    [MemberData(nameof(UsageCases))]
+    public void Usage_fields_are_parsed_independently_without_zero_coercion(string usage,
+        VerificationUsageAvailability availability, int? input, int? cached, int? output, int? reasoning)
     {
         var result = ParseUsage(usage);
 
-        Assert.False(result.UsageAvailable);
-        Assert.Null(result.InputTokens);
-        Assert.Null(result.CachedInputTokens);
-        Assert.Null(result.OutputTokens);
-        Assert.Null(result.ReasoningTokens);
+        Assert.Equal(availability, result.EffectiveUsageAvailability);
+        Assert.Equal(input, result.InputTokens);
+        Assert.Equal(cached, result.CachedInputTokens);
+        Assert.Equal(output, result.OutputTokens);
+        Assert.Equal(reasoning, result.ReasoningTokens);
     }
 
     [Fact]
@@ -101,6 +110,7 @@ public sealed class OpenAIResponsesGatewayTests
         var result = ParseUsage("{\"input_tokens\":12,\"output_tokens\":7}");
 
         Assert.True(result.UsageAvailable);
+        Assert.Equal(VerificationUsageAvailability.Partial, result.EffectiveUsageAvailability);
         Assert.Equal(12, result.InputTokens);
         Assert.Null(result.CachedInputTokens);
         Assert.Equal(7, result.OutputTokens);
@@ -115,10 +125,19 @@ public sealed class OpenAIResponsesGatewayTests
                                 "\"output_tokens_details\":{\"reasoning_tokens\":2}}");
 
         Assert.True(result.UsageAvailable);
+        Assert.Equal(VerificationUsageAvailability.Complete, result.EffectiveUsageAvailability);
         Assert.Equal(12, result.InputTokens);
         Assert.Equal(3, result.CachedInputTokens);
         Assert.Equal(7, result.OutputTokens);
         Assert.Equal(2, result.ReasoningTokens);
+    }
+
+    [Fact]
+    public void Duplicate_usage_property_is_rejected_before_normalization()
+    {
+        var exception = Assert.Throws<OpenAITransportException>(() => ParseUsage(
+            "{\"input_tokens\":1,\"input_tokens\":2,\"output_tokens\":1}"));
+        Assert.Equal("invalid_response", exception.Category);
     }
 
     [Fact]

@@ -1,3 +1,4 @@
+using Forge.Core;
 using Microsoft.Data.Sqlite;
 
 namespace Forge.Infrastructure;
@@ -51,6 +52,9 @@ public sealed class SqliteDatabaseInitializer(string connectionString)
                 ImplementationRevisions TEXT NOT NULL DEFAULT '[]',
                 ActiveImplementationRevisionId TEXT NULL,
                 ApprovedImplementationRevisionId TEXT NULL,
+                CurrentVerificationPlanId TEXT NULL,
+                CurrentVerificationAttemptId TEXT NULL,
+                VerificationDataFormatVersion INTEGER NOT NULL DEFAULT 0,
                 RowVersion INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS ImplementationApprovalCommands (
@@ -62,6 +66,64 @@ public sealed class SqliteDatabaseInitializer(string connectionString)
                 ApprovedRowVersion INTEGER NULL CHECK(ApprovedRowVersion >= 1),
                 ApprovalTimestamp TEXT NULL,
                 CHECK((ApprovedRowVersion IS NULL) = (ApprovalTimestamp IS NULL))
+            );
+            CREATE TABLE IF NOT EXISTS VerificationPlans (
+                PlanId TEXT PRIMARY KEY NOT NULL CHECK(length(PlanId) = 36),
+                TaskId TEXT NOT NULL CHECK(length(TaskId) = 36),
+                PlanNumber INTEGER NOT NULL CHECK(PlanNumber >= 1),
+                ImplementationRevisionId TEXT NOT NULL CHECK(length(ImplementationRevisionId) = 36),
+                ImplementationResultFingerprint TEXT NOT NULL CHECK(length(ImplementationResultFingerprint) = 64),
+                ApprovedRequirementFingerprint TEXT NOT NULL CHECK(length(ApprovedRequirementFingerprint) = 64),
+                ApprovedPlanFingerprint TEXT NOT NULL CHECK(length(ApprovedPlanFingerprint) = 64),
+                PlanFingerprint TEXT NOT NULL CHECK(length(PlanFingerprint) = 64),
+                Status TEXT NOT NULL,
+                GeneratedAt TEXT NOT NULL,
+                Json TEXT NOT NULL,
+                UNIQUE(TaskId, PlanNumber)
+            );
+            CREATE TABLE IF NOT EXISTS VerificationPlanGenerationCommands (
+                CommandId TEXT PRIMARY KEY NOT NULL CHECK(length(CommandId) = 36),
+                TaskId TEXT NOT NULL CHECK(length(TaskId) = 36),
+                Status TEXT NOT NULL,
+                StartedAt TEXT NOT NULL,
+                CompletedAt TEXT NULL,
+                Json TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS ManualVerificationAttempts (
+                AttemptId TEXT PRIMARY KEY NOT NULL CHECK(length(AttemptId) = 36),
+                TaskId TEXT NOT NULL CHECK(length(TaskId) = 36),
+                AttemptNumber INTEGER NOT NULL CHECK(AttemptNumber >= 1),
+                PlanId TEXT NOT NULL CHECK(length(PlanId) = 36),
+                ImplementationRevisionId TEXT NOT NULL CHECK(length(ImplementationRevisionId) = 36),
+                ImplementationResultFingerprint TEXT NOT NULL CHECK(length(ImplementationResultFingerprint) = 64),
+                Status TEXT NOT NULL,
+                StartedAt TEXT NOT NULL,
+                CompletedAt TEXT NULL,
+                AttemptFingerprint TEXT NULL,
+                Json TEXT NOT NULL,
+                UNIQUE(TaskId, AttemptNumber)
+            );
+            CREATE TABLE IF NOT EXISTS ManualCaseResultRevisions (
+                ResultRevisionId TEXT PRIMARY KEY NOT NULL CHECK(length(ResultRevisionId) = 36),
+                TaskId TEXT NOT NULL CHECK(length(TaskId) = 36),
+                AttemptId TEXT NOT NULL CHECK(length(AttemptId) = 36),
+                TestCaseId TEXT NOT NULL CHECK(length(TestCaseId) = 36),
+                RevisionNumber INTEGER NOT NULL CHECK(RevisionNumber >= 1),
+                Result TEXT NOT NULL,
+                RecordedAt TEXT NOT NULL,
+                SupersedesResultRevisionId TEXT NULL,
+                Json TEXT NOT NULL,
+                UNIQUE(AttemptId, TestCaseId, RevisionNumber)
+            );
+            CREATE TABLE IF NOT EXISTS VerificationCommandBindings (
+                CommandId TEXT PRIMARY KEY NOT NULL CHECK(length(CommandId) = 36),
+                TaskId TEXT NOT NULL CHECK(length(TaskId) = 36),
+                CommandType TEXT NOT NULL,
+                SemanticFingerprint TEXT NOT NULL CHECK(length(SemanticFingerprint) = 64),
+                ResultIdentity TEXT NULL,
+                CompletedRowVersion INTEGER NULL CHECK(CompletedRowVersion >= 1),
+                CompletedAt TEXT NULL,
+                CHECK((CompletedRowVersion IS NULL) = (CompletedAt IS NULL))
             );
             """;
         await command.ExecuteNonQueryAsync(cancellationToken);
@@ -86,6 +148,72 @@ public sealed class SqliteDatabaseInitializer(string connectionString)
         await EnsureColumnAsync(connection, "ImplementationRevisions", "TEXT NOT NULL DEFAULT '[]'", cancellationToken);
         await EnsureColumnAsync(connection, "ActiveImplementationRevisionId", "TEXT NULL", cancellationToken);
         await EnsureColumnAsync(connection, "ApprovedImplementationRevisionId", "TEXT NULL", cancellationToken);
+        await EnsureColumnAsync(connection, "CurrentVerificationPlanId", "TEXT NULL", cancellationToken);
+        await EnsureColumnAsync(connection, "CurrentVerificationAttemptId", "TEXT NULL", cancellationToken);
+        await EnsureColumnAsync(connection, "VerificationDataFormatVersion", "INTEGER NOT NULL DEFAULT 0", cancellationToken);
+        command.CommandText = $"""
+            CREATE TRIGGER IF NOT EXISTS RequireCurrentVerificationFormatForPlan
+            BEFORE INSERT ON VerificationPlans BEGIN
+              SELECT CASE WHEN NOT EXISTS (
+                SELECT 1 FROM EngineeringTasks WHERE Id = NEW.TaskId
+                  AND VerificationDataFormatVersion = {VerificationDataFormatVersions.Current})
+              THEN RAISE(ABORT, 'verification parent format mismatch') END;
+            END;
+            CREATE TRIGGER IF NOT EXISTS RequireCurrentVerificationFormatForGeneration
+            BEFORE INSERT ON VerificationPlanGenerationCommands BEGIN
+              SELECT CASE WHEN NOT EXISTS (
+                SELECT 1 FROM EngineeringTasks WHERE Id = NEW.TaskId
+                  AND VerificationDataFormatVersion = {VerificationDataFormatVersions.Current})
+              THEN RAISE(ABORT, 'verification parent format mismatch') END;
+            END;
+            CREATE TRIGGER IF NOT EXISTS RequireCurrentVerificationFormatForAttempt
+            BEFORE INSERT ON ManualVerificationAttempts BEGIN
+              SELECT CASE WHEN NOT EXISTS (
+                SELECT 1 FROM EngineeringTasks WHERE Id = NEW.TaskId
+                  AND VerificationDataFormatVersion = {VerificationDataFormatVersions.Current})
+              THEN RAISE(ABORT, 'verification parent format mismatch') END;
+            END;
+            CREATE TRIGGER IF NOT EXISTS RequireCurrentVerificationFormatForResult
+            BEFORE INSERT ON ManualCaseResultRevisions BEGIN
+              SELECT CASE WHEN NOT EXISTS (
+                SELECT 1 FROM EngineeringTasks WHERE Id = NEW.TaskId
+                  AND VerificationDataFormatVersion = {VerificationDataFormatVersions.Current})
+              THEN RAISE(ABORT, 'verification parent format mismatch') END;
+            END;
+            CREATE TRIGGER IF NOT EXISTS RequireCurrentVerificationFormatForBinding
+            BEFORE INSERT ON VerificationCommandBindings BEGIN
+              SELECT CASE WHEN NOT EXISTS (
+                SELECT 1 FROM EngineeringTasks WHERE Id = NEW.TaskId
+                  AND VerificationDataFormatVersion = {VerificationDataFormatVersions.Current})
+              THEN RAISE(ABORT, 'verification parent format mismatch') END;
+            END;
+            CREATE TRIGGER IF NOT EXISTS PreventVerificationPlanTaskReassignment
+            BEFORE UPDATE OF TaskId ON VerificationPlans
+            WHEN NEW.TaskId <> OLD.TaskId BEGIN
+              SELECT RAISE(ABORT, 'verification child ownership is immutable');
+            END;
+            CREATE TRIGGER IF NOT EXISTS PreventVerificationGenerationTaskReassignment
+            BEFORE UPDATE OF TaskId ON VerificationPlanGenerationCommands
+            WHEN NEW.TaskId <> OLD.TaskId BEGIN
+              SELECT RAISE(ABORT, 'verification child ownership is immutable');
+            END;
+            CREATE TRIGGER IF NOT EXISTS PreventManualVerificationAttemptTaskReassignment
+            BEFORE UPDATE OF TaskId ON ManualVerificationAttempts
+            WHEN NEW.TaskId <> OLD.TaskId BEGIN
+              SELECT RAISE(ABORT, 'verification child ownership is immutable');
+            END;
+            CREATE TRIGGER IF NOT EXISTS PreventManualCaseResultTaskReassignment
+            BEFORE UPDATE OF TaskId ON ManualCaseResultRevisions
+            WHEN NEW.TaskId <> OLD.TaskId BEGIN
+              SELECT RAISE(ABORT, 'verification child ownership is immutable');
+            END;
+            CREATE TRIGGER IF NOT EXISTS PreventVerificationBindingTaskReassignment
+            BEFORE UPDATE OF TaskId ON VerificationCommandBindings
+            WHEN NEW.TaskId <> OLD.TaskId BEGIN
+              SELECT RAISE(ABORT, 'verification child ownership is immutable');
+            END;
+            """;
+        await command.ExecuteNonQueryAsync(cancellationToken);
         await EnsureColumnAsync(connection, "RowVersion", "INTEGER NOT NULL DEFAULT 0", cancellationToken);
         await EnsureIndexAsync(connection, cancellationToken);
     }
