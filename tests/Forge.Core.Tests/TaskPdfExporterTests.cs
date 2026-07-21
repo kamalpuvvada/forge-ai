@@ -1048,6 +1048,8 @@ public sealed class TaskPdfExporterTests
             new ImplementationReportRuntimeStatus(true, ImplementationAttemptDisposition.SafeResume, "Safe resume observation.")));
         var recoveryText = Extract(Exporter().Export(recoveryRequired,
             new ImplementationReportRuntimeStatus(false, ImplementationAttemptDisposition.RecoveryRequired, "Workspace not observed.")));
+        var interruptedText = Extract(Exporter().Export(implementing,
+            new ImplementationReportRuntimeStatus(false, ImplementationAttemptDisposition.Interrupted, "The lease expired before a result was persisted.")));
 
         Assert.Contains("Implementation attempt", implementingText);
         Assert.Contains("Attempt disposition: Active", implementingText);
@@ -1061,6 +1063,27 @@ public sealed class TaskPdfExporterTests
         Assert.Contains("Recovery required: yes", recoveryText);
         Assert.Contains("Active checkout verified when implementation completed: no", recoveryText);
         Assert.Contains("Valid non-reparse isolated worktree metadata observed at export time: no", recoveryText);
+        Assert.Contains("Attempt disposition: Interrupted", interruptedText);
+        Assert.Contains("No implementation result was persisted.", interruptedText);
+        Assert.DoesNotContain("Attempt disposition: Result persisted", interruptedText);
+    }
+
+    [Fact]
+    public void Approved_persisted_result_is_not_reported_interrupted_after_operational_lease_expiry()
+    {
+        var task = ImplementedAuditTask();
+        var revision = Assert.Single(task.ImplementationRevisions);
+        task.ApproveImplementation(Guid.NewGuid(), task.RowVersion, revision.RevisionId,
+            revision.ResultFingerprint!, Now.AddMinutes(7));
+
+        var text = Extract(Exporter().Export(task, new ImplementationReportRuntimeStatus(false,
+            ImplementationAttemptDisposition.Interrupted, "The operational lease expired.")));
+
+        Assert.Contains("Generation disposition: Succeeded", text);
+        Assert.Contains("Review disposition: Approved", text);
+        Assert.Contains("Attempt disposition: Result persisted", text);
+        Assert.Contains("Operational lease no longer active", text);
+        Assert.DoesNotContain("Attempt disposition: Interrupted", text);
     }
 
     [Fact]
@@ -1074,7 +1097,28 @@ public sealed class TaskPdfExporterTests
         Assert.Contains("Implementation review", text);
         Assert.Contains("Active checkout verified when implementation completed: yes", text);
         Assert.Contains("Valid non-reparse isolated worktree metadata observed at export time: no", text);
-        Assert.Contains("Attempt disposition: RecoveryRequired", text);
+        Assert.Contains("Attempt disposition: Result persisted", text);
+        Assert.Contains("Operational lease no longer active", text);
+        Assert.Contains("The workspace was not observed.", text);
+        Assert.DoesNotContain("Attempt disposition: RecoveryRequired", text);
+    }
+
+    [Fact]
+    public void Exporting_persisted_result_disposition_is_read_only_and_requires_no_Git_service()
+    {
+        var task = ImplementedAuditTask();
+        var revision = Assert.Single(task.ImplementationRevisions);
+        task.ApproveImplementation(Guid.NewGuid(), task.RowVersion, revision.RevisionId,
+            revision.ResultFingerprint!, Now.AddMinutes(7));
+        var before = JsonSerializer.Serialize(task, JsonOptions);
+        var rowVersion = task.RowVersion;
+
+        var bytes = Exporter().Export(task, new ImplementationReportRuntimeStatus(false,
+            ImplementationAttemptDisposition.Interrupted, "Read-only runtime observation."));
+
+        Assert.NotEmpty(bytes);
+        Assert.Equal(rowVersion, task.RowVersion);
+        Assert.Equal(before, JsonSerializer.Serialize(task, JsonOptions));
     }
 
     [Fact]

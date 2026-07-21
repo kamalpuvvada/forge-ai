@@ -356,7 +356,13 @@ public sealed class TaskPdfExporter(
         writer.Section("Implementation attempt");
         writer.Field("Started at", task.ImplementationStartedAt is { } started ? FormatTimestamp(started) : "not recorded");
         writer.Field("Workspace phase", task.ImplementationWorkspace?.Phase.ToString() ?? "not recorded");
-        writer.Field("Attempt disposition", runtimeStatus?.Disposition.ToString() ?? PersistedDisposition(task));
+        var safelyPersistedResult = HasSafelyPersistedResult(task);
+        var attemptDisposition = safelyPersistedResult
+            ? runtimeStatus?.Disposition == ImplementationAttemptDisposition.Completed ? "Completed" : "Result persisted"
+            : runtimeStatus?.Disposition.ToString() ?? PersistedDisposition(task);
+        writer.Field("Attempt disposition", attemptDisposition);
+        if (safelyPersistedResult && runtimeStatus is { Disposition: not ImplementationAttemptDisposition.Completed })
+            writer.Field("Operational status", "Operational lease no longer active; the persisted implementation result remains available for review.");
         if (task.LastImplementationFailure is { } failure)
         {
             writer.Field("Failure category", failure.Category);
@@ -376,6 +382,21 @@ public sealed class TaskPdfExporter(
         if (!string.IsNullOrWhiteSpace(runtimeStatus?.SafeMessage))
             writer.Field("Read-only export-time observation", runtimeStatus.SafeMessage);
         if (task.ImplementationResult is null) writer.Body("No implementation result was persisted.");
+    }
+
+    private static bool HasSafelyPersistedResult(EngineeringTask task)
+    {
+        if (task.ImplementationResult is not { ActiveCheckoutVerified: true }) return false;
+        var revisionId = task.ApprovedImplementationRevisionId ?? task.ActiveImplementationRevisionId;
+        var revision = revisionId is { } id
+            ? task.ImplementationRevisions.SingleOrDefault(item => item.RevisionId == id)
+            : null;
+        return revision is
+        {
+            GenerationState: ImplementationGenerationState.Succeeded,
+            Result: not null,
+            ResultFingerprint: not null
+        };
     }
 
     private static string PersistedDisposition(EngineeringTask task) => task.LastImplementationFailure switch
