@@ -27,6 +27,10 @@ public sealed class ForgeAiOptions
     public string ImplementationReasoningEffort { get; set; } = "high";
     public int ImplementationMaxOutputTokens { get; set; } = 32_000;
     public int ImplementationTimeoutSeconds { get; set; } = 180;
+    public string VerificationPlanningModel { get; set; } = "gpt-5.6-sol";
+    public string VerificationPlanningReasoningEffort { get; set; } = "medium";
+    public int VerificationPlanningMaxOutputTokens { get; set; } = 8_000;
+    public int VerificationPlanningTimeoutSeconds { get; set; } = 180;
     public Dictionary<string, ModelPricing> Pricing { get; set; } = DefaultPricing();
 
     public bool IsClarificationConfigurationComplete(bool hasApiKey) =>
@@ -45,7 +49,7 @@ public sealed class ForgeAiOptions
 
     public bool IsOpenAiConfigurationComplete(bool hasApiKey) =>
         IsClarificationConfigurationComplete(hasApiKey) && IsPlanningConfigurationComplete(hasApiKey) &&
-        IsImplementationConfigurationComplete(hasApiKey);
+        IsImplementationConfigurationComplete(hasApiKey) && IsVerificationPlanningConfigurationComplete(hasApiKey);
 
     public bool IsImplementationConfigurationComplete(bool hasApiKey) =>
         hasApiKey &&
@@ -55,6 +59,15 @@ public sealed class ForgeAiOptions
         ImplementationMaxOutputTokens is > 0 and <= MaximumImplementationOutputTokens &&
         ImplementationTimeoutSeconds is > 0 and <= MaximumImplementationTimeoutSeconds &&
         Pricing is not null && Pricing.TryGetValue(ImplementationModel, out var pricing) && IsValidPricing(pricing);
+
+    public bool IsVerificationPlanningConfigurationComplete(bool hasApiKey) =>
+        hasApiKey &&
+        !string.IsNullOrWhiteSpace(VerificationPlanningModel) &&
+        VerificationPlanningModel.Length <= 160 &&
+        SupportedReasoningEfforts.Contains(VerificationPlanningReasoningEffort) &&
+        VerificationPlanningMaxOutputTokens is > 0 and <= MaximumImplementationOutputTokens &&
+        VerificationPlanningTimeoutSeconds is > 0 and <= MaximumImplementationTimeoutSeconds &&
+        Pricing is not null && Pricing.TryGetValue(VerificationPlanningModel, out var pricing) && IsValidPricing(pricing);
 
     public void ValidateSyntax()
     {
@@ -67,6 +80,13 @@ public sealed class ForgeAiOptions
             ImplementationTimeoutSeconds is <= 0 or > MaximumImplementationTimeoutSeconds ||
             Pricing is null || !Pricing.TryGetValue(ImplementationModel, out var pricing) || !IsValidPricing(pricing))
             throw new InvalidOperationException("Forge OpenAI implementation configuration is syntactically invalid.");
+        if (string.IsNullOrWhiteSpace(VerificationPlanningModel) || VerificationPlanningModel.Length > 160 ||
+            !SupportedReasoningEfforts.Contains(VerificationPlanningReasoningEffort) ||
+            VerificationPlanningMaxOutputTokens is <= 0 or > MaximumImplementationOutputTokens ||
+            VerificationPlanningTimeoutSeconds is <= 0 or > MaximumImplementationTimeoutSeconds ||
+            Pricing is null || !Pricing.TryGetValue(VerificationPlanningModel, out var verificationPricing) ||
+            !IsValidPricing(verificationPricing))
+            throw new InvalidOperationException("Forge OpenAI verification-planning configuration is syntactically invalid.");
     }
 
     internal static bool IsValidPricing(ModelPricing? pricing) => pricing is not null &&

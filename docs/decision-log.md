@@ -86,7 +86,7 @@
 
 ## 2026-07-20: Prefer duplicate-billing safety and one strict Responses topology
 
-**Decision:** Retry statusless transport failures only when failure before dispatch is proven; treat ambiguous failures as non-retryable. Require valid response identity and one shared strict topology across clarification, planning, and implementation. Partial usage is unavailable, duplicate JSON properties are rejected, and cost arithmetic cannot erase post-dispatch telemetry.
+**Decision:** Retry statusless transport failures only when failure before dispatch is proven; treat ambiguous failures as non-retryable. Require valid response identity and one shared strict topology across clarification, planning, and implementation. Preserve independently valid partial usage, reject duplicate JSON properties, and ensure cost arithmetic cannot erase post-dispatch telemetry.
 
 **Reason:** A connection failure can occur after the provider accepted a billable request. Conservative retry, strict response identity, and fail-soft telemetry preserve an honest audit record without risking silent duplicate charges.
 
@@ -121,3 +121,37 @@
 **Decision:** Record the successful explicitly authorized `gpt-5.6-sol` Responses API smoke as compatibility evidence for the strict OpenAI implementation boundary. The disposable test accepted exactly one approved modify operation, passed deterministic validation, and left its active checkout clean.
 **Reason:** A real gated request demonstrates that the configured model, Responses transport, strict schema, and local validation interoperate without granting repository or command authority. OpenAI API billing is separate from ChatGPT and Codex.
 **Trade-off:** This evidence covers only one small approved scenario and is not broad model-quality testing. It ran no target validation command and performed no staging, commit, push, pull-request, or delivery action.
+
+## 020 — Bind manual verification to the approved implementation revision
+
+**Decision:** Generate a bounded immutable verification plan for the exact approved implementation revision, store manual case outcomes as append-only user-reported revisions, and require explicit human confirmation before `ReadyForDelivery` or `ManualVerificationFailed`.
+
+**Reason:** Forge needs an auditable verification gate without falsely claiming that it executed commands or independently authenticated user evidence.
+
+**Trade-off:** Slice A trusts the human report and performs no automated validation, failure analysis, correction, commit, push, or pull-request action. OpenAI verification planning remains separately billed and never falls back to Fake.
+
+## 021 — Prefer duplicate-billing safety for verification planning
+
+**Decision:** Persist verification dispatch intent and its exact logical-call start before networking, then atomically persist that start, receive time, normalized response identity, HTTP/status/dispatch facts, explicit usage completeness, and independently valid nullable counters with the `ResponseReceived` checkpoint. Count logical attempts, definite physical requests, possibly dispatched requests, and definitely undispatched attempts as separate facts. Never turn a dispatched, response-received, or ambiguous attempt into retry eligibility through lease expiry or restart. A new physical request is allowed only after a proven pre-dispatch failure or an explicit HTTP 429, 502, or 503 response.
+
+**Reason:** Avoiding a duplicate billable provider request takes priority over availability. Forge cannot infer whether an ambiguous request was accepted or billed.
+
+**Trade-off:** An interrupted ambiguous attempt remains visible and requires operator review rather than silent recovery or automatic redispatch.
+
+## 022 — Preserve partial verification telemetry without overstating cost
+
+**Decision:** Classify verification usage through one shared complete/partial/unavailable contract, preserve cached-only and other independently trustworthy counters, and enforce cached-input/input and reasoning/output consistency. Price only complete usage or the documented conservative partial case where input and output are known but cached input is absent. Expose separate complete, partial-conservative, and combined-available subtotals. Bind response identity and timing in a versioned telemetry fingerprint, preflight malformed persisted histories, classify query-bearing repository claims contextually, and make frontend verification eligibility fail closed.
+
+**Reason:** Partial provider evidence remains useful, but neither missing counters nor ambiguous billing may be presented as zero or as a complete task estimate. The same safety interpretation must survive restart and every API, PDF, and UI projection.
+
+**Trade-off:** Some trustworthy partial combinations remain unpriced, contextual path recognition is intentionally conservative, legacy fingerprint-less rows are accepted read-only, and malformed frontend payloads require reload rather than guessed eligibility. No automated validation or delivery action is added.
+
+## 023 — Make verification format and client decoding fail closed
+
+**Decision:** Accept verification format version zero only when no verification row, pointer, workflow state, verification model call, or command binding exists. Persist authoritative version 2 on the task row before the first verification child or binding and require every current nested response, logical-call, timing, linkage, fingerprint, and model-call usage invariant. Never select legacy compatibility from removable nested fields. Require current-format parents on child INSERT and reject every child or binding `TaskId` reassignment. Classify credible query-bearing repository paths structurally, independent of action verbs. Decode compact history and every consumed field and safety relationship in full actionable task responses separately in the browser; reject malformed plans, results, eligibility, usage, and costs before state replacement. Manual Start, Save, Pass, and Fail controls and handlers require their exact backend eligibility flag and validated current pointers; Start additionally requires empty attempt history, and chronology entries are never an actionable fallback.
+
+**Reason:** Positive proof that no verification artifact exists prevents coordinated parent-plus-child marker deletion from selecting legacy behavior. Structural path recognition closes wording-dependent allowlist gaps, and explicit runtime decoding prevents untrusted API JSON from replacing a valid task, enabling actions, or presenting missing cost as zero.
+
+**Trade-off:** Genuine legacy version-0 tasks contain no verification artifacts and remain read-only; future versions fail until explicitly supported, ambiguous relative references are conservatively treated as repository claims, and malformed responses require reload while preserving the last valid selection and enabling no mutation. Corruption tests represent every storage and endpoint family without claiming an exhaustive Cartesian product. This detects corruption and bounded tampering within Forge's persistence trust boundary; it does not defend against a fully malicious database administrator who can rewrite all application history and code. `Complete`/`Partial` map to `UsageAvailable = true`; `Unavailable` maps to false. Forge still executes no verification or delivery command.
+
+**Low-priority engineering follow-ups:** Keep the representative corruption matrix rather than claiming a Cartesian product; consider additional Save/Pass/Fail keyboard, rapid-action, and stale-response cases; and add an explicit trigger test for `SET TaskId = TaskId`. These are engineering-depth follow-ups, not demonstrated product failures.

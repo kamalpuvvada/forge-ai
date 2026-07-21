@@ -5,7 +5,6 @@ namespace Forge.Core.Tests;
 public sealed class SensitiveContentDetectorTests
 {
     [Theory]
-    [InlineData("Authorization: Bearer abcdefghijklmnop")]
     [InlineData("Authorization: Basic dXNlcjpwYXNzd29yZA==")]
     [InlineData("-----BEGIN PRIVATE KEY-----")]
     [InlineData("https://user:password@example.invalid/path")]
@@ -17,10 +16,33 @@ public sealed class SensitiveContentDetectorTests
         Assert.True(SensitiveContentDetector.ContainsSensitiveValue(value));
     }
 
+    [Fact]
+    public void Runtime_constructed_credential_forms_are_detected_without_static_secret_literals()
+    {
+        var values = new[]
+        {
+            SyntheticSensitiveValues.BearerAuthorization(),
+            SyntheticSensitiveValues.Jwt(),
+            SyntheticSensitiveValues.JsonWithJwt(),
+            SyntheticSensitiveValues.SasQuery(),
+            SyntheticSensitiveValues.AmazonSignedQuery()
+        };
+
+        Assert.All(values, value => Assert.True(SensitiveContentDetector.ContainsSensitiveValue(value)));
+    }
+
     [Theory]
     [InlineData("token budget = 6000")]
     [InlineData("password validation is required")]
     [InlineData("https://example.invalid/path")]
+    [InlineData("token count and token usage are shown")]
+    [InlineData("API key documentation and bearer authentication explanation")]
+    [InlineData("JWT format is header.payload.signature")]
+    [InlineData("https://example.invalid/search?q=request%2Fresponse&expires=tomorrow")]
+    [InlineData("sig=short-example&resource=document")]
+    [InlineData("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")]
+    [InlineData("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")]
+    [InlineData("src/Forge.Core/VerificationValidator.cs")]
     public void Ordinary_source_text_is_not_classified_as_a_secret(string value)
     {
         Assert.False(SensitiveContentDetector.ContainsSensitiveValue(value));

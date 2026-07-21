@@ -4,7 +4,8 @@ public enum ModelCallStage
 {
     Clarification,
     Planning,
-    Implementation
+    Implementation,
+    VerificationPlanning
 }
 
 public sealed record ModelPricingSnapshot(
@@ -29,7 +30,11 @@ public sealed record ModelCallRecord(
     decimal? EstimatedCostUsd,
     string? FailureCategory,
     ModelPricingSnapshot? PricingSnapshot = null,
-    string? ProviderRequestId = null);
+    string? ProviderRequestId = null,
+    VerificationCallDispatchDisposition? VerificationDispatchDisposition = null,
+    int? ProviderHttpStatusCode = null,
+    bool? ProviderUsageAvailable = null,
+    VerificationUsageAvailability? ProviderUsageAvailability = null);
 
 public static class ModelCallUsageEvidence
 {

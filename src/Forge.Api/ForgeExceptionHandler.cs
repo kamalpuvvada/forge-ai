@@ -31,6 +31,7 @@ public sealed class ForgeExceptionHandler(
                 _ => (400, "Repository path invalid", discovery.Message, "repository_missing_path")
             },
             ImplementationException implementation => MapImplementationFailure(implementation),
+            VerificationException verification => MapVerificationFailure(verification),
             PlanningProviderException { Category: "missing_direct_evidence" } provider => (
                 422,
                 "Repository evidence does not support the plan",
@@ -110,6 +111,31 @@ public sealed class ForgeExceptionHandler(
             "implementation_unsafe_path" =>
                 (400, "Unsafe implementation path", safe.Message, safe.Category),
             _ => (422, "Implementation generation rejected", safe.Message, safe.Category)
+        };
+    }
+
+    internal static (int Status, string Title, string Detail, string Code) MapVerificationFailure(
+        VerificationException exception)
+    {
+        var safeMessage = SensitiveContentDetector.ContainsSensitiveValue(exception.Message)
+            ? "Manual verification could not be updated safely."
+            : exception.Message;
+        return exception.Category switch
+        {
+            "verification_plan_not_found" or "verification_attempt_not_found" or "verification_case_not_found" =>
+                (404, "Verification record not found", safeMessage, exception.Category),
+            "verification_configuration" or "verification_authentication" or "verification_permission" or
+                "verification_model_unavailable" or "verification_rate_limit" or "verification_timeout" or
+                "verification_cancelled" or "verification_provider_error" or "verification_invalid_request" =>
+                (503, "Verification planning unavailable", safeMessage, exception.Category),
+            "verification_refusal" or "verification_output_truncated" or "verification_content_filter" or
+                "verification_empty_response" or "verification_unexpected_output" or
+                "verification_incomplete_response" or "verification_invalid_structured_output" or
+                "verification_validation_rejected" =>
+                (502, "Verification-plan provider failure", safeMessage, exception.Category),
+            "verification_stale_binding" or "verification_workflow" =>
+                (409, "Verification state changed", safeMessage, exception.Category),
+            _ => (422, "Manual verification rejected", safeMessage, exception.Category)
         };
     }
 }

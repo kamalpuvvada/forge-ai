@@ -104,6 +104,8 @@ public sealed class TaskPdfExporter(
         if (task.ImplementationRevisions.Count > 0) WriteImplementationRevisionChronology(writer, task);
         if (HasImplementationAttempt(task, runtimeStatus)) WriteImplementationAttempt(writer, task, runtimeStatus);
         if (task.ImplementationResult is { } result) WriteImplementationReview(writer, task, result);
+        if (task.VerificationPlans.Count > 0 || task.VerificationPlanGenerationAttempts.Count > 0)
+            WriteVerificationChronology(writer, task);
 
         writer.Section("Model-call usage and estimated cost");
         writer.Field("Model-call count", task.ModelCalls.Count.ToString(CultureInfo.InvariantCulture));
@@ -114,7 +116,16 @@ public sealed class TaskPdfExporter(
 
         var total = ResolveBoundedTotal(task.ModelCalls, displayedCalls);
         writer.Section("Task cost estimate");
-        writer.Field("Available estimated subtotal", total.TotalEstimatedCostUsd is { } estimated
+        writer.Field("Available estimated subtotal", total.AvailableEstimatedSubtotalUsd is { } available
+            ? FormatCost(available)
+            : "unavailable");
+        writer.Field("Complete estimated subtotal", total.CompleteEstimatedSubtotalUsd is { } complete
+            ? FormatCost(complete)
+            : "unavailable");
+        writer.Field("Partial conservative estimated subtotal", total.PartialEstimatedSubtotalUsd is { } partial
+            ? FormatCost(partial)
+            : "unavailable");
+        writer.Field("Combined available estimated subtotal", total.AvailableEstimatedSubtotalUsd is { } estimated
             ? FormatCost(estimated)
             : "unavailable");
         writer.Body(task.ModelCalls.Count == 0
@@ -133,7 +144,11 @@ public sealed class TaskPdfExporter(
             resolved.AvailableCallCount,
             resolved.UnavailableCallCount,
             calls.Count - displayedCalls,
-            resolved.Overflowed);
+            resolved.Overflowed,
+            resolved.CompleteEstimatedSubtotalUsd,
+            resolved.PartialEstimatedSubtotalUsd,
+            resolved.AvailableEstimatedSubtotalUsd,
+            resolved.HasPartialEstimates);
     }
 
     private static string CostSummary(BoundedTaskCost total)
@@ -147,7 +162,7 @@ public sealed class TaskPdfExporter(
         }
         if (total.AvailableCallCount == 0 && total.UnavailableCallCount > 0)
             return "Estimated cost is unavailable for all displayed model calls.";
-        if (total.UnavailableCallCount > 0 || total.OmittedCallCount > 0)
+        if (total.HasPartialEstimates || total.UnavailableCallCount > 0 || total.OmittedCallCount > 0)
             return $"This is a partial estimate. {total.UnavailableCallCount} displayed model call(s) had unavailable cost; " +
                    $"{total.OmittedCallCount} additional model call(s) were omitted by the report limit.";
         return "All recorded model calls have an available estimated cost.";
@@ -158,7 +173,11 @@ public sealed class TaskPdfExporter(
         int AvailableCallCount,
         int UnavailableCallCount,
         int OmittedCallCount,
-        bool Overflowed);
+        bool Overflowed,
+        decimal? CompleteEstimatedSubtotalUsd,
+        decimal? PartialEstimatedSubtotalUsd,
+        decimal? AvailableEstimatedSubtotalUsd,
+        bool HasPartialEstimates);
 
     private static void WriteChronology(FlowWriter writer, EngineeringTask task)
     {
@@ -173,6 +192,85 @@ public sealed class TaskPdfExporter(
         var approved = task.ImplementationRevisions.SingleOrDefault(revision =>
             revision.RevisionId == task.ApprovedImplementationRevisionId);
         writer.Field("Implementation approved", RecordedAt(approved?.ApprovedAt));
+        writer.Field("Verification plan generated", RecordedAt(task.VerificationPlans.LastOrDefault()?.GeneratedAt));
+        var currentAttempt = task.CurrentVerificationAttemptId is { } attemptId
+            ? task.ManualVerificationAttempts.SingleOrDefault(attempt => attempt.AttemptId == attemptId)
+            : null;
+        writer.Field("Manual verification started", RecordedAt(currentAttempt?.StartedAt));
+        writer.Field("Manual verification completed", RecordedAt(currentAttempt?.CompletedAt));
+        writer.Field("Ready for delivery", task.Status == WorkflowStatus.ReadyForDelivery ? "recorded" : "not recorded");
+    }
+
+    private static void WriteVerificationChronology(FlowWriter writer, EngineeringTask task)
+    {
+        writer.Section("Manual verification chronology");
+        writer.Banner(VerificationTrustLabels.ManualNotExecuted);
+        foreach (var generation in task.VerificationPlanGenerationAttempts.Take(18))
+        {
+            writer.Subsection($"Verification-plan generation — {generation.Status}");
+            writer.Field("Started at", FormatTimestamp(generation.StartedAt));
+            writer.Field("Lease expires at", FormatTimestamp(generation.LeaseExpiresAt));
+            writer.Field("Logical model-call attempts", generation.LogicalCallCount.ToString(CultureInfo.InvariantCulture));
+            writer.Field("Definite physical requests", generation.PhysicalRequestCount.ToString(CultureInfo.InvariantCulture));
+            writer.Field("Possibly dispatched requests", generation.PossiblyDispatchedRequestCount.ToString(CultureInfo.InvariantCulture));
+            var definitelyUndispatched = generation.ModelCallIds.Count(callId => task.ModelCalls.Any(call =>
+                call.Id == callId && call.VerificationDispatchDisposition ==
+                    VerificationCallDispatchDisposition.DefinitelyNotDispatched));
+            writer.Field("Definitely undispatched attempts", definitelyUndispatched.ToString(CultureInfo.InvariantCulture));
+            foreach (var response in generation.ProviderResponses.Take(2))
+            {
+                writer.Field("Provider response ID", response.ProviderResponseId ?? "unavailable");
+                writer.Field("Provider request ID", response.ProviderRequestId ?? "unavailable");
+                writer.Field("Provider response status", response.Status.ToString());
+                writer.Field("Provider HTTP status", response.HttpStatusCode.ToString(CultureInfo.InvariantCulture));
+                writer.Field("Logical call started", FormatTimestamp(response.StartedAt));
+                writer.Field("Provider response received", FormatTimestamp(response.ReceivedAt));
+                writer.Field("Provider usage", response.EffectiveUsageAvailability.ToString());
+                writer.Field("Input tokens", FormatTokens(response.InputTokens));
+                writer.Field("Cached-input tokens", FormatTokens(response.CachedInputTokens));
+                writer.Field("Output tokens", FormatTokens(response.OutputTokens));
+                writer.Field("Reasoning tokens", FormatTokens(response.ReasoningTokens));
+            }
+        }
+        foreach (var plan in task.VerificationPlans.Take(6))
+        {
+            writer.Subsection($"Verification plan {plan.PlanNumber} — {VerificationTrustLabels.ForgeGenerated}");
+            writer.Field("Status", plan.Status.ToString());
+            writer.Field("Implementation revision", plan.ImplementationRevisionId.ToString("D"));
+            writer.Field("Implementation result fingerprint", plan.ImplementationResultFingerprint);
+            writer.Field("Plan fingerprint", plan.PlanFingerprint);
+            writer.Field("Summary", plan.Summary);
+            writer.Field("Required cases", plan.TestCases.Count(testCase => testCase.IsRequired).ToString(CultureInfo.InvariantCulture));
+        }
+        foreach (var attempt in task.ManualVerificationAttempts.Take(18))
+        {
+            writer.Subsection($"Manual attempt {attempt.AttemptNumber} — {VerificationTrustLabels.UserReported}");
+            writer.Field("Status", attempt.Status.ToString());
+            writer.Field("Plan fingerprint", attempt.VerificationPlanFingerprint);
+            writer.Field("Started", FormatTimestamp(attempt.StartedAt));
+            writer.Field("Completed", attempt.CompletedAt is { } completed ? FormatTimestamp(completed) : "not recorded");
+            writer.Field("Human confirmation", attempt.CompletionConfirmation == true ? "confirmed by user" : "not recorded");
+            writer.Field("Summary", attempt.Summary ?? "not recorded");
+            foreach (var result in attempt.ResultRevisions.Take(120))
+            {
+                writer.Body($"Case {result.TestCaseId:D}, revision {result.RevisionNumber}: {result.Result} — {VerificationTrustLabels.UserReported}");
+                if (!string.IsNullOrWhiteSpace(result.ActualResult)) writer.Field("Actual result", result.ActualResult);
+                if (!string.IsNullOrWhiteSpace(result.Notes)) writer.Field("Notes", result.Notes);
+                foreach (var evidence in result.EvidenceDescriptions) writer.Field("Evidence description", evidence);
+                if (result.FailureDetails is { } failure)
+                {
+                    writer.Field("Failure title", failure.Title);
+                    writer.Field("Expected", failure.ExpectedResult);
+                    writer.Field("Actual", failure.ActualResult);
+                    writer.Field("Severity", failure.Severity.ToString());
+                    if (!string.IsNullOrWhiteSpace(failure.ErrorMessage)) writer.Field("Reported error", failure.ErrorMessage);
+                }
+            }
+        }
+        if (task.Status == WorkflowStatus.ReadyForDelivery)
+            writer.Body("Manual verification passed — user reported. ReadyForDelivery does not mean committed, pushed, or submitted as a pull request.");
+        else if (task.Status == WorkflowStatus.ManualVerificationFailed)
+            writer.Body("Manual verification failed or was blocked — user reported. Failure analysis and correction are not available in this slice.");
     }
 
     private static void WriteImplementationRevisionChronology(FlowWriter writer, EngineeringTask task)
@@ -699,6 +797,10 @@ public sealed class TaskPdfExporter(
     {
         var resolved = costResolver.Resolve(call);
         var usageAvailable = ModelCallUsageEvidence.IsAvailable(call);
+        var verificationUsage = call.Stage == ModelCallStage.VerificationPlanning
+            ? call.ProviderUsageAvailability ?? VerificationUsage.Classify(call.InputTokens,
+                call.CachedInputTokens, call.OutputTokens, call.ReasoningTokens)
+            : (VerificationUsageAvailability?)null;
         writer.Subsection($"Call {number}: {call.Stage} / {call.Model}");
         writer.Field("Provider", call.Provider);
         writer.Field("Reasoning effort", call.ReasoningEffort);
@@ -707,14 +809,29 @@ public sealed class TaskPdfExporter(
         writer.Field("Client call ID", call.Id.ToString("D"));
         writer.Field("Provider request ID", call.ProviderRequestId ?? "unavailable");
         writer.Field("Provider response ID", call.ProviderResponseId ?? "unavailable");
+        if (call.Stage == ModelCallStage.VerificationPlanning)
+        {
+            writer.Field("Dispatch disposition", call.VerificationDispatchDisposition?.ToString() ?? "legacy or unavailable");
+            writer.Field("Provider HTTP status", call.ProviderHttpStatusCode?.ToString(CultureInfo.InvariantCulture) ?? "unavailable");
+            writer.Field("Provider usage reported", call.ProviderUsageAvailable switch
+            {
+                true => "yes",
+                false => "no or incomplete",
+                _ => "legacy or unavailable"
+            });
+            writer.Field("Verification usage completeness", verificationUsage!.Value.ToString());
+        }
         writer.Field("Result", call.Succeeded ? "succeeded" : $"failed ({call.FailureCategory ?? "unspecified"})");
-        if (!usageAvailable) writer.Body("Usage unavailable");
-        writer.Field("Total input tokens", FormatTokens(usageAvailable ? call.InputTokens : null));
-        writer.Field("Cached-input tokens", FormatTokens(usageAvailable ? call.CachedInputTokens : null));
+        if (verificationUsage == VerificationUsageAvailability.Partial) writer.Body("Usage partial; unavailable fields remain omitted.");
+        else if (!usageAvailable) writer.Body("Usage unavailable");
+        var preserveIndividualUsage = verificationUsage is VerificationUsageAvailability.Partial or VerificationUsageAvailability.Complete;
+        writer.Field("Total input tokens", FormatTokens(usageAvailable || preserveIndividualUsage ? call.InputTokens : null));
+        writer.Field("Cached-input tokens", FormatTokens(usageAvailable || preserveIndividualUsage ? call.CachedInputTokens : null));
         writer.Field("Uncached-input tokens", FormatTokens(resolved.UncachedInputTokens));
-        writer.Field("Output tokens", FormatTokens(usageAvailable ? call.OutputTokens : null));
-        writer.Field("Reasoning tokens", FormatTokens(usageAvailable ? call.ReasoningTokens : null));
-        writer.Field("Estimated cost", resolved.EstimatedCostUsd is { } cost ? FormatCost(cost) : "unavailable");
+        writer.Field("Output tokens", FormatTokens(usageAvailable || preserveIndividualUsage ? call.OutputTokens : null));
+        writer.Field("Reasoning tokens", FormatTokens(usageAvailable || preserveIndividualUsage ? call.ReasoningTokens : null));
+        writer.Field(resolved.IsPartialEstimate ? "Conservative partial estimated cost" : "Estimated cost",
+            resolved.EstimatedCostUsd is { } cost ? FormatCost(cost) : "unavailable");
         writer.Field("Pricing provenance", resolved.ProvenanceLabel);
         if (call.PricingSnapshot is { } snapshot)
         {

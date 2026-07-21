@@ -9,7 +9,10 @@ public sealed record EngineeringTaskSummaryResponse(
     DateTimeOffset CreatedAt,
     DateTimeOffset UpdatedAt,
     string Repository,
-    string OriginalRequirementPreview)
+    string OriginalRequirementPreview,
+    string? VerificationStatus,
+    string? VerificationProgressSummary,
+    bool ReadyForDelivery)
 {
     public static EngineeringTaskSummaryResponse FromDomain(EngineeringTaskSummary summary) => new(
         summary.Id,
@@ -17,7 +20,24 @@ public sealed record EngineeringTaskSummaryResponse(
         summary.CreatedAt,
         summary.UpdatedAt,
         RepositoryDisplayIdentifier.Create(summary.Repository),
-        summary.OriginalRequirementPreview);
+        summary.OriginalRequirementPreview,
+        summary.Status switch
+        {
+            WorkflowStatus.VerificationPlanning => "Planning",
+            WorkflowStatus.AwaitingManualVerification => "Manual verification",
+            WorkflowStatus.ManualVerificationFailed => "Failed",
+            WorkflowStatus.ReadyForDelivery => "Passed",
+            _ => null
+        },
+        summary.Status switch
+        {
+            WorkflowStatus.VerificationPlanning => "Verification plan generation requires completion or explicit retry.",
+            WorkflowStatus.AwaitingManualVerification => "Manual outcomes are awaiting completion.",
+            WorkflowStatus.ManualVerificationFailed => "Manual verification was completed as failed.",
+            WorkflowStatus.ReadyForDelivery => "Manual verification was completed as passed.",
+            _ => null
+        },
+        summary.Status == WorkflowStatus.ReadyForDelivery);
 }
 
 public sealed record ClarificationAnswerResponse(string Question, string Answer, DateTimeOffset AnsweredAt);
@@ -50,7 +70,12 @@ public sealed record ModelCallResponse(
     bool HasStoredPricingSnapshot,
     ModelPricingSnapshotResponse? StoredPricingSnapshot,
     string? FailureCategory,
-    string? ProviderRequestId);
+    string? ProviderRequestId,
+    VerificationCallDispatchDisposition? VerificationDispatchDisposition,
+    int? ProviderHttpStatusCode,
+    bool? ProviderUsageAvailable,
+    VerificationUsageAvailability? ProviderUsageAvailability,
+    bool IsPartialEstimate);
 
 public sealed record ModelPricingSnapshotResponse(
     decimal InputPerMillionUsd,
@@ -75,6 +100,15 @@ public sealed record ModelTelemetryResponse(
     decimal? TotalEstimatedCostUsd,
     int CostUnavailableCallCount,
     bool IsPartialEstimate,
+    int VerificationLogicalAttemptCount,
+    int VerificationPhysicalRequestCount,
+    int VerificationPossiblyDispatchedRequestCount,
+    int VerificationDefinitelyUndispatchedAttemptCount,
+    decimal? CompleteEstimatedSubtotalUsd,
+    decimal? PartialEstimatedSubtotalUsd,
+    decimal? AvailableEstimatedSubtotalUsd,
+    bool HasPartialEstimates,
+    int PossiblyDispatchedUnavailableEstimatedCostCallCount,
     IReadOnlyList<ModelCallResponse> Calls);
 
 public sealed record RepositoryFileResponse(
@@ -188,6 +222,76 @@ public sealed record ImplementationRevisionResponse(
     bool IsCurrent,
     bool IsApproved);
 
+public sealed record VerificationTestStepResponse(
+    int Order, string Instruction, string? ApprovedValidationCommandId, string ExpectedObservation);
+
+public sealed record VerificationTestCaseResponse(
+    Guid TestCaseId, int Order, string Title, string Objective, VerificationTestCategory Category,
+    bool IsRequired, IReadOnlyList<string> Preconditions, IReadOnlyList<string> TestData,
+    IReadOnlyList<VerificationTestStepResponse> OrderedSteps, string ExpectedResult,
+    IReadOnlyList<string> NegativeOrEdgeCases, IReadOnlyList<string> RegressionScope,
+    IReadOnlyList<string> EvidenceRequirements, IReadOnlyList<string> SafetyNotes);
+
+public sealed record VerificationPlanResponse(
+    Guid PlanId, int PlanNumber, Guid ImplementationRevisionId, string ImplementationResultFingerprint,
+    string ApprovedRequirementFingerprint, string ApprovedPlanFingerprint, string GenerationContextFingerprint,
+    DateTimeOffset GeneratedAt, VerificationPlanSource Source, string? Model, string? ReasoningEffort,
+    string Summary, string Scope, IReadOnlyList<string> Preconditions,
+    IReadOnlyList<VerificationTestCaseResponse> TestCases, IReadOnlyList<string> Risks,
+    IReadOnlyList<string> Limitations, IReadOnlyList<string> EvidenceGuidance,
+    string PlanFingerprint, VerificationPlanStatus Status, string TrustLabel, string ExecutionLabel);
+
+public sealed record VerificationFailureDetailsResponse(
+    string Title, string ExpectedResult, string ActualResult, IReadOnlyList<string> ReproductionSteps,
+    IReadOnlyList<string> EnvironmentNotes, string? ErrorMessage,
+    IReadOnlyList<string> EvidenceDescriptions, VerificationFailureSeverity Severity);
+
+public sealed record ManualCaseResultRevisionResponse(
+    Guid ResultRevisionId, int RevisionNumber, Guid TestCaseId, ManualVerificationCaseResult Result,
+    DateTimeOffset RecordedAt, string? Notes, string? ActualResult,
+    IReadOnlyList<string> EvidenceDescriptions, string? NotApplicableReason,
+    VerificationFailureDetailsResponse? FailureDetails, Guid? SupersedesResultRevisionId, string TrustLabel);
+
+public sealed record ManualVerificationAttemptResponse(
+    Guid AttemptId, int AttemptNumber, Guid VerificationPlanId, string VerificationPlanFingerprint,
+    Guid ImplementationRevisionId, string ImplementationResultFingerprint, DateTimeOffset StartedAt,
+    DateTimeOffset? CompletedAt, ManualVerificationAttemptStatus Status,
+    IReadOnlyList<ManualCaseResultRevisionResponse> ResultRevisions,
+    IReadOnlyList<ManualCaseResultRevisionResponse> CurrentCaseResults,
+    bool? CompletionConfirmation, string? Summary, string? AttemptFingerprint,
+    DateTimeOffset? PassedAt, DateTimeOffset? FailedAt, string TrustLabel);
+
+public sealed record VerificationEligibilityResponse(
+    bool CanGenerateVerificationPlan,
+    bool CanStartVerificationAttempt,
+    bool CanRecordVerificationResult,
+    bool CanCompleteVerificationPassed,
+    bool CanCompleteVerificationFailed,
+    bool ReadyForDelivery,
+    string? IneligibilityReason,
+    bool IsInitialVerificationPlanGeneration,
+    bool CanRetryVerificationPlanGeneration,
+    VerificationGenerationRuntimeStatus? VerificationGenerationStatus,
+    string? VerificationGenerationStatusMessage);
+
+public sealed record VerificationPlanGenerationAttemptResponse(
+    Guid CommandId, DateTimeOffset StartedAt, DateTimeOffset LeaseExpiresAt, DateTimeOffset? CompletedAt,
+    VerificationGenerationAttemptStatus Status, string? FailureCategory,
+    string? FailureMessage, Guid? ResultPlanId, IReadOnlyList<Guid> ModelCallIds,
+    Guid? LastLogicalCallId, int LogicalCallCount, int PhysicalRequestCount,
+    int PossiblyDispatchedRequestCount, IReadOnlyList<VerificationLogicalCallResponse> LogicalCalls,
+    IReadOnlyList<VerificationProviderResponseTelemetryResponse> ProviderResponses);
+
+public sealed record VerificationLogicalCallResponse(Guid LogicalCallId, DateTimeOffset StartedAt);
+
+public sealed record VerificationProviderResponseTelemetryResponse(
+    Guid LogicalCallId, DateTimeOffset StartedAt, DateTimeOffset ReceivedAt,
+    string? ProviderResponseId, string? ProviderRequestId,
+    VerificationProviderResponseStatus Status, string? IncompleteReason,
+    VerificationUsageAvailability UsageAvailability,
+    int? InputTokens, int? CachedInputTokens, int? OutputTokens, int? ReasoningTokens,
+    int HttpStatusCode, VerificationCallDispatchDisposition DispatchDisposition);
+
 public sealed record EngineeringTaskResponse(
     Guid Id,
     string Repository,
@@ -222,7 +326,13 @@ public sealed record EngineeringTaskResponse(
     Guid? ActiveImplementationRevisionId,
     Guid? ApprovedImplementationRevisionId,
     IReadOnlyList<ImplementationRevisionResponse> ImplementationRevisions,
-    ModelTelemetryResponse Telemetry)
+    ModelTelemetryResponse Telemetry,
+    Guid? CurrentVerificationPlanId,
+    Guid? CurrentVerificationAttemptId,
+    IReadOnlyList<VerificationPlanResponse> VerificationPlans,
+    IReadOnlyList<VerificationPlanGenerationAttemptResponse> VerificationPlanGenerationAttempts,
+    IReadOnlyList<ManualVerificationAttemptResponse> ManualVerificationAttempts,
+    VerificationEligibilityResponse VerificationEligibility)
 {
     public static EngineeringTaskResponse FromDomain(
         EngineeringTask task,
@@ -232,7 +342,13 @@ public sealed record EngineeringTaskResponse(
         var calls = task.ModelCalls.Select(call =>
         {
             var resolved = costResolver.Resolve(call);
-            var usageAvailable = ModelCallUsageEvidence.IsAvailable(call);
+            var verificationUsage = call.Stage == ModelCallStage.VerificationPlanning
+                ? call.ProviderUsageAvailability ?? VerificationUsage.Classify(call.InputTokens,
+                    call.CachedInputTokens, call.OutputTokens, call.ReasoningTokens)
+                : (VerificationUsageAvailability?)null;
+            var usageAvailable = verificationUsage is { } verificationState
+                ? verificationState != VerificationUsageAvailability.Unavailable
+                : ModelCallUsageEvidence.IsAvailable(call);
             var snapshot = call.PricingSnapshot is null ? null : new ModelPricingSnapshotResponse(
                 call.PricingSnapshot.InputPerMillionUsd,
                 call.PricingSnapshot.CachedInputPerMillionUsd,
@@ -248,13 +364,15 @@ public sealed record EngineeringTaskResponse(
                 usageAvailable ? call.ReasoningTokens : null,
                 usageAvailable ? resolved.EstimatedCostUsd : null,
                 usageAvailable ? resolved.ProvenanceLabel : "cost unavailable",
-                resolved.HasStoredPricingSnapshot, snapshot, call.FailureCategory, call.ProviderRequestId);
+                resolved.HasStoredPricingSnapshot, snapshot, call.FailureCategory, call.ProviderRequestId,
+                call.VerificationDispatchDisposition, call.ProviderHttpStatusCode, call.ProviderUsageAvailable,
+                verificationUsage, resolved.IsPartialEstimate);
         }).ToList();
-        var validUsageCalls = task.ModelCalls.Where(ModelCallUsageEvidence.IsAvailable).ToArray();
-        var totalCost = costResolver.ResolveTotal(validUsageCalls);
+        var totalCost = costResolver.ResolveTotal(task.ModelCalls);
         var usageUnavailableCallCount = calls.Count(call => !call.UsageAvailable);
-        var costUnavailableCallCount = usageUnavailableCallCount + totalCost.UnavailableCallCount;
-        var usageAvailability = calls.Count == 0 || usageUnavailableCallCount == 0
+        var costUnavailableCallCount = calls.Count(call => call.EstimatedCostUsd is null);
+        var hasPartialUsage = calls.Any(call => call.ProviderUsageAvailability == VerificationUsageAvailability.Partial);
+        var usageAvailability = calls.Count == 0 || usageUnavailableCallCount == 0 && !hasPartialUsage
             ? ModelUsageAvailability.Complete
             : usageUnavailableCallCount == calls.Count
                 ? ModelUsageAvailability.Unavailable
@@ -272,11 +390,22 @@ public sealed record EngineeringTaskResponse(
             completeUsage && calls.All(call => call.ReasoningTokens is not null)
                 ? calls.Sum(call => (long)call.ReasoningTokens!.Value)
                 : null,
-            completeUsage && costUnavailableCallCount == 0
+            costUnavailableCallCount == 0 && !totalCost.HasPartialEstimates
                 ? totalCost.TotalEstimatedCostUsd
                 : null,
             costUnavailableCallCount,
-            costUnavailableCallCount > 0,
+            costUnavailableCallCount > 0 || usageAvailability != ModelUsageAvailability.Complete,
+            task.VerificationPlanGenerationAttempts.Sum(attempt => attempt.LogicalCallCount),
+            task.VerificationPlanGenerationAttempts.Sum(attempt => attempt.PhysicalRequestCount),
+            task.VerificationPlanGenerationAttempts.Sum(attempt => attempt.PossiblyDispatchedRequestCount),
+            task.ModelCalls.Count(call => call.Stage == ModelCallStage.VerificationPlanning &&
+                call.VerificationDispatchDisposition == VerificationCallDispatchDisposition.DefinitelyNotDispatched),
+            totalCost.CompleteEstimatedSubtotalUsd,
+            totalCost.PartialEstimatedSubtotalUsd,
+            totalCost.AvailableEstimatedSubtotalUsd,
+            totalCost.HasPartialEstimates,
+            calls.Count(call => call.VerificationDispatchDisposition == VerificationCallDispatchDisposition.PossiblyDispatched &&
+                call.EstimatedCostUsd is null),
             calls);
 
         var snapshot = task.RepositorySnapshot is null ? null : new RepositorySnapshotResponse(
@@ -381,6 +510,63 @@ public sealed record EngineeringTaskResponse(
                 revision.ApprovedAt,
                 task.ActiveImplementationRevisionId == revision.RevisionId,
                 task.ApprovedImplementationRevisionId == revision.RevisionId)).ToArray();
+        var verificationPlans = task.VerificationPlans.Select(ToVerificationPlanResponse).ToArray();
+        var verificationAttempts = task.ManualVerificationAttempts.Select(attempt =>
+        {
+            var revisions = attempt.ResultRevisions.Select(ToManualResultResponse).ToArray();
+            var currentIds = VerificationFingerprint.CurrentResults(attempt)
+                .Select(result => result.ResultRevisionId).ToHashSet();
+            return new ManualVerificationAttemptResponse(
+                attempt.AttemptId, attempt.AttemptNumber, attempt.VerificationPlanId,
+                attempt.VerificationPlanFingerprint, attempt.ImplementationRevisionId,
+                attempt.ImplementationResultFingerprint, attempt.StartedAt, attempt.CompletedAt,
+                attempt.Status, revisions,
+                revisions.Where(result => currentIds.Contains(result.ResultRevisionId)).ToArray(),
+                attempt.CompletionConfirmation, attempt.Summary, attempt.AttemptFingerprint,
+                attempt.PassedAt, attempt.FailedAt, VerificationTrustLabels.UserReported);
+        }).ToArray();
+        var activeAttempt = task.CurrentVerificationAttemptId is { } activeAttemptId
+            ? task.ManualVerificationAttempts.SingleOrDefault(attempt => attempt.AttemptId == activeAttemptId)
+            : null;
+        var currentPlan = task.CurrentVerificationPlanId is { } currentPlanId
+            ? task.VerificationPlans.SingleOrDefault(plan => plan.PlanId == currentPlanId)
+            : null;
+        var bindingIsCurrent = currentPlan is not null && activeAttempt is not null &&
+                               activeAttempt.VerificationPlanId == currentPlan.PlanId &&
+                               string.Equals(activeAttempt.VerificationPlanFingerprint,
+                                   currentPlan.PlanFingerprint, StringComparison.Ordinal) &&
+                               activeAttempt.ImplementationRevisionId == currentPlan.ImplementationRevisionId &&
+                               string.Equals(activeAttempt.ImplementationResultFingerprint,
+                                   currentPlan.ImplementationResultFingerprint, StringComparison.Ordinal);
+        var canStart = task.Status == WorkflowStatus.AwaitingManualVerification &&
+                       currentPlan is { Status: VerificationPlanStatus.Current } && activeAttempt is null;
+        var canRecord = task.Status == WorkflowStatus.AwaitingManualVerification && bindingIsCurrent &&
+                        activeAttempt!.Status == ManualVerificationAttemptStatus.InProgress;
+        var canCompletePassed = canRecord && CanCompleteManualVerification(activeAttempt!, currentPlan!, passed: true);
+        var canCompleteFailed = canRecord && CanCompleteManualVerification(activeAttempt!, currentPlan!, passed: false);
+        var generation = VerificationGenerationProjection(task, DateTimeOffset.UtcNow);
+        var eligibility = new VerificationEligibilityResponse(
+            generation.CanGenerate,
+            canStart,
+            canRecord,
+            canCompletePassed,
+            canCompleteFailed,
+            task.Status == WorkflowStatus.ReadyForDelivery && bindingIsCurrent &&
+                activeAttempt!.Status == ManualVerificationAttemptStatus.CompletedPassed,
+            task.Status switch
+            {
+                WorkflowStatus.ImplementationApproved => null,
+                WorkflowStatus.VerificationPlanning => "A verification-plan generation attempt must be retried or completed.",
+                WorkflowStatus.AwaitingManualVerification when activeAttempt is null => null,
+                WorkflowStatus.AwaitingManualVerification => null,
+                WorkflowStatus.ManualVerificationFailed => "Manual verification was completed as failed. Analysis and correction are not available in this slice.",
+                WorkflowStatus.ReadyForDelivery => "Manual verification has been completed as passed.",
+                _ => "The approved implementation is not ready for manual verification."
+            },
+            generation.IsInitial,
+            generation.CanRetry,
+            generation.Status,
+            generation.Message);
 
         return new EngineeringTaskResponse(
             task.Id,
@@ -426,8 +612,129 @@ public sealed record EngineeringTaskResponse(
             task.ActiveImplementationRevisionId,
             task.ApprovedImplementationRevisionId,
             implementationRevisions,
-            telemetry);
+            telemetry,
+            task.CurrentVerificationPlanId,
+            task.CurrentVerificationAttemptId,
+            verificationPlans,
+            task.VerificationPlanGenerationAttempts.Select(attempt => new VerificationPlanGenerationAttemptResponse(
+                attempt.CommandId, attempt.StartedAt, attempt.LeaseExpiresAt, attempt.CompletedAt, attempt.Status,
+                attempt.FailureCategory is null ? null : SafeImplementationText(attempt.FailureCategory, "verification_failure"),
+                attempt.FailureMessage is null ? null : SafeImplementationText(attempt.FailureMessage,
+                    "Verification-plan generation failed safely."),
+                attempt.ResultPlanId, attempt.ModelCallIds, attempt.LastLogicalCallId,
+                attempt.LogicalCallCount, attempt.PhysicalRequestCount,
+                attempt.PossiblyDispatchedRequestCount, attempt.LogicalCalls!.Select(call =>
+                    new VerificationLogicalCallResponse(call.LogicalCallId, call.StartedAt)).ToArray(),
+                attempt.ProviderResponses.Select(response =>
+                    new VerificationProviderResponseTelemetryResponse(response.LogicalCallId, response.StartedAt,
+                        response.ReceivedAt,
+                        response.ProviderResponseId, response.ProviderRequestId, response.Status,
+                        response.IncompleteReason, response.EffectiveUsageAvailability, response.InputTokens,
+                        response.CachedInputTokens, response.OutputTokens, response.ReasoningTokens,
+                        response.HttpStatusCode, response.DispatchDisposition)).ToArray())).ToArray(),
+            verificationAttempts,
+            eligibility);
     }
+
+    private static bool CanCompleteManualVerification(
+        ManualVerificationAttempt attempt,
+        VerificationPlan plan,
+        bool passed)
+    {
+        var current = VerificationFingerprint.CurrentResults(attempt)
+            .ToDictionary(result => result.TestCaseId);
+        if (!passed)
+            return current.Values.Any(result =>
+                result.Result is ManualVerificationCaseResult.Failed or ManualVerificationCaseResult.Blocked &&
+                result.FailureDetails is not null);
+
+        if (current.Values.Any(result =>
+                result.Result is ManualVerificationCaseResult.Failed or ManualVerificationCaseResult.Blocked))
+            return false;
+        return plan.TestCases.Where(testCase => testCase.IsRequired).All(testCase =>
+            current.TryGetValue(testCase.TestCaseId, out var result) &&
+            result.Result is ManualVerificationCaseResult.Passed or ManualVerificationCaseResult.NotApplicable &&
+            (testCase.EvidenceRequirements.Count == 0 || result.EvidenceDescriptions.Count > 0));
+    }
+
+    private static (VerificationGenerationRuntimeStatus? Status, bool CanGenerate, bool IsInitial,
+        bool CanRetry, string? Message)
+        VerificationGenerationProjection(EngineeringTask task, DateTimeOffset now)
+    {
+        if (task.Status == WorkflowStatus.ImplementationApproved &&
+            task.VerificationPlanGenerationAttempts.Count == 0)
+            return (VerificationGenerationRuntimeStatus.NotStarted, true, true, false,
+                "Verification-plan generation is ready to start.");
+        if (task.Status != WorkflowStatus.VerificationPlanning ||
+            task.VerificationPlanGenerationAttempts.LastOrDefault() is not { } attempt)
+            return task.VerificationPlans.Count > 0
+                ? (VerificationGenerationRuntimeStatus.Completed, false, false, false,
+                    "Verification-plan generation completed.")
+                : (null, false, false, false, null);
+        var expired = now >= attempt.LeaseExpiresAt;
+        return attempt.Status switch
+        {
+            VerificationGenerationAttemptStatus.Prepared when expired =>
+                (VerificationGenerationRuntimeStatus.InterruptedBeforeDispatch, true, false, true,
+                    "The previous attempt ended before provider dispatch and is eligible for explicit retry."),
+            VerificationGenerationAttemptStatus.Prepared =>
+                (VerificationGenerationRuntimeStatus.Active, false, false, false,
+                    "Verification-plan generation is active. Reload later; Forge will not automatically redispatch."),
+            VerificationGenerationAttemptStatus.DispatchMayHaveStarted when expired =>
+                (VerificationGenerationRuntimeStatus.AmbiguousAfterDispatch, false, false, false,
+                    "The provider request may have been dispatched, but Forge could not safely complete the generation record. Retry is disabled to avoid a duplicate billable request. Forge does not know whether the ambiguous provider request was billed."),
+            VerificationGenerationAttemptStatus.DispatchMayHaveStarted =>
+                (VerificationGenerationRuntimeStatus.Active, false, false, false,
+                    "Verification-plan generation has an active dispatch lease. Forge will not automatically redispatch."),
+            VerificationGenerationAttemptStatus.ResponseReceived when expired =>
+                (VerificationGenerationRuntimeStatus.AmbiguousAfterDispatch, false, false, false,
+                    "A provider response was recorded, but Forge could not safely finish the generation record. Retry is disabled to avoid a duplicate billable request. Forge does not know whether the ambiguous provider request was billed."),
+            VerificationGenerationAttemptStatus.ResponseReceived =>
+                (VerificationGenerationRuntimeStatus.Active, false, false, false,
+                    "The provider response is recorded and Forge is finalizing the verification plan."),
+            VerificationGenerationAttemptStatus.FailedBeforeDispatch =>
+                (VerificationGenerationRuntimeStatus.FailedBeforeDispatch, true, false, true,
+                    "The request failed definitely before dispatch and is eligible for explicit retry."),
+            VerificationGenerationAttemptStatus.RetryableProviderResponse =>
+                (VerificationGenerationRuntimeStatus.RetryableProviderResponse, true, false, true,
+                    "The provider returned an explicit retryable response; an explicit retry is allowed."),
+            VerificationGenerationAttemptStatus.InterruptedBeforeDispatch =>
+                (VerificationGenerationRuntimeStatus.InterruptedBeforeDispatch, true, false, true,
+                    "The attempt ended before provider dispatch and is eligible for explicit retry."),
+            VerificationGenerationAttemptStatus.AmbiguousAfterDispatch =>
+                (VerificationGenerationRuntimeStatus.AmbiguousAfterDispatch, false, false, false,
+                    "The provider request may have been dispatched, but Forge could not safely complete the generation record. Retry is disabled to avoid a duplicate billable request. Forge does not know whether the ambiguous provider request was billed."),
+            VerificationGenerationAttemptStatus.Completed =>
+                (VerificationGenerationRuntimeStatus.Completed, false, false, false,
+                    "Verification-plan generation completed."),
+            _ => (VerificationGenerationRuntimeStatus.Active, false, false, false,
+                "Verification-plan generation is not retry eligible.")
+        };
+    }
+
+    private static VerificationPlanResponse ToVerificationPlanResponse(VerificationPlan plan) => new(
+        plan.PlanId, plan.PlanNumber, plan.ImplementationRevisionId, plan.ImplementationResultFingerprint,
+        plan.ApprovedRequirementFingerprint, plan.ApprovedPlanFingerprint, plan.GenerationContextFingerprint,
+        plan.GeneratedAt, plan.Source, plan.Model, plan.ReasoningEffort, plan.Summary, plan.Scope,
+        plan.Preconditions, plan.TestCases.Select(testCase => new VerificationTestCaseResponse(
+            testCase.TestCaseId, testCase.Order, testCase.Title, testCase.Objective, testCase.Category,
+            testCase.IsRequired, testCase.Preconditions, testCase.TestData,
+            testCase.OrderedSteps.Select(step => new VerificationTestStepResponse(
+                step.Order, step.Instruction, step.ApprovedValidationCommandId, step.ExpectedObservation)).ToArray(),
+            testCase.ExpectedResult, testCase.NegativeOrEdgeCases, testCase.RegressionScope,
+            testCase.EvidenceRequirements, testCase.SafetyNotes)).ToArray(),
+        plan.Risks, plan.Limitations, plan.EvidenceGuidance, plan.PlanFingerprint, plan.Status,
+        VerificationTrustLabels.ForgeGenerated, VerificationTrustLabels.ManualNotExecuted);
+
+    private static ManualCaseResultRevisionResponse ToManualResultResponse(ManualCaseResultRevision result) => new(
+        result.ResultRevisionId, result.RevisionNumber, result.TestCaseId, result.Result, result.RecordedAt,
+        result.Notes, result.ActualResult, result.EvidenceDescriptions, result.NotApplicableReason,
+        result.FailureDetails is null ? null : new VerificationFailureDetailsResponse(
+            result.FailureDetails.Title, result.FailureDetails.ExpectedResult, result.FailureDetails.ActualResult,
+            result.FailureDetails.ReproductionSteps, result.FailureDetails.EnvironmentNotes,
+            result.FailureDetails.ErrorMessage, result.FailureDetails.EvidenceDescriptions,
+            result.FailureDetails.Severity),
+        result.SupersedesResultRevisionId, VerificationTrustLabels.UserReported);
 
     private static string SafeImplementationText(string value, string fallback) =>
         SensitiveContentDetector.ContainsSensitiveValue(value) ? fallback : value;

@@ -58,6 +58,48 @@ public sealed class TaskPdfExporterTests
     }
 
     [Fact]
+    public void Verification_chronology_distinguishes_logical_physical_possible_and_undispatched_attempts()
+    {
+        var task = VerificationWorkflowTests.ApprovedImplementation();
+        var revision = task.ImplementationRevisions.Single(item => item.RevisionId == task.ApprovedImplementationRevisionId);
+        var first = new VerificationPlanGenerationCommand(Guid.NewGuid(), task.Id, task.RowVersion,
+            revision.RevisionId, revision.ResultFingerprint!);
+        task.BeginVerificationPlanGeneration(first, Now);
+        var firstCallId = Guid.NewGuid();
+        task.RecordVerificationGenerationCheckpoint(first.CommandId,
+            VerificationDispatchCheckpoint.DispatchMayHaveStarted, firstCallId, Now.AddSeconds(1));
+        var undispatchedCall = new ModelCallRecord(firstCallId, ModelCallStage.VerificationPlanning, "OpenAI",
+            "gpt-5.6-sol", "medium", Now.AddSeconds(1), Now.AddSeconds(2), false, null, null, null, null, null, null,
+            "verification_provider_error", null, null,
+            VerificationCallDispatchDisposition.DefinitelyNotDispatched, null, false);
+        task.RecordVerificationTransportFailure(first.CommandId, firstCallId,
+            VerificationDispatchCheckpoint.FailedBeforeDispatch, undispatchedCall,
+            VerificationCallDispatchDisposition.DefinitelyNotDispatched,
+            "The request failed definitely before dispatch.", Now.AddSeconds(2));
+
+        var second = new VerificationPlanGenerationCommand(Guid.NewGuid(), task.Id, task.RowVersion,
+            revision.RevisionId, revision.ResultFingerprint!);
+        task.BeginVerificationPlanGeneration(second, Now.AddSeconds(3));
+        var secondCallId = Guid.NewGuid();
+        task.RecordVerificationGenerationCheckpoint(second.CommandId,
+            VerificationDispatchCheckpoint.DispatchMayHaveStarted, secondCallId, Now.AddSeconds(4));
+        task.RecordVerificationProviderResponse(second.CommandId,
+            new VerificationProviderResponseTelemetry(secondCallId, Now.AddSeconds(4), Now.AddSeconds(5), "resp-safe", "req-safe",
+                VerificationProviderResponseStatus.Completed, null, false, null, null, null, null, 200,
+                VerificationCallDispatchDisposition.ResponseReceived), Now.AddSeconds(5));
+
+        var text = Extract(Exporter().Export(task));
+
+        Assert.Contains("Logical model-call attempts: 1", text);
+        Assert.Contains("Definite physical requests: 0", text);
+        Assert.Contains("Definite physical requests: 1", text);
+        Assert.Contains("Possibly dispatched requests: 0", text);
+        Assert.Contains("Definitely undispatched attempts: 1", text);
+        Assert.Contains("Provider response ID: resp-safe", text);
+        Assert.Contains("Provider usage: Unavailable", text);
+    }
+
+    [Fact]
     public void Non_empty_fully_priced_pdf_preserves_complete_estimate_wording()
     {
         var task = EngineeringTask.Create("C:/repository", "Export a task report.", Now);
@@ -295,6 +337,29 @@ public sealed class TaskPdfExporterTests
         Assert.Contains("This is a partial estimate. 1 displayed model call(s) had unavailable cost", text);
         Assert.Contains("Usage unavailable", text);
         Assert.DoesNotContain("Available estimated subtotal: $0", text);
+    }
+
+    [Fact]
+    public void Conservative_partial_usage_is_labelled_and_kept_separate_from_complete_subtotal()
+    {
+        var task = EngineeringTask.Create("C:/repository", "Render conservative partial usage.", Now);
+        task.RecordModelCall(new ModelCallRecord(
+            Guid.NewGuid(), ModelCallStage.VerificationPlanning, "OpenAI", "gpt-5.6-sol", "medium",
+            Now, Now.AddSeconds(1), true, "response", 12, null, 7, null, 0.00026m, null,
+            new ModelPricingSnapshot(10m, 2m, 20m), "request",
+            VerificationCallDispatchDisposition.ResponseReceived, 200, true,
+            VerificationUsageAvailability.Partial), Now);
+
+        var text = Extract(Exporter().Export(task));
+
+        Assert.Contains("Verification usage completeness: Partial", text);
+        Assert.Contains("Usage partial; unavailable fields remain omitted.", text);
+        Assert.Contains("Conservative partial estimated cost: $0.00026000 USD", text);
+        Assert.Contains("Complete estimated subtotal: unavailable", text);
+        Assert.Contains("Partial conservative estimated subtotal: $0.00026000 USD", text);
+        Assert.Contains("Available estimated subtotal: $0.00026000 USD", text);
+        Assert.Contains("stored pricing snapshot", text);
+        Assert.DoesNotContain("Estimated cost: $0.00026000 USD", text);
     }
 
     [Fact]

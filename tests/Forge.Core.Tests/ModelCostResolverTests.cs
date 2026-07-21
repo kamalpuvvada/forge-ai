@@ -102,6 +102,45 @@ public sealed class ModelCostResolverTests
     }
 
     [Fact]
+    public void Verification_partial_usage_with_unknown_cached_input_has_conservative_stored_snapshot_estimate()
+    {
+        var call = Call(1_000, null, 500, 999m, Snapshot) with
+        {
+            Stage = ModelCallStage.VerificationPlanning,
+            ProviderUsageAvailable = true,
+            ProviderUsageAvailability = VerificationUsageAvailability.Partial
+        };
+
+        var resolved = Resolver().Resolve(call);
+
+        Assert.Equal(0.02m, resolved.EstimatedCostUsd);
+        Assert.True(resolved.IsPartialEstimate);
+        Assert.Equal(ModelCostProvenance.StoredPricingSnapshot, resolved.Provenance);
+        Assert.Equal(1_000, resolved.UncachedInputTokens);
+    }
+
+    [Fact]
+    public void Cached_only_and_conflicting_reasoning_usage_do_not_produce_cost()
+    {
+        var cachedOnly = Call(null, 10, null, null, Snapshot) with
+        {
+            Stage = ModelCallStage.VerificationPlanning,
+            ProviderUsageAvailable = true,
+            ProviderUsageAvailability = VerificationUsageAvailability.Partial
+        };
+        var conflicting = Call(10, 0, 5, null, Snapshot) with
+        {
+            Stage = ModelCallStage.VerificationPlanning,
+            ReasoningTokens = 6,
+            ProviderUsageAvailable = true,
+            ProviderUsageAvailability = VerificationUsageAvailability.Partial
+        };
+
+        Assert.Null(Resolver().Resolve(cachedOnly).EstimatedCostUsd);
+        Assert.Null(Resolver().Resolve(conflicting).EstimatedCostUsd);
+    }
+
+    [Fact]
     public void Unknown_model_without_stored_estimate_is_unavailable()
     {
         var resolved = Resolver().Resolve(Call(100, 0, 10, null) with { Model = "unknown-model" });
@@ -122,6 +161,30 @@ public sealed class ModelCostResolverTests
         Assert.Equal(1, total.AvailableCallCount);
         Assert.Equal(1, total.UnavailableCallCount);
         Assert.True(total.IsPartial);
+    }
+
+    [Fact]
+    public void Total_separates_complete_partial_and_combined_available_subtotals_without_double_counting()
+    {
+        var partial = Call(1_000, null, 500, null, Snapshot) with
+        {
+            Stage = ModelCallStage.VerificationPlanning,
+            ProviderUsageAvailable = true,
+            ProviderUsageAvailability = VerificationUsageAvailability.Partial
+        };
+        var total = Resolver().ResolveTotal([
+            Call(1_000, 250, 500, null, Snapshot),
+            partial,
+            Call(null, null, null, null) with { Model = "unknown-model" }
+        ]);
+
+        Assert.Equal(0.018m, total.CompleteEstimatedSubtotalUsd);
+        Assert.Equal(0.02m, total.PartialEstimatedSubtotalUsd);
+        Assert.Equal(0.038m, total.AvailableEstimatedSubtotalUsd);
+        Assert.Equal(0.038m, total.TotalEstimatedCostUsd);
+        Assert.True(total.HasPartialEstimates);
+        Assert.Equal(2, total.AvailableCallCount);
+        Assert.Equal(1, total.UnavailableCallCount);
     }
 
     [Fact]

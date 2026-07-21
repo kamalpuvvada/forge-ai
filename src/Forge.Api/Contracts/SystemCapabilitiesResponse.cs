@@ -28,4 +28,11 @@ public sealed record SystemCapabilitiesResponse(
     bool SilentFallbackSupported,
     bool CommitAvailable,
     bool PushAvailable,
-    bool DeliveryPullRequestAvailable);
+    bool DeliveryPullRequestAvailable,
+    string VerificationPlanningProvider,
+    string VerificationPlanningModel,
+    string VerificationPlanningReasoningEffort,
+    bool VerificationPlanningConfigured,
+    bool ManualResultRecordingAvailable,
+    bool AutomatedValidationAvailable,
+    bool FailureAnalysisAvailable);

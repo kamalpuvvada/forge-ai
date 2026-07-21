@@ -17,7 +17,8 @@ public sealed record ModelCallCostResolution(
     decimal? UncachedInputCostUsd,
     decimal? CachedInputCostUsd,
     decimal? OutputCostUsd,
-    bool HasStoredPricingSnapshot)
+    bool HasStoredPricingSnapshot,
+    bool IsPartialEstimate = false)
 {
     public string ProvenanceLabel => Provenance switch
     {
@@ -32,7 +33,11 @@ public sealed record ModelTaskCostResolution(
     decimal? TotalEstimatedCostUsd,
     int AvailableCallCount,
     int UnavailableCallCount,
-    bool Overflowed)
+    bool Overflowed,
+    decimal? CompleteEstimatedSubtotalUsd = null,
+    decimal? PartialEstimatedSubtotalUsd = null,
+    decimal? AvailableEstimatedSubtotalUsd = null,
+    bool HasPartialEstimates = false)
 {
     public bool IsPartial => UnavailableCallCount > 0;
 }
@@ -44,13 +49,22 @@ public sealed class ModelCostResolver(ModelCostCalculator calculator)
     public ModelCallCostResolution Resolve(ModelCallRecord call)
     {
         ArgumentNullException.ThrowIfNull(call);
-        if (!ModelCallUsageEvidence.IsAvailable(call))
+        var verificationAvailability = call.Stage == ModelCallStage.VerificationPlanning
+            ? call.ProviderUsageAvailability ?? VerificationUsage.Classify(call.InputTokens,
+                call.CachedInputTokens, call.OutputTokens, call.ReasoningTokens)
+            : (VerificationUsageAvailability?)null;
+        if (!VerificationUsage.IsInternallyConsistent(call.InputTokens, call.CachedInputTokens,
+                call.OutputTokens, call.ReasoningTokens) ||
+            verificationAvailability == VerificationUsageAvailability.Unavailable ||
+            call.InputTokens is null || call.OutputTokens is null)
             return Unavailable(call.PricingSnapshot is not null);
+        var isPartialEstimate = call.CachedInputTokens is null;
 
         if (call.PricingSnapshot is not null)
         {
             if (TryCalculate(call.PricingSnapshot, call, out var storedBreakdown))
-                return FromBreakdown(storedBreakdown, ModelCostProvenance.StoredPricingSnapshot, true);
+                return FromBreakdown(storedBreakdown, ModelCostProvenance.StoredPricingSnapshot, true,
+                    isPartialEstimate);
             return Unavailable(true);
         }
 
@@ -64,13 +78,15 @@ public sealed class ModelCostResolver(ModelCostCalculator calculator)
                 null,
                 null,
                 null,
-                false);
+                false,
+                isPartialEstimate);
         }
 
         if (!string.IsNullOrWhiteSpace(call.Model) &&
             calculator.TryGetPricingSnapshot(call.Model, out var currentPricing) &&
             TryCalculate(currentPricing, call, out var currentBreakdown))
-            return FromBreakdown(currentBreakdown, ModelCostProvenance.ReestimatedUsingCurrentPricing, false);
+            return FromBreakdown(currentBreakdown, ModelCostProvenance.ReestimatedUsingCurrentPricing, false,
+                isPartialEstimate);
 
         return Unavailable(false);
     }
@@ -79,9 +95,14 @@ public sealed class ModelCostResolver(ModelCostCalculator calculator)
     {
         ArgumentNullException.ThrowIfNull(calls);
         decimal total = 0;
+        decimal completeSubtotal = 0;
+        decimal partialSubtotal = 0;
         var available = 0;
         var unavailable = 0;
         var overflowed = false;
+        var hasPartial = false;
+        var completeAvailable = 0;
+        var partialAvailable = 0;
         foreach (var call in calls)
         {
             var resolved = Resolve(call);
@@ -93,6 +114,17 @@ public sealed class ModelCostResolver(ModelCostCalculator calculator)
             try
             {
                 total = checked(total + cost);
+                if (resolved.IsPartialEstimate)
+                {
+                    partialSubtotal = checked(partialSubtotal + cost);
+                    hasPartial = true;
+                    partialAvailable++;
+                }
+                else
+                {
+                    completeSubtotal = checked(completeSubtotal + cost);
+                    completeAvailable++;
+                }
                 available++;
             }
             catch (OverflowException)
@@ -105,26 +137,33 @@ public sealed class ModelCostResolver(ModelCostCalculator calculator)
             overflowed || available == 0 && unavailable > 0 ? null : total,
             available,
             unavailable,
-            overflowed);
+            overflowed,
+            overflowed || completeAvailable == 0 ? null : completeSubtotal,
+            overflowed || partialAvailable == 0 ? null : partialSubtotal,
+            overflowed || available == 0 && unavailable > 0 ? null : total,
+            hasPartial);
     }
 
     private ModelCallCostResolution FromBreakdown(
         ModelCostBreakdown breakdown,
         ModelCostProvenance provenance,
-        bool hasStoredSnapshot) => new(
+        bool hasStoredSnapshot,
+        bool isPartialEstimate) => new(
             breakdown.TotalCostUsd,
             provenance,
             breakdown.UncachedInputTokens,
             breakdown.UncachedInputCostUsd,
             breakdown.CachedInputCostUsd,
             breakdown.OutputCostUsd,
-            hasStoredSnapshot);
+            hasStoredSnapshot,
+            isPartialEstimate);
 
     private bool TryCalculate(ModelPricingSnapshot pricing, ModelCallRecord call, out ModelCostBreakdown breakdown)
     {
         breakdown = null!;
-        if (call.InputTokens is not { } input || call.CachedInputTokens is not { } cached || call.OutputTokens is not { } output)
+        if (call.InputTokens is not { } input || call.OutputTokens is not { } output)
             return false;
+        var cached = call.CachedInputTokens ?? 0;
         return calculator.TryCalculate(pricing, input, cached, output, out breakdown);
     }
 

@@ -18,6 +18,7 @@ public sealed class SystemController(ForgeAiOptions options, OpenAIConfiguration
         var planningConfigured = isFake || isOpenAi && options.IsPlanningConfigurationComplete(configurationState.HasApiKey);
         var openAiImplementationAvailable = isOpenAi && options.IsImplementationConfigurationComplete(configurationState.HasApiKey);
         var implementationConfigured = isFake || openAiImplementationAvailable;
+        var verificationConfigured = isFake || isOpenAi && options.IsVerificationPlanningConfigurationComplete(configurationState.HasApiKey);
         var provider = isFake ? "Fake" : isOpenAi ? "OpenAI" : "Unavailable";
         return Ok(new SystemCapabilitiesResponse(
             options.Mode,
@@ -46,6 +47,13 @@ public sealed class SystemController(ForgeAiOptions options, OpenAIConfiguration
             openAiImplementationAvailable,
             false,
             false,
+            false,
+            false,
+            provider,
+            options.VerificationPlanningModel,
+            options.VerificationPlanningReasoningEffort,
+            verificationConfigured,
+            true,
             false,
             false));
     }
