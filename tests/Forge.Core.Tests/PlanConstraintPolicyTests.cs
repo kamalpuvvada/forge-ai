@@ -21,6 +21,70 @@ public sealed class PlanConstraintPolicyTests
         Assert.Equal(ExpectedPaths, Assert.Single(plan.RequirementCoverage).AffectedPaths);
     }
 
+    [Fact]
+    public async Task Fake_plan_resolves_one_imperative_mutation_path_and_keeps_three_files_evidence_only()
+    {
+        var context = Context(OneFileSmokeRequirement());
+
+        var plan = (await new FakePlanningEngine().CreatePlanAsync(context)).Plan;
+
+        var file = Assert.Single(plan.AffectedFiles);
+        Assert.Equal("src/GreetingService.cs", file.Path);
+        Assert.Equal(PlannedFileAction.Modify, file.Action);
+        Assert.All(plan.Steps, step => Assert.All(step.AffectedPaths,
+            path => Assert.Equal("src/GreetingService.cs", path)));
+        Assert.Equal(["src/GreetingService.cs"], Assert.Single(plan.RequirementCoverage).AffectedPaths);
+        Assert.Empty(plan.ProposedValidationCommands);
+        Assert.Contains(plan.Steps, step => step.Description.Contains("bounded diff", StringComparison.OrdinalIgnoreCase));
+        Assert.DoesNotContain(PlanText(plan), value => new[] { "ManualTarget.csproj", "config/settings.json", "README.md" }
+            .Any(path => value.Contains(path, StringComparison.OrdinalIgnoreCase)));
+    }
+
+    [Fact]
+    public async Task Latest_plan_correction_preserves_the_one_file_scope()
+    {
+        var initial = Context(OneFileSmokeRequirement());
+        var previous = (await new FakePlanningEngine().CreatePlanAsync(initial)).Plan;
+        var revision = new PlanRevisionNote(
+            "Modify only `src/GreetingService.cs`; `ManualTarget.csproj`, `config/settings.json`, and `README.md` are evidence-only.",
+            Now, previous.Title, previous.RepositoryFingerprint, previous);
+        var context = Context(OneFileSmokeRequirement(), revision, previous.AffectedFiles.Select(file => file.Path).ToArray());
+
+        var plan = (await new FakePlanningEngine().CreatePlanAsync(context)).Plan;
+
+        Assert.Equal("src/GreetingService.cs", Assert.Single(plan.AffectedFiles).Path);
+        Assert.Empty(plan.ProposedValidationCommands);
+    }
+
+    [Fact]
+    public async Task Latest_approved_requirement_overrides_an_earlier_validation_answer()
+    {
+        var context = Context(OneFileSmokeRequirement()) with
+        {
+            ClarificationAnswers = [new ClarificationAnswer("How should validation run?", "Run build and tests.", Now.AddMinutes(-1))]
+        };
+
+        var plan = (await new FakePlanningEngine().CreatePlanAsync(context)).Plan;
+
+        Assert.Empty(plan.ProposedValidationCommands);
+        Assert.Equal("src/GreetingService.cs", Assert.Single(plan.AffectedFiles).Path);
+    }
+
+    [Fact]
+    public async Task Imperative_two_file_scope_is_exact_and_case_duplicates_collapse()
+    {
+        var context = Context("""
+            Modify `src/GreetingService.cs` and `SRC/GreetingService.cs`.
+            Update `config/settings.json`.
+            """);
+
+        var plan = (await new FakePlanningEngine().CreatePlanAsync(context)).Plan;
+
+        Assert.Equal(new[] { "src/GreetingService.cs", "config/settings.json" },
+            plan.AffectedFiles.Select(file => file.Path));
+        Assert.All(plan.AffectedFiles, file => Assert.Equal(PlannedFileAction.Modify, file.Action));
+    }
+
     [Theory]
     [InlineData("Modify these existing files only:")]
     [InlineData("Modify only these three files:")]
@@ -53,7 +117,7 @@ public sealed class PlanConstraintPolicyTests
     [Fact]
     public async Task Fake_revision_replaces_previous_scope_and_removes_tests_and_repository_commands()
     {
-        var initialContext = Context("Update the selected repository files.");
+        var initialContext = Context(AllEvidenceRequirement());
         var previous = (await new FakePlanningEngine().CreatePlanAsync(initialContext)).Plan;
         Assert.Contains(previous.AffectedFiles, file => file.Path == "ManualTarget.csproj");
         Assert.NotEmpty(previous.ProposedValidationCommands);
@@ -260,15 +324,17 @@ public sealed class PlanConstraintPolicyTests
     }
 
     [Fact]
-    public async Task Ambiguous_file_mentions_do_not_become_hard_scope_constraints()
+    public async Task Ambiguous_file_mentions_fail_closed_without_evidence_mutation_fallback()
     {
         var context = Context("Consider files such as src/GreetingService.cs while deciding the implementation scope.");
 
         var constraints = PlanConstraintPolicy.Derive(context);
-        var plan = (await new FakePlanningEngine().CreatePlanAsync(context)).Plan;
+        var exception = await Assert.ThrowsAsync<PlanningException>(() =>
+            new FakePlanningEngine().CreatePlanAsync(context));
 
         Assert.Null(constraints.AuthoritativePaths);
-        Assert.Equal(4, plan.AffectedFiles.Count);
+        Assert.Equal("plan_constraint_violation", exception.Category);
+        Assert.Equal(PlanConstraintPolicy.ConstraintViolationMessage, exception.Message);
     }
 
     [Fact]
@@ -291,10 +357,10 @@ public sealed class PlanConstraintPolicyTests
     public async Task Candidate_trust_gate_rejects_excluded_path_outside_affected_files()
     {
         var previous = (await new FakePlanningEngine().CreatePlanAsync(
-            Context("Update the selected repository files."))).Plan;
+            Context(AllEvidenceRequirement()))).Plan;
         var correction = "Exclude ManualTarget.csproj.";
         var revision = new PlanRevisionNote(correction, Now, previous.Title, previous.RepositoryFingerprint, previous);
-        var context = Context("Update the selected repository files.", revision,
+        var context = Context(AllEvidenceRequirement(), revision,
             previous.AffectedFiles.Select(file => file.Path).ToArray());
         var candidate = previous with
         {
@@ -336,10 +402,10 @@ public sealed class PlanConstraintPolicyTests
     {
         const string excluded = "ManualTarget.csproj";
         var previous = (await new FakePlanningEngine().CreatePlanAsync(
-            Context("Update the selected repository files."))).Plan;
+            Context(AllEvidenceRequirement()))).Plan;
         var revision = new PlanRevisionNote($"Exclude {excluded}.", Now, previous.Title,
             previous.RepositoryFingerprint, previous);
-        var context = Context("Update the selected repository files.", revision,
+        var context = Context(AllEvidenceRequirement(), revision,
             previous.AffectedFiles.Select(file => file.Path).ToArray());
         var valid = (await new FakePlanningEngine().CreatePlanAsync(context)).Plan;
         var candidate = InjectExcludedPath(valid, field, excluded);
@@ -426,6 +492,24 @@ public sealed class PlanConstraintPolicyTests
         - README.md
         Do not add or update tests.
         Do not propose or run builds, tests, lint, restore or target-repository validation commands.
+        """;
+
+    private static string OneFileSmokeRequirement() => """
+        Update only `src/GreetingService.cs`.
+        Do not modify `ManualTarget.csproj`.
+        Do not modify `config/settings.json`.
+        Do not modify `README.md`.
+        Do not modify any other file.
+        Validation is manual source/diff review only.
+        No build, test, lint, application, staging, commit, push, or PR command.
+        """;
+
+    private static string AllEvidenceRequirement() => """
+        Modify only:
+        - src/GreetingService.cs
+        - config/settings.json
+        - README.md
+        - ManualTarget.csproj
         """;
 
     private static readonly string[] ExpectedPaths =

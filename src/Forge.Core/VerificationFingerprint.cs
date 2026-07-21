@@ -36,6 +36,35 @@ public static class VerificationFingerprint
         writer.WriteString("implementationRevisionId", context.ImplementationRevisionId);
         writer.WriteString("implementationResultFingerprint", context.ImplementationResultFingerprint);
         writer.WriteString("createdAt", context.CreatedAt.ToUniversalTime());
+        if (context.PreviousPlan is { } previous)
+        {
+            writer.WriteString("previousPlanId", previous.PlanId);
+            writer.WriteString("previousPlanFingerprint", previous.PlanFingerprint);
+        }
+        else writer.WriteNull("previousPlanId");
+        writer.WritePropertyName("previousFailureEvidence");
+        writer.WriteStartArray();
+        foreach (var result in context.PreviousFailureEvidence ?? [])
+        {
+            writer.WriteStartObject();
+            writer.WriteString("resultRevisionId", result.ResultRevisionId);
+            writer.WriteString("testCaseId", result.TestCaseId);
+            writer.WriteString("result", result.Result.ToString());
+            writer.WriteEndObject();
+        }
+        writer.WriteEndArray();
+        if (context.FailureAnalysis is { } analysis)
+        {
+            writer.WriteString("failureAnalysisId", analysis.AnalysisId);
+            writer.WriteString("failureAnalysisFingerprint", analysis.AnalysisFingerprint);
+        }
+        else writer.WriteNull("failureAnalysisId");
+        if (context.CorrectionProposal is { } proposal)
+        {
+            writer.WriteString("correctionProposalId", proposal.ProposalId);
+            writer.WriteString("correctionProposalFingerprint", proposal.ProposalFingerprint);
+        }
+        else writer.WriteNull("correctionProposalId");
         writer.WritePropertyName("commands");
         writer.WriteStartArray();
         foreach (var command in context.ApprovedValidationCommands)
@@ -133,6 +162,8 @@ public static class VerificationFingerprint
         if (plan.SupersedesPlanId is { } superseded) writer.WriteString("supersedesPlanId", superseded);
         else writer.WriteNull("supersedesPlanId");
         WriteNullable(writer, "regenerationReason", plan.RegenerationReason);
+        if (plan.InitialPlanLanguageOverrideApplied)
+            writer.WriteBoolean("initialPlanLanguageOverrideApplied", true);
         writer.WriteEndObject();
     });
 

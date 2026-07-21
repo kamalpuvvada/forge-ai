@@ -8,15 +8,23 @@ import { createRequirementCopier } from './requirementCopy'
 import type { RequirementCopyState } from './requirementCopy'
 import { TaskHistory } from './TaskHistory'
 import { VerificationPanel } from './VerificationPanel'
+import { CorrectionPanel } from './CorrectionPanel'
+import { DeliveryPanel } from './DeliveryPanel'
+import { UnifiedDiff } from './UnifiedDiff'
+
+type ActiveTaskAction = 'failure-analysis' | 'correction-approval' | 'correction-generation' |
+  'corrected-revision-approval' | 'replacement-verification-plan' | 'start-verification' |
+  'delivery-prepare' | 'delivery-approval' | 'delivery-execute' | 'delivery-reconcile'
+type ImplementationReviewTarget = { plan: VerificationPlan; revision: ImplementationRevision; result: ImplementationResult }
 import { isCaseFormValueValid } from './verificationForm'
 import type { CaseFormValue } from './verificationForm'
 import { TaskSelectionCoordinator, newTaskUrl, parseTaskSelection, taskUrl } from './taskNavigation'
-import type { EngineeringTask, EngineeringTaskSummary, ModelCall, ModelTelemetry, SystemCapabilities, VerificationTestCase, WorkflowStatus } from './types'
+import type { EngineeringTask, EngineeringTaskSummary, ImplementationResult, ImplementationRevision, ModelCall, ModelTelemetry, SystemCapabilities, VerificationPlan, VerificationTestCase, WorkflowStatus } from './types'
 import './App.css'
 import './implementation.css'
 
 const stages = ['Understand', 'Clarify', 'Confirm', 'Plan', 'Implement', 'Diff review', 'Validate', 'Review', 'Pull Request']
-const stageByStatus: Record<WorkflowStatus, number> = { Draft: 0, Clarifying: 1, RequirementSummaryReady: 2, AwaitingRequirementApproval: 2, ReadyForPlanning: 3, Planning: 3, AwaitingPlanApproval: 3, PlanApproved: 3, Implementing: 4, AwaitingImplementationReview: 5, ImplementationApproved: 5, VerificationPlanning: 6, AwaitingManualVerification: 6, ManualVerificationFailed: 6, ReadyForDelivery: 6, Validating: 6, Reviewing: 7, Completed: 8, Failed: 0 }
+const stageByStatus: Record<WorkflowStatus, number> = { Draft: 0, Clarifying: 1, RequirementSummaryReady: 2, AwaitingRequirementApproval: 2, ReadyForPlanning: 3, Planning: 3, AwaitingPlanApproval: 3, PlanApproved: 3, Implementing: 4, ImplementingCorrection: 4, CorrectionRecoveryRequired: 4, AwaitingImplementationReview: 5, ImplementationApproved: 5, VerificationPlanning: 6, AwaitingManualVerification: 6, ManualVerificationFailed: 6, FailureAnalysisPending: 6, FailureAnalysisRecoveryRequired: 6, AwaitingFailureResolution: 6, AwaitingCorrectionApproval: 6, CorrectionApproved: 6, ReadyForDelivery: 6, AwaitingDeliveryApproval: 7, Delivering: 7, PullRequestCreated: 8, DeliveryRecoveryRequired: 7, Validating: 6, Reviewing: 7, Completed: 8, Failed: 0 }
 
 function App() {
   const [repository, setRepository] = useState('')
@@ -36,6 +44,8 @@ function App() {
   const [capabilities, setCapabilities] = useState<SystemCapabilities | null>(null)
   const [capabilitiesUnavailable, setCapabilitiesUnavailable] = useState(false)
   const [busy, setBusy] = useState(false)
+  const [implementationReviewTarget, setImplementationReviewTarget] = useState<ImplementationReviewTarget | null>(null)
+  const [activeTaskAction, setActiveTaskAction] = useState<ActiveTaskAction | null>(null)
   const [planningProgress, setPlanningProgress] = useState<number | null>(null)
   const [planningFailure, setPlanningFailure] = useState<string | null>(null)
   const [planningSnapshotStale, setPlanningSnapshotStale] = useState(false)
@@ -59,7 +69,9 @@ function App() {
   const approvalCancelButton = useRef<HTMLButtonElement | null>(null)
   const approvalSubmissionActive = useRef(false)
   const verificationActionActive = useRef(false)
+  const taskActionActive = useRef(false)
   const currentTask = useRef<EngineeringTask | null>(null)
+  const implementationResultCache = useRef(new Map<string, ImplementationResult>())
   const currentBusy = useRef(false)
   currentTask.current = task
   currentBusy.current = busy
@@ -99,6 +111,9 @@ function App() {
   function resetTaskScopedUi() {
     clearCopyResetTimer()
     setBusy(false)
+    setActiveTaskAction(null)
+    taskActionActive.current = false
+    currentBusy.current = false
     setPlanningProgress(null)
     setPlanningFailure(null)
     setPlanningSnapshotStale(false)
@@ -112,6 +127,61 @@ function App() {
     setApprovalInFlight(false)
     approvalSubmissionActive.current = false
     setApprovalDialogOpen(false)
+    setImplementationReviewTarget(null)
+  }
+
+  function reviewCacheKey(taskId: string, revisionId: string, fingerprint: string) {
+    return `${taskId}:${revisionId}:${fingerprint}`
+  }
+
+  function rememberActiveImplementationResult(value: EngineeringTask) {
+    const revision = value.implementationRevisions.find(item => item.revisionId === value.activeImplementationRevisionId)
+    if (!value.implementationResult || !revision?.resultFingerprint || revision.baseCommitSha !== value.implementationResult.baseCommitSha) return
+    implementationResultCache.current.set(reviewCacheKey(value.id, revision.revisionId, revision.resultFingerprint), value.implementationResult)
+  }
+
+  function resolveImplementationReview(value: EngineeringTask, plan: VerificationPlan): ImplementationReviewTarget | null {
+    const revision = value.implementationRevisions.find(item => item.revisionId === plan.implementationRevisionId)
+    if (!revision?.resultFingerprint || revision.resultFingerprint !== plan.implementationResultFingerprint ||
+      revision.generationState !== 'Succeeded' || !['Approved', 'HistoricallyApproved'].includes(revision.reviewState)) return null
+    rememberActiveImplementationResult(value)
+    const result = implementationResultCache.current.get(reviewCacheKey(value.id, revision.revisionId, revision.resultFingerprint))
+    return result && result.baseCommitSha === revision.baseCommitSha ? { plan, revision, result } : null
+  }
+
+  function applyImplementationReviewLocation(value: EngineeringTask, search: string) {
+    const query = new URLSearchParams(search)
+    if (query.get('view') !== 'implementation') { setImplementationReviewTarget(null); return }
+    const plan = (value.verificationPlans ?? []).find(item => item.planId === query.get('plan'))
+    const target = plan && plan.implementationRevisionId === query.get('revision') &&
+      plan.implementationResultFingerprint === query.get('fingerprint') ? resolveImplementationReview(value, plan) : null
+    setImplementationReviewTarget(target)
+    if (!target) setError('The approved implementation diff is unavailable because its revision binding could not be verified.')
+  }
+
+  function openImplementationReview(plan: VerificationPlan) {
+    const value = currentTask.current
+    if (!value) return
+    const currentQuery = new URLSearchParams(window.location.search)
+    if (currentQuery.get('view') === 'implementation' && currentQuery.get('plan') === plan.planId &&
+      currentQuery.get('revision') === plan.implementationRevisionId &&
+      currentQuery.get('fingerprint') === plan.implementationResultFingerprint) return
+    const target = resolveImplementationReview(value, plan)
+    if (!target) { setError('The approved implementation diff is unavailable because its revision binding could not be verified.'); return }
+    if (implementationReviewTarget?.plan.planId === plan.planId) return
+    const query = new URLSearchParams({ task: value.id.toLowerCase(), view: 'implementation', plan: plan.planId,
+      revision: plan.implementationRevisionId, fingerprint: plan.implementationResultFingerprint })
+    window.history.pushState({ forgeImplementationReview: true }, '', `/?${query}`)
+    setError(null)
+    setImplementationReviewTarget(target)
+  }
+
+  function backToManualVerification() {
+    if (window.history.state?.forgeImplementationReview) window.history.back()
+    else {
+      window.history.replaceState(null, '', taskUrl(currentTask.current!.id))
+      setImplementationReviewTarget(null)
+    }
   }
 
   function captureTaskSelection(taskId: string) {
@@ -136,7 +206,9 @@ function App() {
       const loaded = await forgeApi.getTask(selection.id)
       if (!selectionCoordinator.current.matches(token)) return
       setTaskLoading(false)
+      rememberActiveImplementationResult(loaded)
       setTask(loaded)
+      applyImplementationReviewLocation(loaded, search)
     } catch (caught) {
       if (!selectionCoordinator.current.matches(token)) return
       setTaskLoading(false)
@@ -151,7 +223,15 @@ function App() {
 
   useEffect(() => {
     const coordinator = selectionCoordinator.current
-    const handleLocation = () => { void loadSelection(window.location.search) }
+    const handleLocation = () => {
+      const selection = parseTaskSelection(window.location.search)
+      const selected = currentTask.current
+      if (selection.kind === 'task' && selected?.id.toLowerCase() === selection.id) {
+        applyImplementationReviewLocation(selected, window.location.search)
+        return
+      }
+      void loadSelection(window.location.search)
+    }
     handleLocation()
     window.addEventListener('popstate', handleLocation)
     return () => {
@@ -197,10 +277,14 @@ function App() {
     approvalCancelButton.current?.focus()
   }, [approvalDialogOpen])
 
-  async function runTaskAction(taskId: string, action: () => Promise<EngineeringTask>, onSuccess?: () => void) {
+  async function runTaskAction(taskId: string, action: () => Promise<EngineeringTask>, onSuccess?: () => void,
+    activeAction: ActiveTaskAction | null = null) {
+    if (taskActionActive.current || currentBusy.current) return
     const token = captureTaskSelection(taskId)
     if (!token) return
-    setBusy(true); setError(null)
+    taskActionActive.current = true
+    currentBusy.current = true
+    setBusy(true); setActiveTaskAction(activeAction); setError(null)
     try {
       const updated = await action()
       if (!selectionCoordinator.current.matches(token)) return
@@ -212,7 +296,12 @@ function App() {
       setError(caught instanceof Error ? caught.message : 'An unexpected error occurred.')
     }
     finally {
-      if (selectionCoordinator.current.matches(token)) setBusy(false)
+      if (selectionCoordinator.current.matches(token)) {
+        setBusy(false)
+        setActiveTaskAction(null)
+        taskActionActive.current = false
+        currentBusy.current = false
+      }
     }
   }
 
@@ -400,7 +489,8 @@ function App() {
     if (!token) return
     approvalSubmissionActive.current = true
     closeApprovalDialog()
-    setBusy(true); setApprovalInFlight(true); setError(null)
+    setBusy(true); setApprovalInFlight(true)
+    setActiveTaskAction(revision.revisionNumber === 2 ? 'corrected-revision-approval' : null); setError(null)
     try {
       const approved = await forgeApi.approveImplementation(task.id, {
         commandId: crypto.randomUUID(),
@@ -427,9 +517,68 @@ function App() {
       if (selectionCoordinator.current.matches(token)) {
         setBusy(false)
         setApprovalInFlight(false)
+        setActiveTaskAction(null)
         approvalSubmissionActive.current = false
       }
     }
+  }
+  function generateFailureAnalysis() {
+    if (!task || task.status !== 'ManualVerificationFailed') return
+    const attempt = (task.manualVerificationAttempts ?? []).find(item => item.attemptId === task.currentVerificationAttemptId)
+    if (!attempt?.attemptFingerprint) return
+    const attemptFingerprint = attempt.attemptFingerprint
+    void runTaskAction(task.id, () => forgeApi.generateFailureAnalysis(task.id, {
+      commandId: crypto.randomUUID(), expectedRowVersion: task.rowVersion,
+      expectedFailedAttemptId: attempt.attemptId,
+      expectedFailedAttemptFingerprint: attemptFingerprint,
+    }), undefined, 'failure-analysis')
+  }
+  function approveCorrectionProposal() {
+    if (!task || task.status !== 'AwaitingCorrectionApproval') return
+    const proposal = (task.correctionProposals ?? []).find(item => item.proposalId === task.currentCorrectionProposalId)
+    if (!proposal) return
+    void runTaskAction(task.id, () => forgeApi.approveCorrectionProposal(task.id, proposal.proposalId, {
+      commandId: crypto.randomUUID(), expectedRowVersion: task.rowVersion,
+      proposalFingerprint: proposal.proposalFingerprint,
+      analysisId: proposal.analysisId, analysisFingerprint: proposal.analysisFingerprint,
+      failedAttemptId: proposal.failedAttemptId, failedAttemptFingerprint: proposal.failedAttemptFingerprint,
+      previousRevisionId: proposal.previousApprovedRevisionId,
+      previousResultFingerprint: proposal.previousResultFingerprint,
+      approvedRequirementFingerprint: proposal.approvedRequirementFingerprint,
+      approvedPlanFingerprint: proposal.approvedPlanFingerprint,
+      originalBaseCommitSha: proposal.originalBaseCommitSha,
+    }), undefined, 'correction-approval')
+  }
+  function generateCorrection() {
+    if (!task || task.status !== 'CorrectionApproved') return
+    const proposal = (task.correctionProposals ?? []).find(item => item.proposalId === task.currentCorrectionProposalId)
+    if (!proposal) return
+    void runTaskAction(task.id, () => forgeApi.generateImplementationCorrection(task.id, {
+      commandId: crypto.randomUUID(), expectedRowVersion: task.rowVersion,
+      proposalId: proposal.proposalId, proposalFingerprint: proposal.proposalFingerprint,
+      previousRevisionId: proposal.previousApprovedRevisionId,
+      previousResultFingerprint: proposal.previousResultFingerprint,
+    }), undefined, 'correction-generation')
+  }
+  function reconcileFailureAnalysis() {
+    if (!task || task.status !== 'FailureAnalysisPending') return
+    const attempt = task.failureAnalysisGenerationAttempts?.at(-1)
+    if (!attempt) return
+    void runTaskAction(task.id, () => forgeApi.reconcileFailureAnalysis(task.id, attempt.commandId,
+      { commandId: crypto.randomUUID(), expectedRowVersion: task.rowVersion }))
+  }
+  function reconcileCorrection() {
+    if (!task || task.status !== 'ImplementingCorrection') return
+    const attempt = task.correctionGenerationAttempts?.at(-1)
+    const revisionId = attempt?.revisionId
+    const previousRevisionId = attempt?.previousRevisionId
+    if (!attempt || !revisionId || !previousRevisionId) return
+    void runTaskAction(task.id, () => forgeApi.reconcileImplementationCorrection(task.id, attempt.attemptId, {
+      commandId: crypto.randomUUID(), expectedRowVersion: task.rowVersion,
+      proposalId: attempt.proposalId, proposalFingerprint: attempt.proposalFingerprint,
+      previousRevisionId, previousResultFingerprint: attempt.previousResultFingerprint,
+      revisionId,
+    }))
   }
   function verificationBinding(selectedTask: EngineeringTask) {
     const plan = (selectedTask.verificationPlans ?? []).find(item => item.planId === selectedTask.currentVerificationPlanId)
@@ -438,13 +587,64 @@ function App() {
       plan.implementationResultFingerprint !== revision.resultFingerprint)) return null
     return { plan, revision }
   }
+  function deliveryBinding(selectedTask: EngineeringTask) {
+    const revision = selectedTask.implementationRevisions.find(item => item.revisionId === selectedTask.approvedImplementationRevisionId)
+    const plan = (selectedTask.verificationPlans ?? []).find(item => item.planId === selectedTask.currentVerificationPlanId)
+    const attempt = (selectedTask.manualVerificationAttempts ?? []).find(item => item.attemptId === selectedTask.currentVerificationAttemptId)
+    if (!revision?.resultFingerprint || !plan || !attempt?.attemptFingerprint || attempt.status !== 'CompletedPassed') return null
+    return { revision, plan, attempt }
+  }
+  function prepareDelivery() {
+    if (!task || task.status !== 'ReadyForDelivery') return
+    const binding = deliveryBinding(task); if (!binding) return
+    void runTaskAction(task.id, () => forgeApi.prepareDelivery(task.id, {
+      commandId: crypto.randomUUID(), expectedRowVersion: task.rowVersion,
+      revisionId: binding.revision.revisionId, resultFingerprint: binding.revision.resultFingerprint,
+      verificationPlanId: binding.plan.planId, verificationPlanFingerprint: binding.plan.planFingerprint,
+      manualAttemptId: binding.attempt.attemptId, manualAttemptFingerprint: binding.attempt.attemptFingerprint,
+    }), undefined, 'delivery-prepare')
+  }
+  function approveDelivery() {
+    if (!task || task.status !== 'AwaitingDeliveryApproval') return
+    const proposal = (task.deliveryProposals ?? []).find(item => item.deliveryProposalId === task.currentDeliveryProposalId)
+    if (!proposal) return
+    void runTaskAction(task.id, () => forgeApi.approveDelivery(task.id, proposal.deliveryProposalId, {
+      commandId: crypto.randomUUID(), expectedRowVersion: task.rowVersion, proposalFingerprint: proposal.proposalFingerprint,
+      revisionId: proposal.currentApprovedRevisionId, resultFingerprint: proposal.currentImplementationResultFingerprint,
+      verificationPlanId: proposal.currentVerificationPlanId, verificationPlanFingerprint: proposal.currentVerificationPlanFingerprint,
+      manualAttemptId: proposal.passedManualAttemptId, manualAttemptFingerprint: proposal.passedManualAttemptFingerprint,
+      confirmedByHuman: true,
+    }), undefined, 'delivery-approval')
+  }
+  function executeDelivery() {
+    if (!task || task.status !== 'AwaitingDeliveryApproval') return
+    const proposal = (task.deliveryProposals ?? []).find(item => item.deliveryProposalId === task.currentDeliveryProposalId)
+    if (!proposal) return
+    void runTaskAction(task.id, () => forgeApi.executeDelivery(task.id, {
+      commandId: crypto.randomUUID(), expectedRowVersion: task.rowVersion,
+      proposalId: proposal.deliveryProposalId, proposalFingerprint: proposal.proposalFingerprint,
+    }), undefined, 'delivery-execute')
+  }
+  function reconcileDelivery() {
+    if (!task || task.status !== 'DeliveryRecoveryRequired') return
+    const proposal = (task.deliveryProposals ?? []).find(item => item.deliveryProposalId === task.currentDeliveryProposalId)
+    const attempt = (task.deliveryAttempts ?? []).find(item => item.attemptId === task.currentDeliveryAttemptId)
+    if (!proposal || !attempt || !task.deliveryEligibility?.canReconcileDelivery) return
+    void runTaskAction(task.id, () => forgeApi.reconcileDelivery(task.id, attempt.attemptId, {
+      commandId: attempt.commandId, expectedRowVersion: task.rowVersion,
+      proposalId: proposal.deliveryProposalId, proposalFingerprint: proposal.proposalFingerprint,
+    }), undefined, 'delivery-reconcile')
+  }
   async function generateVerificationPlan() {
     if (!task) return
     const binding = verificationBinding(task)
     if (!binding) return
     const token = captureTaskSelection(task.id)
     if (!token) return
-    setBusy(true); setError(null)
+    currentBusy.current = true
+    setBusy(true)
+    setActiveTaskAction(task.implementationRevisions.length === 2 ? 'replacement-verification-plan' : null)
+    setError(null)
     try {
       const updated = await forgeApi.generateVerificationPlan(task.id, {
         commandId: crypto.randomUUID(), expectedRowVersion: task.rowVersion,
@@ -460,12 +660,14 @@ function App() {
         setTask(refreshed)
       } catch { /* Preserve the safe generation error. */ }
       if (selectionCoordinator.current.matches(token)) setError(caught instanceof Error ? caught.message : 'Verification-plan generation failed safely.')
-    } finally { if (selectionCoordinator.current.matches(token)) setBusy(false) }
+    } finally { if (selectionCoordinator.current.matches(token)) {
+      setBusy(false); setActiveTaskAction(null); currentBusy.current = false
+    } }
   }
   async function runManualVerificationAction(selectedTask: EngineeringTask, action: () => Promise<EngineeringTask>) {
     if (verificationActionActive.current || currentBusy.current) return
     verificationActionActive.current = true
-    try { await runTaskAction(selectedTask.id, action) }
+    try { await runTaskAction(selectedTask.id, action, undefined, 'start-verification') }
     finally { verificationActionActive.current = false }
   }
   function startVerificationAttempt() {
@@ -477,10 +679,8 @@ function App() {
       selectedTask.verificationEligibility.canCompleteVerificationPassed !== false ||
       selectedTask.verificationEligibility.canCompleteVerificationFailed !== false ||
       selectedTask.currentVerificationAttemptId !== null ||
-      (selectedTask.manualVerificationAttempts?.length ?? 0) !== 0 ||
       selectedTask.manualVerificationAttempts?.some(attempt =>
-        attempt.status === 'InProgress' || attempt.status === 'CompletedPassed' ||
-        attempt.status === 'CompletedFailed')) return
+        attempt.verificationPlanId === selectedTask.currentVerificationPlanId)) return
     const binding = verificationBinding(selectedTask)
     if (!binding?.plan || binding.plan.planId !== selectedTask.currentVerificationPlanId ||
       binding.plan.status !== 'Current') return
@@ -616,15 +816,20 @@ function App() {
     : task?.lastImplementationFailure?.safeToResume ? 'SafeResume' : 'Interrupted')
   const implementationIsActive = task?.status === 'Implementing' && implementationDisposition === 'Active'
   const implementationCanResume = task?.status === 'Implementing' && implementationDisposition === 'SafeResume'
+  const displayedImplementationResult = implementationReviewTarget?.result ?? task?.implementationResult ?? null
+  const displayedImplementationRevision = implementationReviewTarget?.revision ??
+    task?.implementationRevisions.find(revision => revision.revisionId === task.activeImplementationRevisionId) ?? null
   const activeCheckoutVerified = task?.implementationRuntime?.activeCheckoutVerified
-    ?? task?.implementationResult?.activeCheckoutVerified
+    ?? displayedImplementationResult?.activeCheckoutVerified
     ?? task?.lastImplementationFailure?.activeCheckoutVerified
     ?? false
-  const persistedCheckoutVerified = task?.implementationResult?.activeCheckoutVerified === true
+  const persistedCheckoutVerified = displayedImplementationResult?.activeCheckoutVerified === true
   const hasApprovedPlan = Boolean(task?.implementationPlan && task.planApprovedAt)
   const approvedPlanControlsRenderedInState = task ? [
     'PlanApproved', 'Implementing', 'AwaitingImplementationReview', 'ImplementationApproved',
-    'AwaitingManualVerification', 'ManualVerificationFailed', 'ReadyForDelivery',
+    'VerificationPlanning', 'AwaitingManualVerification', 'ManualVerificationFailed', 'ReadyForDelivery',
+    'FailureAnalysisPending', 'AwaitingFailureResolution', 'AwaitingCorrectionApproval',
+    'FailureAnalysisRecoveryRequired', 'CorrectionApproved', 'ImplementingCorrection', 'CorrectionRecoveryRequired',
   ].includes(task.status) : false
   const activeImplementationRevision = task?.implementationRevisions.find(revision => revision.revisionId === task.activeImplementationRevisionId) ?? null
   const nativeApprovalDialogSupported = typeof HTMLDialogElement !== 'undefined'
@@ -644,8 +849,8 @@ function App() {
   const aggregateUsageLabel = telemetry.usageAvailability === 'Partial'
     ? 'Partial usage — aggregate totals unavailable because some calls lack telemetry'
     : 'Usage unavailable'
-  const implementationSourceLabel = task?.implementationResult?.source === 'OpenAI'
-    ? `OpenAI · ${task.implementationResult.model}`
+  const implementationSourceLabel = displayedImplementationResult?.source === 'OpenAI'
+    ? `OpenAI · ${displayedImplementationResult.model}`
     : 'Deterministic Fake implementation · MECHANICAL WORKFLOW DEMONSTRATION'
   const latestFailedPlanningCall = [...planningCalls].reverse().find(call => !call.succeeded)
   const planningRecovery = getPlanningRecovery(latestFailedPlanningCall?.failureCategory ?? null, planningSnapshotStale)
@@ -752,28 +957,40 @@ function App() {
           {task?.status === 'PlanApproved' && <div className="ready-view"><div className="success-seal">✓</div><p className="eyebrow">PLAN APPROVED</p><h2>Generate an isolated implementation for diff review.</h2><p>{capabilities?.implementationProvider === 'OpenAI' ? 'Forge first inspects approved files read-only, sends bounded context to OpenAI, and treats the proposed operations as untrusted until deterministic validation passes. No worktree exists until that validation succeeds.' : 'Forge will require a clean Git repository at the approved HEAD, create a task branch and linked worktree outside the active checkout, then apply deterministic Fake changes only in that worktree.'}</p><div className="coming-next"><span>05</span><div><strong>{capabilities?.implementationProvider === 'OpenAI' ? 'OpenAI implementation proposal' : 'Safe Fake implementation'}</strong><p>{capabilities?.implementationProvider === 'OpenAI' ? `${capabilities.implementationModel} · ${capabilities.implementationReasoningEffort} reasoning · separately billed API usage. One bounded retry may produce two recorded calls.` : 'No validation, staging, commit, push or pull request action will run.'}</p></div>{capabilities?.implementationConfigured ? <button className="primary-button compact" onClick={() => void generateImplementation()} disabled={busy}>{implementationInFlight ? <><span className="spinner" />{capabilities.implementationProvider === 'OpenAI' ? 'Awaiting validated proposal…' : 'Generating…'}</> : <>Generate implementation <span>→</span></>}</button> : <p className="truth-note" role="status">Implementation generation is unavailable until the active provider configuration is complete.</p>}</div><p className="form-note"><span>i</span>No target validation, staging, commit, push, or pull request action will run.</p><div className="export-actions"><button className="secondary-button" onClick={() => void exportPdf('plan')} disabled={exportingPdf !== null}>{exportingPdf === 'plan' ? 'Generating plan…' : 'Download approved plan'}</button><button className="secondary-button" onClick={() => void exportPdf('task')} disabled={exportingPdf !== null}>{exportingPdf === 'task' ? 'Generating task report…' : 'Download task report PDF'}</button></div>{pdfExportError && <p className="export-error" role="alert">{pdfExportError}</p>}</div>}
           {implementationIsActive && <div className="implementation-progress" role="status"><span className="spinner dark" /><p className="eyebrow">ISOLATED IMPLEMENTATION</p><h2>Preparing generated changes for diff review</h2><p>Forge holds a valid implementation lease and is working only in the persisted task worktree.</p></div>}
           {task?.status === 'Implementing' && !implementationIsActive && <div className="planning-failure implementation-failure"><div className="failure-seal">!</div><p className="eyebrow">IMPLEMENTATION ATTEMPT IS NOT ACTIVE</p><h2>{implementationCanResume ? 'The isolated workspace can be safely resumed' : implementationDisposition === 'TerminalIncompatible' ? capabilities?.implementationProvider === 'OpenAI' ? 'The approved plan cannot be implemented safely' : 'The approved plan is not compatible with Fake implementation' : 'Workspace recovery is required'}</h2><p>{task.implementationRuntime?.safeMessage ?? task.lastImplementationFailure?.message ?? 'The previous implementation attempt was interrupted.'}</p><small>{implementationCanResume ? capabilities?.implementationProvider === 'OpenAI' ? 'Forge will verify the matching untouched workspace; resuming makes a new separately billed provider request.' : 'Forge will verify the matching untouched workspace before it resumes.' : 'Forge will not reset, delete, or overwrite this workspace automatically.'}</small>{implementationCanResume && <button className="primary-button compact" onClick={() => void generateImplementation()} disabled={busy}>Resume implementation <span>→</span></button>}<div className="export-actions"><button className="secondary-button" onClick={() => void exportPdf('plan')} disabled={exportingPdf !== null}>Download approved plan</button><button className="secondary-button" onClick={() => void exportPdf('task')} disabled={exportingPdf !== null}>Download task report PDF</button></div></div>}
-          {(task?.status === 'AwaitingImplementationReview' || task?.status === 'ImplementationApproved') && task.implementationResult && <div className="implementation-review">
-            <div className="action-title"><span className="title-icon">06</span><div><h2>{task.status === 'ImplementationApproved' ? 'Implementation approved' : 'Review the isolated generated changes'}</h2><p>No validation commands were run and no change was staged, committed, pushed, or proposed as a pull request.</p></div></div>
+          {task && ((task.status === 'AwaitingImplementationReview' || task.status === 'ImplementationApproved') || implementationReviewTarget) && displayedImplementationResult && <div className="implementation-review">
+            {implementationReviewTarget && <div className="implementation-review-return"><button type="button" className="secondary-button" onClick={backToManualVerification}>Back to manual verification</button><p>Reviewing the exact approved diff bound to verification plan {implementationReviewTarget.plan.planNumber}, revision {implementationReviewTarget.revision.revisionNumber}.</p></div>}
+            <div className="action-title"><span className="title-icon">06</span><div><h2>{implementationReviewTarget ? `Approved implementation revision ${displayedImplementationRevision?.revisionNumber}` : task.status === 'ImplementationApproved' ? 'Implementation approved' : 'Review the isolated generated changes'}</h2><p>No validation commands were run and no change was staged, committed, pushed, or proposed as a pull request.</p></div></div>
             <span className="fake-label">{implementationSourceLabel}</span>
             {task.status === 'ImplementationApproved' && activeImplementationRevision && <div className="implementation-approved" role="status"><strong>Implementation approved</strong><p>Revision {activeImplementationRevision.revisionNumber} was approved on {activeImplementationRevision.approvedAt ? new Date(activeImplementationRevision.approvedAt).toLocaleString() : 'an unrecorded date'}.</p><code>{activeImplementationRevision.resultFingerprint?.slice(0, 12)}…</code><small>This approval accepts persisted review evidence only. Validation was not run, and nothing was staged, committed, pushed, or submitted as a pull request.</small></div>}
             {!persistedCheckoutVerified && <div className="diff-truncation-banner" role="alert"><strong>This review cannot be approved.</strong><p>Forge could not verify that the active checkout remained unchanged when implementation completed. This persisted completion evidence is not safely approvable.</p></div>}
             <div className="implementation-truth"><p><strong>Validation commands were not run.</strong></p><p><strong>{activeCheckoutVerified ? 'The active checkout was verified unchanged.' : 'The active checkout could not be verified unchanged.'}</strong></p><p>Workspace: {task.implementationRuntime ? task.implementationRuntime.workspaceAvailable ? 'available' : 'unavailable; persisted review remains readable' : 'not observed during approval; persisted review remains readable'}</p></div>
-            <section className="plan-section implementation-metadata"><small>IMPLEMENTATION METADATA</small><dl><div><dt>Base commit</dt><dd><code>{task.implementationResult.baseCommitSha}</code></dd></div><div><dt>Generated branch</dt><dd><code>{task.implementationResult.branch}</code></dd></div><div><dt>Source</dt><dd>{task.implementationResult.source === 'OpenAI' ? 'OpenAI' : 'Deterministic Fake implementation'}</dd></div>{task.implementationResult.source === 'OpenAI' && <><div><dt>Model</dt><dd>{task.implementationResult.model}</dd></div><div><dt>Reasoning effort</dt><dd>{implementationCalls.at(-1)?.reasoningEffort ?? 'unavailable'}</dd></div><div><dt>Physical calls</dt><dd>{implementationCalls.length}</dd></div><div><dt>Implementation cost</dt><dd>{implementationCostLabel === 'Cost unavailable' ? implementationCostLabel : `${implementationCostLabel} configured estimate`}</dd></div></>}</dl>{task.implementationResult.source === 'OpenAI' && <p>Provider output was treated as untrusted. Deterministic proposal validation: accepted. Human approval is still required.</p>}</section>
-            <section className="plan-section"><small>SUMMARY</small><p>{task.implementationResult.summary}</p></section>
-            <section className="plan-section"><small>WARNINGS</small><ul>{task.implementationResult.warnings.map(warning => <li key={warning}>{warning}</li>)}</ul></section>
-            {task.implementationResult.diffTruncated && <div className="diff-truncation-banner" role="status"><strong>Displayed diff is incomplete.</strong><p>{task.implementationResult.displayedDiffCharacters.toLocaleString()} of {task.implementationResult.fullDiffCharacters.toLocaleString()} diff characters are persisted for display. File hashes and line counts are complete.</p></div>}
-            <section className="plan-section changed-files"><small>CHANGED FILES</small>{task.implementationResult.changedFiles.map(file => <details className="changed-file-review" key={file.path}><summary><code>{file.path}</code><span>{file.action}</span><b className="diff-counts">+{file.additions} −{file.deletions}</b></summary><div className="changed-file-metadata"><span>{file.originalLines} → {file.newLines} lines</span><span>{file.originalBytes.toLocaleString()} → {file.newBytes.toLocaleString()} bytes</span></div>{file.diffTruncated && <div className="diff-truncation-banner compact"><strong>This file diff is truncated.</strong><span>{file.displayedDiffCharacters.toLocaleString()} of {file.fullDiffCharacters.toLocaleString()} characters displayed.</span></div>}<pre className="unified-diff" tabIndex={0} aria-label={`Unified diff for ${file.path}`}>{file.diffPreview}</pre></details>)}</section>
-            <details className="implementation-revision-history"><summary>Implementation revision history</summary>{task.implementationRevisions.map(revision => <article key={revision.revisionId}><div><strong>Revision {revision.revisionNumber} · {revision.kind}</strong>{revision.isCurrent && <span>CURRENT</span>}{revision.isApproved && <span>APPROVED</span>}</div><p>{revision.generationState} · {revision.reviewState} · {revision.changedFileCount} changed file{revision.changedFileCount === 1 ? '' : 's'}</p><code>{revision.resultFingerprint ?? 'Result fingerprint not recorded'}</code>{revision.approvedAt && <small>Approved {new Date(revision.approvedAt).toLocaleString()}</small>}</article>)}</details>
-            {task.status === 'AwaitingImplementationReview' && persistedCheckoutVerified && activeImplementationRevision?.resultFingerprint && <div className="approval-row implementation-approval-row"><p><strong>Explicit implementation approval required</strong><br />Approval accepts revision {activeImplementationRevision.revisionNumber} and its exact persisted review fingerprint.</p><button type="button" className="primary-button compact" onClick={() => setApprovalDialogOpen(true)} disabled={busy || approvalInFlight}>Approve implementation <span>→</span></button></div>}
+            <section className="plan-section implementation-metadata"><small>IMPLEMENTATION METADATA</small><dl><div><dt>Base commit</dt><dd><code>{displayedImplementationResult.baseCommitSha}</code></dd></div><div><dt>Generated branch</dt><dd><code>{displayedImplementationResult.branch}</code></dd></div><div><dt>Source</dt><dd>{displayedImplementationResult.source === 'OpenAI' ? 'OpenAI' : 'Deterministic Fake implementation'}</dd></div>{displayedImplementationResult.source === 'OpenAI' && <><div><dt>Model</dt><dd>{displayedImplementationResult.model}</dd></div><div><dt>Reasoning effort</dt><dd>{implementationCalls.at(-1)?.reasoningEffort ?? 'unavailable'}</dd></div><div><dt>Physical calls</dt><dd>{implementationCalls.length}</dd></div><div><dt>Implementation cost</dt><dd>{implementationCostLabel === 'Cost unavailable' ? implementationCostLabel : `${implementationCostLabel} configured estimate`}</dd></div></>}</dl>{displayedImplementationResult.source === 'OpenAI' && <p>Provider output was treated as untrusted. Deterministic proposal validation: accepted. Human approval is still required.</p>}</section>
+            <section className="plan-section"><small>SUMMARY</small><p>{displayedImplementationResult.summary}</p></section>
+            <section className="plan-section"><small>WARNINGS</small><ul>{displayedImplementationResult.warnings.map(warning => <li key={warning}>{warning}</li>)}</ul></section>
+            {displayedImplementationResult.diffTruncated && <div className="diff-truncation-banner" role="status"><strong>Displayed diff is incomplete.</strong><p>{displayedImplementationResult.displayedDiffCharacters.toLocaleString()} of {displayedImplementationResult.fullDiffCharacters.toLocaleString()} diff characters are persisted for display. File hashes and line counts are complete.</p></div>}
+            <section className="plan-section changed-files"><small>CHANGED FILES</small>{displayedImplementationResult.changedFiles.map(file => <details className="changed-file-review" key={file.path}><summary><code>{file.path}</code><span>{file.action}</span><b className="diff-counts">+{file.additions} −{file.deletions}</b></summary><div className="changed-file-metadata"><span>{file.originalLines} → {file.newLines} lines</span><span>{file.originalBytes.toLocaleString()} → {file.newBytes.toLocaleString()} bytes</span></div>{file.diffTruncated && <div className="diff-truncation-banner compact"><strong>This file diff is truncated.</strong><span>{file.displayedDiffCharacters.toLocaleString()} of {file.fullDiffCharacters.toLocaleString()} characters displayed.</span></div>}<UnifiedDiff diff={file.diffPreview} filePath={file.path} /></details>)}</section>
+            <details className="implementation-revision-history"><summary>Implementation revision history</summary>{task.implementationRevisions.map(revision => <article key={revision.revisionId}><div><strong>Revision {revision.revisionNumber} · {revision.kind}</strong>{revision.reviewState === 'HistoricallyApproved' && <span>HISTORICAL</span>}{revision.revisionNumber === 1 && revision.reviewState === 'Approved' && <span>EFFECTIVE</span>}{revision.revisionNumber === 2 && revision.reviewState === 'Current' && <span>CANDIDATE</span>}{revision.isCurrent && <span>CURRENT</span>}{revision.isApproved && <span>APPROVED</span>}</div><p>{revision.generationState} · {revision.reviewState} · {revision.changedFileCount} changed file{revision.changedFileCount === 1 ? '' : 's'}</p><code>{revision.resultFingerprint ?? 'Result fingerprint not recorded'}</code>{revision.correctionProposalFingerprint && <small>Proposal {revision.correctionProposalFingerprint}</small>}{revision.approvedAt && <small>Approved {new Date(revision.approvedAt).toLocaleString()}</small>}</article>)}</details>
+            {task.status === 'AwaitingImplementationReview' && persistedCheckoutVerified && activeImplementationRevision?.resultFingerprint && <div className="approval-row implementation-approval-row"><p><strong>Explicit implementation approval required</strong><br />Approval accepts revision {activeImplementationRevision.revisionNumber} and its exact persisted review fingerprint.</p><button type="button" className="primary-button compact" aria-busy={activeTaskAction === 'corrected-revision-approval'} onClick={() => setApprovalDialogOpen(true)} disabled={busy || approvalInFlight}>{activeTaskAction === 'corrected-revision-approval' ? 'Approving corrected revision…' : <>Approve implementation <span>→</span></>}</button></div>}
             {nativeApprovalDialogSupported
               ? <dialog ref={approvalDialog} className="approval-dialog" onCancel={event => { event.preventDefault(); closeApprovalDialog() }} onClose={() => setApprovalDialogOpen(false)} onKeyDown={event => { if (event.key === 'Escape') { event.preventDefault(); closeApprovalDialog() } }} aria-labelledby="implementation-approval-title" aria-describedby="implementation-approval-description">{approvalDialogContents}</dialog>
               : approvalDialogOpen && <div className="approval-dialog approval-dialog-fallback" role="dialog" aria-modal="true" aria-labelledby="implementation-approval-title" aria-describedby="implementation-approval-description" onKeyDown={event => { if (event.key === 'Escape') { event.preventDefault(); closeApprovalDialog() } }}>{approvalDialogContents}</div>}
             <div className="export-actions"><button className="secondary-button" onClick={() => void exportPdf('plan')} disabled={exportingPdf !== null}>Download approved plan</button><button className="secondary-button" onClick={() => void exportPdf('task')} disabled={exportingPdf !== null}>Download task report PDF</button></div>{pdfExportError && <p className="export-error" role="alert">{pdfExportError}</p>}
           </div>}
-          {task && ['ImplementationApproved', 'VerificationPlanning', 'AwaitingManualVerification', 'ManualVerificationFailed', 'ReadyForDelivery'].includes(task.status) && <VerificationPanel
+          {task && ['ManualVerificationFailed', 'FailureAnalysisPending', 'FailureAnalysisRecoveryRequired', 'AwaitingFailureResolution', 'AwaitingCorrectionApproval', 'CorrectionApproved', 'ImplementingCorrection', 'CorrectionRecoveryRequired'].includes(task.status) && <CorrectionPanel
+            task={task}
+            busy={busy}
+            activeAction={activeTaskAction}
+            onGenerateAnalysis={generateFailureAnalysis}
+            onApproveProposal={approveCorrectionProposal}
+            onGenerateCorrection={generateCorrection}
+            onReconcileFailureAnalysis={reconcileFailureAnalysis}
+            onReconcileCorrection={reconcileCorrection}
+          />}
+          {task && ['ImplementationApproved', 'VerificationPlanning', 'AwaitingManualVerification', 'ManualVerificationFailed', 'FailureAnalysisPending', 'FailureAnalysisRecoveryRequired', 'AwaitingFailureResolution', 'AwaitingCorrectionApproval', 'CorrectionApproved', 'ImplementingCorrection', 'CorrectionRecoveryRequired', 'AwaitingImplementationReview', 'ReadyForDelivery'].includes(task.status) && <div hidden={implementationReviewTarget !== null}><VerificationPanel
             task={task}
             capabilities={capabilities}
             busy={busy}
+            activeAction={activeTaskAction}
             documentsBusy={exportingPdf !== null}
             documentError={pdfExportError}
             onGenerate={() => void generateVerificationPlan()}
@@ -783,7 +1000,12 @@ function App() {
             onExportPlan={() => void exportVerificationPlan()}
             onExportApprovedPlan={() => void exportPdf('plan')}
             onExportTaskReport={() => void exportPdf('task')}
-          />}
+            onViewImplementation={openImplementationReview}
+          /></div>}
+          {task && ['ReadyForDelivery', 'AwaitingDeliveryApproval', 'Delivering', 'PullRequestCreated', 'DeliveryRecoveryRequired'].includes(task.status) && <DeliveryPanel
+            task={task} busy={busy} activeAction={activeTaskAction}
+            onPrepare={prepareDelivery} onApprove={approveDelivery} onExecute={executeDelivery} onReconcile={reconcileDelivery}
+            onExportTaskReport={() => void exportPdf('task')} />}
           {task && hasApprovedPlan && !approvedPlanControlsRenderedInState && <div className="semantic-plan-actions"><div><strong>Approved plan documents</strong><p>The persisted plan approval remains valid in this later workflow state.</p></div><div className="export-actions"><button className="secondary-button" onClick={() => void exportPdf('plan')} disabled={exportingPdf !== null}>Download approved plan</button><button className="secondary-button" onClick={() => void exportPdf('task')} disabled={exportingPdf !== null}>Download task report PDF</button></div></div>}
           {task && task.evidenceItems.length > 0 && <section className="evidence-view"><div className="evidence-heading"><div><p className="eyebrow">SELECTED REPOSITORY EVIDENCE</p><h3>{task.evidenceFilesSelected} files · {task.totalEvidenceCharacters.toLocaleString()} characters</h3></div><span>{task.evidenceFilesInspected} eligible files inspected</span></div>{task.evidenceItems.map(item => <details className="evidence-item" key={item.id}><summary><b>{item.id}</b><code>{item.relativePath}:{item.startLine}-{item.endLine}</code><span>score {item.score}</span></summary><p>{item.reasonSelected}</p><pre>{item.excerpt}</pre></details>)}</section>}
         </section>

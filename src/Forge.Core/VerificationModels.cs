@@ -82,7 +82,8 @@ public sealed record VerificationPlan(
     VerificationPlanStatus Status,
     IReadOnlyList<Guid> ModelCallIds,
     Guid? SupersedesPlanId,
-    string? RegenerationReason);
+    string? RegenerationReason,
+    bool InitialPlanLanguageOverrideApplied = false);
 
 public sealed record VerificationTestStepCandidate(
     int Order,
@@ -136,14 +137,23 @@ public sealed record VerificationPlanContext(
     string ContextFingerprint,
     DateTimeOffset CreatedAt,
     int RepositoryEvidenceFilesInspected = 0,
-    int RepositoryEvidenceFilesSelected = 0);
+    int RepositoryEvidenceFilesSelected = 0,
+    VerificationPlan? PreviousPlan = null,
+    IReadOnlyList<ManualCaseResultRevision>? PreviousFailureEvidence = null,
+    FailureAnalysis? FailureAnalysis = null,
+    CorrectionProposal? CorrectionProposal = null,
+    IReadOnlyList<string>? ApprovedManualTestData = null,
+    bool InitialPlanLanguageOverrideEligible = false);
 
 public sealed record VerificationPlanEvaluation(
     VerificationPlanCandidate Candidate,
-    IReadOnlyList<ModelCallRecord> ModelCalls)
+    IReadOnlyList<ModelCallRecord> ModelCalls,
+    bool InitialPlanLanguageOverrideApplied = false)
 {
     public VerificationPlanEvaluation(VerificationPlanCandidate candidate) : this(candidate, []) { }
 }
+
+public sealed record VerificationPlanLanguageOverridePolicy(bool Enabled);
 
 public interface IVerificationPlanEngine
 {
@@ -167,6 +177,7 @@ public enum VerificationGenerationAttemptStatus
     Completed,
     FailedBeforeDispatch,
     RetryableProviderResponse,
+    RejectedProviderOutput,
     AmbiguousAfterDispatch,
     InterruptedBeforeDispatch
 }
@@ -177,6 +188,7 @@ public enum VerificationGenerationRuntimeStatus
     Active,
     FailedBeforeDispatch,
     RetryableProviderResponse,
+    RejectedProviderOutput,
     AmbiguousAfterDispatch,
     InterruptedBeforeDispatch,
     Completed
@@ -336,6 +348,40 @@ public sealed record VerificationPlanGenerationAttempt(
     IReadOnlyList<VerificationProviderResponseTelemetry> ProviderResponses,
     IReadOnlyList<VerificationLogicalCallRecord>? LogicalCalls = null);
 
+public static class VerificationGenerationAttemptSemantics
+{
+    public const string ValidationRejectedCategory = "verification_validation_rejected";
+
+    public static bool IsLegacyRejectedProviderOutput(
+        VerificationPlanGenerationAttempt attempt,
+        IReadOnlyList<ModelCallRecord> modelCalls) =>
+        attempt.Status == VerificationGenerationAttemptStatus.AmbiguousAfterDispatch &&
+        HasRejectedProviderOutputEvidence(attempt, modelCalls);
+
+    public static bool HasRejectedProviderOutputEvidence(
+        VerificationPlanGenerationAttempt attempt,
+        IReadOnlyList<ModelCallRecord> modelCalls)
+    {
+        if (!string.Equals(attempt.FailureCategory, ValidationRejectedCategory, StringComparison.Ordinal) ||
+            attempt.CompletedAt is null || attempt.ResultPlanId is not null ||
+            attempt.LogicalCallCount != 1 || attempt.PhysicalRequestCount != 1 ||
+            attempt.PossiblyDispatchedRequestCount != 0 || attempt.ProviderResponses.Count != 1 ||
+            attempt.ModelCallIds.Count != 1 || attempt.LastLogicalCallId is not { } logicalCallId ||
+            attempt.ModelCallIds[0] != logicalCallId)
+            return false;
+
+        var response = attempt.ProviderResponses[0];
+        var call = modelCalls.SingleOrDefault(item => item.Id == logicalCallId);
+        return response.LogicalCallId == logicalCallId &&
+            response.DispatchDisposition == VerificationCallDispatchDisposition.ResponseReceived &&
+            response.HttpStatusCode == 200 && response.Status == VerificationProviderResponseStatus.Completed &&
+            call is { Stage: ModelCallStage.VerificationPlanning, Succeeded: false,
+                VerificationDispatchDisposition: VerificationCallDispatchDisposition.ResponseReceived,
+                ProviderHttpStatusCode: 200 } &&
+            string.Equals(call.FailureCategory, ValidationRejectedCategory, StringComparison.Ordinal);
+    }
+}
+
 public enum ManualVerificationAttemptStatus
 {
     InProgress,
@@ -441,12 +487,22 @@ public sealed class VerificationLimits
     public int GenerationLeaseSeconds { get; set; } = 300;
 }
 
+public enum VerificationValidationFailureReason
+{
+    General,
+    ManualExecutionClaim,
+    HistoricalFailureClaim
+}
+
 public sealed class VerificationException(
     string category,
     string safeMessage,
-    Exception? innerException = null) : Exception(safeMessage, innerException)
+    Exception? innerException = null,
+    VerificationValidationFailureReason validationFailureReason = VerificationValidationFailureReason.General)
+    : Exception(safeMessage, innerException)
 {
     public string Category { get; } = category;
+    public VerificationValidationFailureReason ValidationFailureReason { get; } = validationFailureReason;
 }
 
 public sealed class VerificationDurabilityException(Exception innerException)

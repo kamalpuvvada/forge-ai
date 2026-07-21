@@ -35,6 +35,11 @@ const apiModule = vi.hoisted(() => {
       approveImplementation: vi.fn(),
       generateVerificationPlan: vi.fn(),
       startVerificationAttempt: vi.fn(),
+      generateFailureAnalysis: vi.fn(),
+      reconcileFailureAnalysis: vi.fn(),
+      approveCorrectionProposal: vi.fn(),
+      generateImplementationCorrection: vi.fn(),
+      reconcileImplementationCorrection: vi.fn(),
       updateVerificationCase: vi.fn(),
       completeVerification: vi.fn(),
       exportVerificationPlanPdf: vi.fn(),
@@ -558,6 +563,206 @@ describe('App task navigation hardening', () => {
     randomUuid.mockRestore()
   })
 
+  it('renders the persisted correction candidate as implementation revision two', async () => {
+    const review = buildImplementationReviewTask(firstId)
+    const revision1 = {
+      ...review.implementationRevisions[0], reviewState: 'Approved' as const,
+      isCurrent: false, isApproved: true, approvedAt: '2026-07-18T12:10:00.000Z',
+    }
+    const revision2 = {
+      ...review.implementationRevisions[0], revisionId: '99999999-9999-4999-8999-999999999999',
+      revisionNumber: 2, kind: 'Correction' as const, previousRevisionId: revision1.revisionId,
+      reviewState: 'Current' as const, isCurrent: true, isApproved: false, approvedAt: null,
+      resultFingerprint: '9'.repeat(64), correctionSubmittedAt: '2026-07-18T12:11:00.000Z',
+      correctionProposalId: '88888888-8888-4888-8888-888888888888',
+      correctionProposalFingerprint: '8'.repeat(64),
+    }
+    review.implementationRevisions = [revision1, revision2]
+    review.activeImplementationRevisionId = revision2.revisionId
+    review.approvedImplementationRevisionId = revision1.revisionId
+    review.implementationResult = {
+      ...review.implementationResult!, summary: 'Corrected revision two is ready for exact diff review.',
+    }
+    review.correctionEligibility = {
+      canGenerateFailureAnalysis: false, canApproveCorrection: false, canGenerateCorrection: false,
+      canApproveCorrectedRevision: true, canGenerateReplacementVerificationPlan: false,
+    }
+    forgeApi.getTask.mockResolvedValue(review)
+
+    await navigate(taskUrl(firstId))
+    const rendered = await renderApp()
+    await expectText(rendered.container, 'Corrected revision two is ready for exact diff review.')
+
+    expect(rendered.container.textContent).toContain('Revision 2')
+    expect(rendered.container.textContent).toContain('CANDIDATE')
+    expect(rendered.container.textContent).toContain('Approval accepts revision 2')
+    expect(rendered.container.textContent).not.toContain('The previous implementation attempt was interrupted.')
+  })
+
+  it('reopens the exact verification-bound implementation diff and returns without another task read', async () => {
+    const manual = buildManualVerificationTask(firstId, true)
+    const activeAttempt = buildHistoricalManualAttempt(manual)
+    manual.currentVerificationAttemptId = activeAttempt.attemptId
+    manual.manualVerificationAttempts = [activeAttempt]
+    manual.verificationEligibility = { ...manual.verificationEligibility!, canStartVerificationAttempt: false,
+      canRecordVerificationResult: true }
+    forgeApi.getTask.mockResolvedValue(manual)
+    await navigate(taskUrl(firstId))
+    const rendered = await renderApp()
+    await expectText(rendered.container, 'Review the exact approved diff used by this verification plan.')
+    const notes = [...rendered.container.querySelectorAll('label')].find(label => label.textContent?.startsWith('Notes'))!
+      .querySelector<HTMLTextAreaElement>('textarea')!
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')!.set!
+        .call(notes, 'Unsaved reviewer note.')
+      notes.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+    const reads = forgeApi.getTask.mock.calls.length
+    const action = findButton(rendered.container, 'View approved implementation diff')
+    const pushes = vi.spyOn(window.history, 'pushState')
+
+    await act(async () => { action.click(); action.click() })
+
+    expect(rendered.container.textContent).toContain('Approved implementation revision 1')
+    expect(rendered.container.querySelector('.diff-line-added')?.textContent).toContain('+new')
+    expect(rendered.container.querySelector('.diff-line-deleted')?.textContent).toContain('-old')
+    expect(window.location.search).toContain('view=implementation')
+    expect(forgeApi.getTask).toHaveBeenCalledTimes(reads)
+    expect(pushes).toHaveBeenCalledOnce()
+
+    const back = vi.spyOn(window.history, 'back').mockImplementation(() => undefined)
+    await click(findButton(rendered.container, 'Back to manual verification'))
+    expect(back).toHaveBeenCalledOnce()
+    await dispatchPopState(taskUrl(firstId))
+    expect(rendered.container.textContent).toContain('Manual verification plan')
+    expect(rendered.container.textContent).not.toContain('Approved implementation revision 1')
+    expect([...rendered.container.querySelectorAll('label')].find(label => label.textContent?.startsWith('Notes'))!
+      .querySelector<HTMLTextAreaElement>('textarea')!.value).toBe('Unsaved reviewer note.')
+  })
+
+  it('fails closed when the verification plan fingerprint does not match its revision', async () => {
+    const manual = buildManualVerificationTask(firstId, true)
+    manual.verificationPlans![0].implementationResultFingerprint = 'f'.repeat(64)
+    forgeApi.getTask.mockResolvedValue(manual)
+    await navigate(taskUrl(firstId))
+    const rendered = await renderApp()
+
+    await click(findButton(rendered.container, 'View approved implementation diff'))
+
+    expect(rendered.container.textContent).toContain('revision binding could not be verified')
+    expect(rendered.container.textContent).not.toContain('Approved implementation revision 1')
+    expect(window.location.search).not.toContain('view=implementation')
+  })
+
+  it('binds replacement verification plan 2 to approved implementation revision 2', async () => {
+    const manual = buildManualVerificationTask(firstId, true)
+    const revisionId = '77777777-7777-4777-8777-777777777777'
+    const fingerprint = '7'.repeat(64)
+    manual.activeImplementationRevisionId = revisionId
+    manual.approvedImplementationRevisionId = revisionId
+    manual.implementationRevisions = [{ ...manual.implementationRevisions[0], revisionId, revisionNumber: 2,
+      kind: 'Correction', previousRevisionId: manual.implementationRevisions[0].revisionId, resultFingerprint: fingerprint }]
+    manual.verificationPlans = [{ ...manual.verificationPlans![0], planId: '88888888-8888-4888-8888-888888888888',
+      planNumber: 2, implementationRevisionId: revisionId, implementationResultFingerprint: fingerprint }]
+    manual.currentVerificationPlanId = manual.verificationPlans[0].planId
+    forgeApi.getTask.mockResolvedValue(manual)
+    await navigate(taskUrl(firstId))
+    const rendered = await renderApp()
+
+    await click(findButton(rendered.container, 'View approved implementation diff'))
+
+    expect(rendered.container.textContent).toContain('Approved implementation revision 2')
+    expect(window.location.search).toContain(`revision=${revisionId}`)
+  })
+
+  it('honors Back and Forward view URLs and clears the review on task switch', async () => {
+    const first = buildManualVerificationTask(firstId, true)
+    const second = buildTask(secondId, 'Clarifying', { repository: 'C:/repo/second' })
+    forgeApi.getTask.mockImplementation(async (id: string) => id === firstId ? first : second)
+    await navigate(taskUrl(firstId))
+    const rendered = await renderApp()
+    await click(findButton(rendered.container, 'View approved implementation diff'))
+    const reviewUrl = `${window.location.pathname}${window.location.search}`
+
+    await dispatchPopState(taskUrl(firstId))
+    expect(rendered.container.querySelector('.implementation-review-return')).toBeNull()
+    await dispatchPopState(reviewUrl)
+    expect(rendered.container.textContent).toContain('Approved implementation revision 1')
+
+    await dispatchPopState(taskUrl(secondId))
+    await expectText(rendered.container, 'C:/repo/second')
+    expect(rendered.container.querySelector('.implementation-review-return')).toBeNull()
+    expect(rendered.container.textContent).not.toContain('Approved implementation revision 1')
+  })
+
+  it('reopens cached historical plan 1 with revision 1 after replacement plan 2 becomes current', async () => {
+    const original = buildManualVerificationTask(firstId, true)
+    const revisionTwoId = '77777777-7777-4777-8777-777777777777'
+    const revisionTwoFingerprint = '7'.repeat(64)
+    const replacement = structuredClone(original)
+    replacement.implementationRevisions[0] = { ...replacement.implementationRevisions[0], reviewState: 'HistoricallyApproved', isCurrent: false, isApproved: false }
+    replacement.implementationRevisions.push({ ...replacement.implementationRevisions[0], revisionId: revisionTwoId,
+      revisionNumber: 2, kind: 'Correction', previousRevisionId: original.implementationRevisions[0].revisionId,
+      reviewState: 'Approved', resultFingerprint: revisionTwoFingerprint, isCurrent: true, isApproved: true })
+    replacement.verificationPlans![0] = { ...replacement.verificationPlans![0], status: 'Superseded' }
+    replacement.verificationPlans!.push({ ...replacement.verificationPlans![0],
+      planId: '88888888-8888-4888-8888-888888888888', planNumber: 2, status: 'Current',
+      implementationRevisionId: revisionTwoId, implementationResultFingerprint: revisionTwoFingerprint })
+    replacement.activeImplementationRevisionId = revisionTwoId
+    replacement.approvedImplementationRevisionId = revisionTwoId
+    replacement.currentVerificationPlanId = replacement.verificationPlans![1].planId
+    const second = buildTask(secondId, 'Clarifying')
+    let firstRead = true
+    forgeApi.getTask.mockImplementation(async (id: string) => {
+      if (id === secondId) return second
+      if (firstRead) { firstRead = false; return original }
+      return replacement
+    })
+    await navigate(taskUrl(firstId))
+    const rendered = await renderApp()
+    await dispatchPopState(taskUrl(secondId))
+    await dispatchPopState(taskUrl(firstId))
+    await expectText(rendered.container, 'Superseded verification plans')
+    const history = rendered.container.querySelector<HTMLDetailsElement>('.verification-plan-history')!
+    history.open = true
+
+    await click(history.querySelector<HTMLButtonElement>('button')!)
+
+    expect(rendered.container.textContent).toContain('Approved implementation revision 1')
+    expect(window.location.search).toContain(`revision=${original.implementationRevisions[0].revisionId}`)
+  })
+
+  it('shows corrected-revision approval progress while the revision-two request is pending', async () => {
+    const review = buildImplementationReviewTask(firstId)
+    const revision1 = { ...review.implementationRevisions[0], reviewState: 'Approved' as const,
+      isCurrent: false, isApproved: true, approvedAt: '2026-07-18T12:08:00.000Z' }
+    const revision2 = { ...review.implementationRevisions[0],
+      revisionId: '22222222-2222-4222-8222-222222222222', revisionNumber: 2,
+      kind: 'Correction' as const, previousRevisionId: revision1.revisionId,
+      reviewState: 'Current' as const, resultFingerprint: 'c'.repeat(64),
+      correctionSubmittedAt: '2026-07-18T12:09:00.000Z', approvedAt: null,
+      isCurrent: true, isApproved: false }
+    review.implementationRevisions = [revision1, revision2]
+    review.activeImplementationRevisionId = revision2.revisionId
+    review.approvedImplementationRevisionId = revision1.revisionId
+    const pending = deferred<EngineeringTask>()
+    forgeApi.getTask.mockResolvedValue(review)
+    forgeApi.approveImplementation.mockReturnValue(pending.promise)
+
+    await navigate(taskUrl(firstId))
+    const rendered = await renderApp()
+    await click(findButton(rendered.container, 'Approve implementation'))
+    await click(findButton(rendered.container, 'Confirm approval'))
+
+    const progress = findButton(rendered.container, 'Approving corrected revision…')
+    expect(progress.disabled).toBe(true)
+    expect(progress.getAttribute('aria-busy')).toBe('true')
+    pending.reject(new Error('Correction approval failed safely.'))
+    await settle()
+    expect(findButton(rendered.container, 'Approve implementation')).toBeTruthy()
+    expect(rendered.container.textContent).toContain('Correction approval failed safely.')
+  })
+
   it('uses an accessible fallback when native dialog support is unavailable', async () => {
     Reflect.deleteProperty(HTMLDialogElement.prototype, 'showModal')
     const review = buildImplementationReviewTask(firstId)
@@ -943,6 +1148,35 @@ describe('App task navigation hardening', () => {
     expect(rendered.container.textContent).not.toContain('could not be validated safely')
   })
 
+  it('shows and clears replacement-plan progress for approved revision two', async () => {
+    const selected = buildVerificationReadyTask(firstId)
+    const revision1 = { ...selected.implementationRevisions[0], reviewState: 'HistoricallyApproved' as const,
+      isApproved: false, isCurrent: false }
+    const revision2 = { ...selected.implementationRevisions[0],
+      revisionId: '99999999-9999-4999-8999-999999999999', revisionNumber: 2,
+      kind: 'Correction' as const, previousRevisionId: revision1.revisionId,
+      reviewState: 'Approved' as const, resultFingerprint: '9'.repeat(64), isApproved: true, isCurrent: true }
+    selected.implementationRevisions = [revision1, revision2]
+    selected.activeImplementationRevisionId = revision2.revisionId
+    selected.approvedImplementationRevisionId = revision2.revisionId
+    selected.verificationEligibility = {
+      ...selected.verificationEligibility!, isInitialVerificationPlanGeneration: false,
+    }
+    const pending = deferred<EngineeringTask>()
+    forgeApi.getTask.mockResolvedValue(selected)
+    forgeApi.generateVerificationPlan.mockReturnValue(pending.promise)
+    await navigate(taskUrl(firstId))
+    const rendered = await renderApp()
+
+    await click(findButton(rendered.container, 'Generate replacement verification plan'))
+    const progress = findButton(rendered.container, 'Generating verification plan 2…')
+    expect(progress.disabled).toBe(true)
+    expect(progress.getAttribute('aria-busy')).toBe('true')
+    pending.resolve(selected)
+    await settle()
+    expect(findButton(rendered.container, 'Generate replacement verification plan')).toBeTruthy()
+  })
+
   it.each([
     ['valid', false],
     ['malformed', true],
@@ -1065,12 +1299,37 @@ describe('App task navigation hardening', () => {
       start.click()
     })
     expect(forgeApi.startVerificationAttempt).toHaveBeenCalledTimes(1)
+    const pendingButton = findButton(rendered.container, 'Starting verification…')
+    expect(pendingButton.disabled).toBe(true)
+    expect(pendingButton.getAttribute('aria-busy')).toBe('true')
 
     await click(findButton(rendered.container, 'New task'))
     pending.resolve(eligible)
     await settle()
     expect(rendered.container.textContent).toContain('What are we building?')
     expect(forgeApi.startVerificationAttempt).toHaveBeenCalledTimes(1)
+  })
+
+  it('clears Start progress after success and bounded error', async () => {
+    const eligible = buildManualVerificationTask(firstId, true)
+    const first = deferred<EngineeringTask>()
+    const second = deferred<EngineeringTask>()
+    forgeApi.getTask.mockResolvedValue(eligible)
+    forgeApi.startVerificationAttempt.mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise)
+    await navigate(taskUrl(firstId))
+    const rendered = await renderApp()
+
+    await click(findButton(rendered.container, 'Start verification'))
+    expect(findButton(rendered.container, 'Starting verification…')).toBeTruthy()
+    first.resolve(eligible)
+    await settle()
+    expect(findButton(rendered.container, 'Start verification').getAttribute('aria-busy')).toBe('false')
+
+    await click(findButton(rendered.container, 'Start verification'))
+    second.reject(new Error('The verification attempt could not be started safely.'))
+    await settle()
+    expect(findButton(rendered.container, 'Start verification')).toBeTruthy()
+    expect(rendered.container.textContent).toContain('could not be started safely')
   })
 
   it('never treats the latest plan history entry as actionable without a current pointer', async () => {
@@ -1370,11 +1629,12 @@ function buildManualVerificationTask(id: string, canStart: boolean): Engineering
   const resultFingerprint = 'c'.repeat(64)
   const planId = '11111111-1111-4111-8111-111111111111'
   return buildTask(id, 'AwaitingManualVerification', {
+    implementationResult: buildImplementationReviewTask(id).implementationResult,
     activeImplementationRevisionId: revisionId,
     approvedImplementationRevisionId: revisionId,
     implementationRevisions: [{
       revisionId, revisionNumber: 1, kind: 'Initial', previousRevisionId: null,
-      planFingerprint: 'a'.repeat(64), baseCommitSha: 'b'.repeat(40),
+      planFingerprint: 'a'.repeat(64), baseCommitSha: '0123456789abcdef0123456789abcdef01234567',
       generationStartedAt: '2026-07-18T11:00:00.000Z', generationCompletedAt: '2026-07-18T11:10:00.000Z',
       generationState: 'Succeeded', reviewState: 'Approved', failureCategory: null, failureMessage: null,
       resultFingerprint, changedFileCount: 1, correctionSubmittedAt: null,
@@ -1451,7 +1711,7 @@ function buildImplementationReviewTask(id: string): EngineeringTask {
         newLines: 2,
         additions: 1,
         deletions: 0,
-        diffPreview: 'diff --git a/src/ReportExportService.cs b/src/ReportExportService.cs',
+        diffPreview: 'diff --git a/src/ReportExportService.cs b/src/ReportExportService.cs\n--- a/src/ReportExportService.cs\n+++ b/src/ReportExportService.cs\n-old\n+new',
         fullDiffCharacters: 120,
         displayedDiffCharacters: 70,
         diffTruncated: true,

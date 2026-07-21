@@ -66,7 +66,9 @@ public sealed record ImplementationWorkspace(
     string OwnershipReference = "",
     string ActiveCheckoutContentFingerprint = "",
     int ActiveCheckoutTrackedFileCount = 0,
-    long ActiveCheckoutTrackedBytes = 0);
+    long ActiveCheckoutTrackedBytes = 0,
+    int RevisionNumber = 1,
+    string TaskToken = "");
 
 public sealed record ImplementationLease(
     Guid LeaseId,
@@ -131,7 +133,20 @@ public sealed record ImplementationContext(
     IReadOnlyList<EvidenceItem>? Evidence = null,
     IReadOnlyList<string>? ProjectConventions = null,
     int OmittedOptionalContextCount = 0,
-    string ContextFingerprint = "");
+    string ContextFingerprint = "",
+    CorrectionImplementationContext? Correction = null);
+
+public sealed record CorrectionImplementationContext(
+    Guid ProposalId,
+    string ProposalFingerprint,
+    Guid PreviousRevisionId,
+    string PreviousResultFingerprint,
+    IReadOnlyList<ApprovedOperationReference> CorrectionOperations,
+    IReadOnlyDictionary<string, string?> PreviousFinalContent,
+    string RootCauseSummary,
+    string CorrectionStrategy,
+    string ExpectedBehavior,
+    string VerificationImpact);
 
 public sealed record ImplementationOperation(
     string Path,
@@ -167,6 +182,11 @@ public interface IImplementationEngine
     Task<ImplementationEvaluation> GenerateAsync(
         ImplementationContext context,
         CancellationToken cancellationToken = default);
+
+    Task<ImplementationEvaluation> GenerateCorrectionAsync(
+        ImplementationContext context,
+        IImplementationGenerationObserver observer,
+        CancellationToken cancellationToken = default) => GenerateAsync(context, cancellationToken);
 }
 
 public sealed record ChangedFileReview(
@@ -225,7 +245,8 @@ public enum ImplementationReviewState
     NotReviewable,
     Current,
     Superseded,
-    Approved
+    Approved,
+    HistoricallyApproved
 }
 
 public sealed record ImplementationRevision(
@@ -250,7 +271,9 @@ public sealed record ImplementationRevision(
     ImplementationLease? Lease,
     DateTimeOffset? ApprovedAt,
     Guid? ApprovalCommandId,
-    long? ApprovalExpectedRowVersion = null);
+    long? ApprovalExpectedRowVersion = null,
+    Guid? CorrectionProposalId = null,
+    string? CorrectionProposalFingerprint = null);
 
 public sealed record ActiveCheckoutSignature(
     string Branch,
@@ -272,6 +295,10 @@ public sealed record ImplementationInspection(
     string RepositoryIdentity,
     string GitCommonDirectoryIdentity);
 
+public sealed record CorrectionSourceInspection(
+    ImplementationInspection OriginalBaseInspection,
+    IReadOnlyDictionary<string, string?> PreviousFinalContent);
+
 public sealed record PreparedImplementationWorkspace(
     ImplementationWorkspace Workspace,
     ActiveCheckoutSignature ActiveCheckout,
@@ -285,6 +312,17 @@ public interface IImplementationWorkspaceLock : IAsyncDisposable
 
 public interface IImplementationWorkspaceManager
 {
+    Task<CorrectionSourceInspection> InspectCorrectionSourceAsync(
+        string repositoryPath,
+        RepositorySnapshot snapshot,
+        ImplementationPlan plan,
+        ImplementationWorkspace previousWorkspace,
+        ImplementationResult previousResult,
+        ImplementationLimits limits,
+        CancellationToken cancellationToken = default) =>
+        throw new ImplementationException("correction_recovery_required",
+            "Correction source inspection is not supported by this workspace manager.", true);
+
     Task<ImplementationInspection> InspectAsync(
         string repositoryPath,
         RepositorySnapshot snapshot,
@@ -301,6 +339,17 @@ public interface IImplementationWorkspaceManager
         ImplementationInspection inspection,
         CancellationToken cancellationToken = default) =>
         ReserveAsync(taskId, repositoryPath, snapshot, plan, limits, cancellationToken);
+
+    Task<ImplementationReservation> ReserveRevisionAsync(
+        Guid taskId,
+        int revisionNumber,
+        string repositoryPath,
+        RepositorySnapshot snapshot,
+        ImplementationPlan plan,
+        ImplementationLimits limits,
+        ImplementationInspection inspection,
+        CancellationToken cancellationToken = default) =>
+        ReserveAsync(taskId, repositoryPath, snapshot, plan, limits, inspection, cancellationToken);
 
     Task<ImplementationReservation> ReserveAsync(
         Guid taskId,

@@ -128,5 +128,5 @@ public sealed class PlanningWorkflowTests
 
     internal static ImplementationPlan Plan(RepositorySnapshot snapshot, IReadOnlyList<EvidenceItem> evidence) =>
         new FakePlanningEngine().CreatePlanAsync(new PlanningContext(
-            "Requirement", "Approved requirement", [], [], snapshot, evidence, Now)).GetAwaiter().GetResult().Plan;
+            "Requirement", "Modify only `src/App.cs`.", [], [], snapshot, evidence, Now)).GetAwaiter().GetResult().Plan;
 }

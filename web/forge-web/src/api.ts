@@ -17,13 +17,15 @@ const workflowStatuses = new Set([
   'Draft', 'Clarifying', 'RequirementSummaryReady', 'AwaitingRequirementApproval', 'ReadyForPlanning',
   'Planning', 'AwaitingPlanApproval', 'PlanApproved', 'Implementing', 'AwaitingImplementationReview',
   'ImplementationApproved', 'VerificationPlanning', 'AwaitingManualVerification', 'ManualVerificationFailed',
-  'ReadyForDelivery', 'Validating', 'Reviewing', 'Completed', 'Failed',
+  'FailureAnalysisPending', 'FailureAnalysisRecoveryRequired', 'AwaitingFailureResolution', 'AwaitingCorrectionApproval', 'CorrectionApproved', 'ImplementingCorrection', 'CorrectionRecoveryRequired',
+  'ReadyForDelivery', 'AwaitingDeliveryApproval', 'Delivering', 'PullRequestCreated', 'DeliveryRecoveryRequired',
+  'Validating', 'Reviewing', 'Completed', 'Failed',
 ])
 const verificationStatuses = new Set([
-  'NotStarted', 'Active', 'FailedBeforeDispatch', 'RetryableProviderResponse', 'AmbiguousAfterDispatch',
+  'NotStarted', 'Active', 'FailedBeforeDispatch', 'RetryableProviderResponse', 'RejectedProviderOutput', 'AmbiguousAfterDispatch',
   'InterruptedBeforeDispatch', 'Completed',
 ])
-const safeRetryStatuses = new Set(['FailedBeforeDispatch', 'RetryableProviderResponse', 'InterruptedBeforeDispatch'])
+const safeRetryStatuses = new Set(['FailedBeforeDispatch', 'RetryableProviderResponse', 'RejectedProviderOutput', 'InterruptedBeforeDispatch'])
 export const invalidVerificationEligibilityMessage = 'Verification generation state could not be validated. Reload the task before taking action.'
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -33,12 +35,12 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 const guidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 const usageStates = new Set(['Complete', 'Partial', 'Unavailable'])
 const responseStates = new Set(['Unknown', 'Queued', 'InProgress', 'Completed', 'Incomplete', 'Failed', 'Cancelled'])
-const attemptStates = new Set(['Prepared', 'DispatchMayHaveStarted', 'ResponseReceived', 'Completed', 'FailedBeforeDispatch', 'RetryableProviderResponse', 'AmbiguousAfterDispatch', 'InterruptedBeforeDispatch'])
+const attemptStates = new Set(['Prepared', 'DispatchMayHaveStarted', 'ResponseReceived', 'Completed', 'FailedBeforeDispatch', 'RetryableProviderResponse', 'RejectedProviderOutput', 'AmbiguousAfterDispatch', 'InterruptedBeforeDispatch'])
 const caseResults = new Set(['NotStarted', 'Passed', 'Failed', 'Blocked', 'NotApplicable'])
 const manualAttemptStates = new Set(['InProgress', 'CompletedPassed', 'CompletedFailed'])
 const testCategories = new Set(['Build', 'UnitTest', 'IntegrationTest', 'EndToEnd', 'LintOrStaticAnalysis', 'ManualBehavior', 'Regression', 'Security', 'DataOrMigration', 'Other'])
 const dispatchStates = new Set(['DefinitelyNotDispatched', 'PossiblyDispatched', 'ResponseReceived'])
-const modelStages = new Set(['Clarification', 'Planning', 'Implementation', 'VerificationPlanning'])
+const modelStages = new Set(['Clarification', 'Planning', 'Implementation', 'VerificationPlanning', 'FailureAnalysis'])
 const plannedFileActions = new Set(['Modify', 'Create', 'Delete', 'Inspect'])
 const implementationOperationActions = new Set(['Create', 'Modify', 'Delete'])
 const workspacePhases = new Set(['Reserved', 'Ready', 'RecoveryRequired', 'Completed', 'WorkspacePreparing',
@@ -60,6 +62,7 @@ const isStringArray = (value: unknown, maximumItems = 200, maximumLength = 10_00
   Array.isArray(value) && value.length <= maximumItems && value.every(item => isSafeString(item, maximumLength))
 const isNullableGuid = (value: unknown) => value === null || isGuid(value)
 const isSha256 = (value: unknown) => typeof value === 'string' && sha256Pattern.test(value)
+const isGitSha = (value: unknown) => typeof value === 'string' && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(value)
 const isNullableSha256 = (value: unknown) => value === null || isSha256(value)
 const isBoolean = (value: unknown) => typeof value === 'boolean'
 const isNumberInRange = (value: unknown, minimum: number, maximum: number) =>
@@ -212,7 +215,9 @@ function decodeTestCase(value: unknown) {
     !Array.isArray(value.orderedSteps) || !value.orderedSteps.every(decodeTestStep) ||
     !isSafeString(value.expectedResult) || !isStringArray(value.negativeOrEdgeCases) ||
     !isStringArray(value.regressionScope) || !isStringArray(value.evidenceRequirements) ||
-    !isStringArray(value.safetyNotes)) return false
+    !isStringArray(value.safetyNotes) || !(value.originTestCaseId === undefined || isNullableGuid(value.originTestCaseId)) ||
+    !(value.regressionFailureReportIds === undefined || Array.isArray(value.regressionFailureReportIds) &&
+      value.regressionFailureReportIds.every(isGuid) && areUnique(value.regressionFailureReportIds as string[]))) return false
   return isSequential(value.orderedSteps.map(step => (step as Record<string, unknown>).order as number))
 }
 
@@ -227,7 +232,9 @@ function decodeVerificationPlan(value: unknown) {
       !Array.isArray(value.testCases) || !value.testCases.every(decodeTestCase) ||
       !isStringArray(value.risks) || !isStringArray(value.limitations) || !isStringArray(value.evidenceGuidance) ||
       !['Current', 'Superseded', 'Completed'].includes(value.status as string) ||
-      !isSafeString(value.trustLabel, 100) || !isSafeString(value.executionLabel, 100)) return false
+      !isSafeString(value.trustLabel, 100) || !isSafeString(value.executionLabel, 100) ||
+      !(value.supersedesPlanId === undefined || isNullableGuid(value.supersedesPlanId)) ||
+      !(value.regenerationReason === undefined || isNullableString(value.regenerationReason, 500))) return false
   const cases = value.testCases as Array<Record<string, unknown>>
   return areUnique(cases.map(testCase => testCase.testCaseId as string)) &&
     isSequential(cases.map(testCase => testCase.order as number))
@@ -295,11 +302,244 @@ function decodeImplementationRevision(value: unknown) {
     isSafeString(value.planFingerprint, 128) && isSafeString(value.baseCommitSha, 128) &&
     isTimestamp(value.generationStartedAt) && isNullableTimestamp(value.generationCompletedAt) &&
     ['Requested', 'Generating', 'Succeeded', 'Failed'].includes(value.generationState as string) &&
-    ['NotReviewable', 'Current', 'Superseded', 'Approved'].includes(value.reviewState as string) &&
+    ['NotReviewable', 'Current', 'Superseded', 'Approved', 'HistoricallyApproved'].includes(value.reviewState as string) &&
     isNullableString(value.failureCategory, 200) && isNullableString(value.failureMessage) &&
     isNullableString(value.resultFingerprint, 128) && isSafeInteger(value.changedFileCount) &&
     isNullableTimestamp(value.correctionSubmittedAt) && isNullableTimestamp(value.approvedAt) &&
-    typeof value.isCurrent === 'boolean' && typeof value.isApproved === 'boolean'
+    typeof value.isCurrent === 'boolean' && typeof value.isApproved === 'boolean' &&
+    (value.correctionProposalId === undefined || isNullableGuid(value.correctionProposalId)) &&
+    (value.correctionProposalFingerprint === undefined || isNullableSha256(value.correctionProposalFingerprint))
+}
+
+function decodeApprovedOperation(value: unknown) {
+  return isRecord(value) && isSafeString(value.path, 300) && implementationOperationActions.has(value.action as string)
+}
+
+function decodeFailureAnalysis(value: unknown) {
+  return isRecord(value) && isGuid(value.analysisId) && isSafeInteger(value.analysisNumber) && value.analysisNumber > 0 &&
+    isGuid(value.generationCommandId) && isSha256(value.contextFingerprint) && isGuid(value.failedAttemptId) &&
+    isSha256(value.failedAttemptFingerprint) && isGuid(value.verificationPlanId) &&
+    isSha256(value.verificationPlanFingerprint) && isGuid(value.implementationRevisionId) &&
+    isSha256(value.implementationResultFingerprint) &&
+    ['ImplementationDefect', 'ApprovedPlanDefect', 'ApprovedRequirementDefect', 'EnvironmentOrSetupIssue', 'InsufficientEvidence'].includes(value.classification as string) &&
+    isNumberInRange(value.confidencePercent, 0, 100) && isSafeString(value.rootCauseSummary, 1200) &&
+    isSafeString(value.rationale, 2000) && isStringArray(value.evidenceReferences, 24, 500) &&
+    Array.isArray(value.affectedApprovedOperations) && value.affectedApprovedOperations.length <= 20 &&
+    value.affectedApprovedOperations.every(decodeApprovedOperation) && isSafeString(value.correctionStrategy, 2000) &&
+    isSafeString(value.expectedBehavior, 1200) && isSafeString(value.verificationImpact, 1200) &&
+    isStringArray(value.risks, 8, 500) && ['DeterministicFake', 'OpenAI'].includes(value.source as string) &&
+    isNullableString(value.model, 200) && isNullableString(value.reasoningEffort, 80) &&
+    Array.isArray(value.modelCallIds) && value.modelCallIds.every(isGuid) && areUnique(value.modelCallIds as string[]) &&
+    isSha256(value.analysisFingerprint) && value.status === 'Completed' && isTimestamp(value.createdAt) &&
+    isSafeString(value.trustLabel, 100) && isSafeString(value.safeRoute, 1000)
+}
+
+function decodeCorrectionProposal(value: unknown) {
+  return isRecord(value) && isGuid(value.proposalId) && isSafeInteger(value.proposalNumber) && value.proposalNumber > 0 &&
+    isGuid(value.analysisId) && isSha256(value.analysisFingerprint) && isGuid(value.failedAttemptId) &&
+    isSha256(value.failedAttemptFingerprint) && isGuid(value.previousApprovedRevisionId) &&
+    isSha256(value.previousResultFingerprint) && isSha256(value.approvedRequirementFingerprint) &&
+    isSha256(value.approvedPlanFingerprint) && isSafeString(value.originalBaseCommitSha, 128) &&
+    Array.isArray(value.affectedApprovedOperations) &&
+    value.affectedApprovedOperations.length > 0 && value.affectedApprovedOperations.length <= 20 &&
+    value.affectedApprovedOperations.every(decodeApprovedOperation) && isSafeString(value.rootCauseSummary, 1200) &&
+    isSafeString(value.correctionStrategy, 2000) && isSafeString(value.expectedBehavior, 1200) &&
+    isSafeString(value.verificationImpact, 1200) && isStringArray(value.risks, 8, 500) &&
+    isSha256(value.proposalFingerprint) && ['AwaitingApproval', 'Approved'].includes(value.status as string) &&
+    isTimestamp(value.createdAt) && isNullableTimestamp(value.approvedAt)
+}
+
+function decodeCorrectionEligibility(value: unknown) {
+  return isRecord(value) && ['canGenerateFailureAnalysis', 'canApproveCorrection', 'canGenerateCorrection',
+    'canApproveCorrectedRevision', 'canGenerateReplacementVerificationPlan'].every(key => typeof value[key] === 'boolean')
+}
+
+function decodeFailureAnalysisAttempt(value: unknown) {
+  const states = ['Prepared', 'DispatchMayHaveStarted', 'ResponseReceived', 'Completed',
+    'FailedBeforeDispatch', 'RetryableProviderResponse', 'RejectedProviderOutput', 'AmbiguousAfterDispatch',
+    'ExpiredBeforeDispatch', 'InterruptedAfterResponse']
+  return isRecord(value) && isGuid(value.commandId) && isGuid(value.expectedFailedAttemptId) &&
+    isSha256(value.expectedFailedAttemptFingerprint) && isTimestamp(value.startedAt) && isTimestamp(value.leaseExpiresAt) &&
+    Date.parse(value.leaseExpiresAt as string) > Date.parse(value.startedAt as string) && isTimestamp(value.updatedAt) &&
+    isNullableTimestamp(value.completedAt) &&
+    Date.parse(value.updatedAt as string) >= Date.parse(value.startedAt as string) && states.includes(value.status as string) &&
+    isSafeInteger(value.logicalCallCount) && isSafeInteger(value.physicalRequestCount) &&
+    isSafeInteger(value.possiblyDispatchedRequestCount) && isSafeInteger(value.definitelyUndispatchedRequestCount) &&
+    isSafeInteger(value.activeRequestCount) && value.physicalRequestCount + value.possiblyDispatchedRequestCount +
+      value.definitelyUndispatchedRequestCount + value.activeRequestCount === value.logicalCallCount &&
+    Array.isArray(value.modelCallIds) &&
+    value.modelCallIds.every(isGuid) && areUnique(value.modelCallIds as string[]) &&
+    value.physicalRequestCount === value.modelCallIds.length && value.possiblyDispatchedRequestCount <= value.logicalCallCount &&
+    Array.isArray(value.providerResponses) && value.providerResponses.every(decodeProviderResponse) &&
+    isNullableGuid(value.resultAnalysisId) &&
+    isNullableString(value.failureCategory, 200) && isNullableString(value.failureMessage, 1000) &&
+    typeof value.retryEligible === 'boolean' && typeof value.recoveryRequired === 'boolean' &&
+    value.retryEligible === ['FailedBeforeDispatch', 'RetryableProviderResponse', 'RejectedProviderOutput', 'ExpiredBeforeDispatch'].includes(value.status as string) &&
+    value.recoveryRequired === ['AmbiguousAfterDispatch', 'InterruptedAfterResponse'].includes(value.status as string) &&
+    (['Prepared', 'DispatchMayHaveStarted', 'ResponseReceived'].includes(value.status as string)
+      ? value.completedAt === null : value.completedAt !== null)
+}
+
+function decodeCorrectionGenerationAttempt(value: unknown) {
+  const states = ['Prepared', 'DispatchMayHaveStarted', 'ResponseReceived', 'OutputAccepted', 'CheckoutVerified',
+    'RevisionReserved', 'WorkspacePreparing', 'WorkspacePrepared', 'MutationStarted', 'ApplyCompleted',
+    'ResultPersisted', 'FailedBeforeDispatch', 'FailedBeforeMutation', 'AmbiguousAfterDispatch', 'InterruptedAfterResponse', 'RecoveryRequired', 'Completed']
+  return isRecord(value) && isGuid(value.attemptId) && isGuid(value.commandId) && isGuid(value.proposalId) &&
+    isSha256(value.proposalFingerprint) && isGuid(value.previousRevisionId) && isSha256(value.previousResultFingerprint) &&
+    isTimestamp(value.startedAt) &&
+    isTimestamp(value.leaseExpiresAt) && Date.parse(value.leaseExpiresAt as string) > Date.parse(value.startedAt as string) &&
+    isNullableTimestamp(value.completedAt) &&
+    isTimestamp(value.updatedAt) && Date.parse(value.updatedAt as string) >= Date.parse(value.startedAt as string) &&
+    states.includes(value.status as string) && isSafeInteger(value.logicalCallCount) &&
+    isSafeInteger(value.physicalRequestCount) && isSafeInteger(value.possiblyDispatchedRequestCount) &&
+    isSafeInteger(value.definitelyUndispatchedRequestCount) && isSafeInteger(value.activeRequestCount) &&
+    value.physicalRequestCount + value.possiblyDispatchedRequestCount + value.definitelyUndispatchedRequestCount +
+      value.activeRequestCount === value.logicalCallCount &&
+    Array.isArray(value.modelCallIds) && value.modelCallIds.every(isGuid) && areUnique(value.modelCallIds as string[]) &&
+    value.physicalRequestCount === value.modelCallIds.length && value.possiblyDispatchedRequestCount <= value.logicalCallCount &&
+    Array.isArray(value.providerResponses) && value.providerResponses.every(decodeProviderResponse) &&
+    (value.acceptedOutputFingerprint === null || isSha256(value.acceptedOutputFingerprint)) &&
+    isNullableGuid(value.revisionId) && isNullableString(value.failureCategory, 200) &&
+    isNullableString(value.failureMessage, 1000) && typeof value.retryEligible === 'boolean' &&
+    typeof value.recoveryRequired === 'boolean' &&
+    value.retryEligible === ['FailedBeforeDispatch', 'FailedBeforeMutation'].includes(value.status as string) &&
+    value.recoveryRequired === ['AmbiguousAfterDispatch', 'InterruptedAfterResponse', 'RecoveryRequired'].includes(value.status as string) &&
+    (['FailedBeforeDispatch', 'FailedBeforeMutation', 'AmbiguousAfterDispatch', 'InterruptedAfterResponse', 'RecoveryRequired', 'Completed'].includes(value.status as string)
+      ? value.completedAt !== null : value.completedAt === null)
+}
+
+function decodeCorrectionApprovalAudit(value: unknown) {
+  return isRecord(value) && isGuid(value.commandId) && isGuid(value.proposalId) &&
+    isSha256(value.proposalFingerprint) && isSafeInteger(value.expectedRowVersion) &&
+    isSafeInteger(value.completedRowVersion) && value.completedRowVersion === value.expectedRowVersion + 1 &&
+    isTimestamp(value.createdAt) && isTimestamp(value.completedAt) &&
+    Date.parse(value.completedAt as string) >= Date.parse(value.createdAt as string) && value.result === 'Approved'
+}
+
+function decodeDeliveryProposal(value: unknown) {
+  return isRecord(value) && isGuid(value.deliveryProposalId) && value.proposalNumber === 1 &&
+    isGuid(value.currentApprovedRevisionId) && isSha256(value.currentImplementationResultFingerprint) &&
+    isGuid(value.currentVerificationPlanId) && isSha256(value.currentVerificationPlanFingerprint) &&
+    isGuid(value.passedManualAttemptId) && isSha256(value.passedManualAttemptFingerprint) &&
+    isGitSha(value.baseCommitSha) && value.remoteName === 'origin' && isSafeString(value.gitHubRepositoryOwner, 100) &&
+    isSafeString(value.gitHubRepositoryName, 100) && value.targetBaseBranch === 'main' &&
+    isGitSha(value.targetBaseCommitShaAtPreparation) && isSafeString(value.deliveryBranch, 160) &&
+    /^forge-delivery-[a-z0-9-]+$/.test(value.deliveryBranch as string) &&
+    isSafeString(value.commitMessage, 160) && !(value.commitMessage as string).includes('\n') &&
+    isSafeString(value.pullRequestTitle, 120) && !(value.pullRequestTitle as string).includes('\n') &&
+    isSafeString(value.pullRequestBody, 8192) && new TextEncoder().encode(value.pullRequestBody as string).length <= 8192 &&
+    Array.isArray(value.changedPaths) && value.changedPaths.length > 0 && value.changedPaths.length <= 24 &&
+    value.changedPaths.every(path => isSafeString(path, 300) && !/^(?:[a-z]:|[/\\]|.*(?:^|[/\\])\.\.(?:[/\\]|$))/i.test(path as string)) &&
+    areUnique(value.changedPaths as string[]) && isSha256(value.proposalFingerprint) && isTimestamp(value.createdAt) &&
+    ['Prepared', 'Approved', 'Delivered'].includes(value.status as string) && isNullableTimestamp(value.approvedAt) &&
+    (value.status === 'Prepared' ? value.approvedAt === null : value.approvedAt !== null)
+}
+
+function decodeDeliveryAttempt(value: unknown) {
+  const phases = ['Prepared', 'WorktreeVerified', 'StagingStarted', 'CommitCreated', 'PushStarted', 'BranchPushed',
+    'PullRequestCreationStarted', 'PullRequestCreated', 'FailedBeforeMutation', 'RecoveryRequired']
+  return isRecord(value) && isGuid(value.attemptId) && isSafeInteger(value.attemptNumber) &&
+    value.attemptNumber >= 1 && value.attemptNumber <= 3 && isGuid(value.commandId) && isGuid(value.deliveryProposalId) &&
+    isSha256(value.deliveryProposalFingerprint) && isTimestamp(value.startedAt) && isTimestamp(value.updatedAt) &&
+    isNullableTimestamp(value.completedAt) && isTimestamp(value.leaseExpiresAt) &&
+    Date.parse(value.updatedAt as string) >= Date.parse(value.startedAt as string) &&
+    Date.parse(value.leaseExpiresAt as string) > Date.parse(value.startedAt as string) &&
+    phases.includes(value.phase as string) && (value.commitSha === null || isGitSha(value.commitSha)) &&
+    (value.remoteBranchSha === null || isGitSha(value.remoteBranchSha)) &&
+    (value.pullRequestNumber === null || isSafeInteger(value.pullRequestNumber) && value.pullRequestNumber > 0) &&
+    (value.pullRequestUrl === null || isSafeString(value.pullRequestUrl, 500) && /^https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/pull\/[1-9][0-9]*$/.test(value.pullRequestUrl as string)) &&
+    isNullableString(value.safeFailureCategory, 100) && isNullableString(value.safeFailureMessage, 500) &&
+    typeof value.recoveryRequired === 'boolean' && typeof value.activeCheckoutVerifiedBefore === 'boolean' &&
+    typeof value.activeCheckoutVerifiedAfter === 'boolean' && typeof value.legacyCanonicalizationUsed === 'boolean' &&
+    (['PullRequestCreated', 'FailedBeforeMutation', 'RecoveryRequired'].includes(value.phase as string)
+      ? value.completedAt !== null : value.completedAt === null) &&
+    (value.phase === 'RecoveryRequired') === value.recoveryRequired && validateDeliveryAttemptPhase(value)
+}
+
+function validateDeliveryAttemptPhase(value: Record<string, unknown>) {
+  const noPullRequest = value.pullRequestNumber === null && value.pullRequestUrl === null
+  const noFailure = value.safeFailureCategory === null && value.safeFailureMessage === null && value.recoveryRequired === false
+  if (['Prepared', 'WorktreeVerified', 'StagingStarted'].includes(value.phase as string))
+    return value.commitSha === null && value.remoteBranchSha === null && noPullRequest && noFailure
+  if (['CommitCreated', 'PushStarted'].includes(value.phase as string))
+    return value.commitSha !== null && value.remoteBranchSha === null && noPullRequest && noFailure
+  if (['BranchPushed', 'PullRequestCreationStarted'].includes(value.phase as string))
+    return value.commitSha !== null && value.remoteBranchSha === value.commitSha && noPullRequest && noFailure
+  if (value.phase === 'PullRequestCreated')
+    return value.commitSha !== null && value.remoteBranchSha === value.commitSha && value.pullRequestNumber !== null &&
+      value.pullRequestUrl !== null && noFailure && value.activeCheckoutVerifiedAfter === true
+  if (value.phase === 'FailedBeforeMutation')
+    return value.commitSha === null && value.remoteBranchSha === null && noPullRequest &&
+      value.safeFailureCategory !== null && value.safeFailureMessage !== null
+  return value.phase === 'RecoveryRequired' && value.safeFailureCategory !== null && value.safeFailureMessage !== null
+}
+
+function decodeDeliveryEligibility(value: unknown) {
+  return isRecord(value) && ['canPrepareDelivery', 'canApproveDelivery', 'canExecuteDelivery',
+    'canReconcileDelivery', 'deliveryRecoveryRequired', 'pullRequestCreated'].every(key => typeof value[key] === 'boolean')
+}
+
+function validateDeliveryRelationships(task: Record<string, unknown>) {
+  const proposals = (task.deliveryProposals ?? []) as Array<Record<string, unknown>>
+  const attempts = (task.deliveryAttempts ?? []) as Array<Record<string, unknown>>
+  const eligibility = (task.deliveryEligibility ?? {
+    canPrepareDelivery: false, canApproveDelivery: false, canExecuteDelivery: false,
+    canReconcileDelivery: false, deliveryRecoveryRequired: false, pullRequestCreated: false,
+  }) as Record<string, unknown>
+  const deliveryStatus = ['AwaitingDeliveryApproval', 'Delivering', 'PullRequestCreated', 'DeliveryRecoveryRequired']
+    .includes(task.status as string)
+  if (!deliveryStatus && proposals.length === 0 && attempts.length === 0)
+    return Object.values(eligibility).every(value => value === false) ||
+      task.status === 'ReadyForDelivery' && eligibility.canPrepareDelivery === true
+  if (proposals.length !== 1 || task.currentDeliveryProposalId !== proposals[0].deliveryProposalId) return false
+  const proposal = proposals[0]
+  const revision = (task.implementationRevisions as Array<Record<string, unknown>>)
+    .find(item => item.revisionId === proposal.currentApprovedRevisionId)
+  const plan = (task.verificationPlans as Array<Record<string, unknown>>)
+    .find(item => item.planId === proposal.currentVerificationPlanId)
+  const manual = (task.manualVerificationAttempts as Array<Record<string, unknown>>)
+    .find(item => item.attemptId === proposal.passedManualAttemptId)
+  if (!revision || revision.resultFingerprint !== proposal.currentImplementationResultFingerprint ||
+      !plan || plan.planFingerprint !== proposal.currentVerificationPlanFingerprint ||
+      !manual || manual.attemptFingerprint !== proposal.passedManualAttemptFingerprint ||
+      manual.status !== 'CompletedPassed' || manual.completionConfirmation !== true) return false
+  if (attempts.length > 3 || attempts.some(attempt => attempt.deliveryProposalId !== proposal.deliveryProposalId ||
+      attempt.deliveryProposalFingerprint !== proposal.proposalFingerprint)) return false
+  if (!attempts.every((attempt, index) => attempt.attemptNumber === index + 1) ||
+      !areUnique(attempts.map(attempt => attempt.attemptId) as string[]) ||
+      !areUnique(attempts.map(attempt => attempt.commandId) as string[])) return false
+  const currentAttemptId = task.currentDeliveryAttemptId
+  if (attempts.length === 0 ? currentAttemptId !== null : currentAttemptId !== attempts.at(-1)?.attemptId) return false
+  const activePhases = ['Prepared', 'WorktreeVerified', 'StagingStarted', 'CommitCreated', 'PushStarted',
+    'BranchPushed', 'PullRequestCreationStarted']
+  const activeAttempts = attempts.filter(attempt => activePhases.includes(attempt.phase as string))
+  if (activeAttempts.length > 1 || activeAttempts.some(attempt => attempt.attemptId !== currentAttemptId)) return false
+  const uniqueNullable = (values: unknown[]) => {
+    const present = values.filter((value): value is string | number => value !== null)
+    return new Set(present).size === present.length
+  }
+  if (!uniqueNullable(attempts.map(attempt => attempt.commitSha)) ||
+      !uniqueNullable(attempts.map(attempt => attempt.remoteBranchSha)) ||
+      !uniqueNullable(attempts.map(attempt => attempt.pullRequestNumber)) ||
+      !uniqueNullable(attempts.map(attempt => attempt.pullRequestUrl))) return false
+  if (attempts.slice(0, -1).some(attempt => attempt.phase !== 'FailedBeforeMutation' || attempt.recoveryRequired === true)) return false
+  const latestAttempt = attempts.at(-1)
+  const expected = {
+    canPrepareDelivery: false,
+    canApproveDelivery: task.status === 'AwaitingDeliveryApproval' && proposal.status === 'Prepared',
+    canExecuteDelivery: task.status === 'AwaitingDeliveryApproval' && proposal.status === 'Approved' &&
+      (attempts.length === 0 || attempts.length < 3 && latestAttempt?.phase === 'FailedBeforeMutation'),
+    canReconcileDelivery: task.status === 'DeliveryRecoveryRequired' && latestAttempt?.phase === 'RecoveryRequired',
+    deliveryRecoveryRequired: task.status === 'DeliveryRecoveryRequired',
+    pullRequestCreated: task.status === 'PullRequestCreated',
+  }
+  if (!Object.entries(expected).every(([key, value]) => eligibility[key] === value)) return false
+  if (task.status === 'Delivering') return latestAttempt !== undefined && !['PullRequestCreated', 'FailedBeforeMutation', 'RecoveryRequired'].includes(latestAttempt.phase as string)
+  if (task.status === 'DeliveryRecoveryRequired') return latestAttempt?.phase === 'RecoveryRequired'
+  if (task.status === 'PullRequestCreated') return proposal.status === 'Delivered' && latestAttempt?.phase === 'PullRequestCreated' &&
+    latestAttempt.commitSha === latestAttempt.remoteBranchSha && latestAttempt.pullRequestUrl !== null &&
+    latestAttempt.activeCheckoutVerifiedAfter === true
+  return task.status === 'AwaitingDeliveryApproval' && (attempts.length === 0 || latestAttempt?.phase === 'FailedBeforeMutation')
 }
 
 function validateUsage(state: string, available: boolean, input: unknown, cached: unknown, output: unknown,
@@ -339,14 +579,17 @@ function decodeModelCall(value: unknown): ModelCall | null {
         isCost(value.storedPricingSnapshot.outputPerMillionUsd)) ||
       (value.hasStoredPricingSnapshot === true) !== (value.storedPricingSnapshot !== null)) return null
   if (Date.parse(value.completedAt as string) < Date.parse(value.startedAt as string)) return null
-  if (value.stage === 'VerificationPlanning') {
+  if (value.stage === 'VerificationPlanning' || value.stage === 'FailureAnalysis') {
     if (!usageStates.has(value.providerUsageAvailability as string) || typeof value.providerUsageAvailable !== 'boolean' ||
         value.providerUsageAvailable !== value.usageAvailable ||
         !validateUsage(value.providerUsageAvailability as string, value.usageAvailable as boolean, value.inputTokens,
           value.cachedInputTokens, value.outputTokens, value.reasoningTokens, value.estimatedCostUsd)) return null
   } else {
     if (value.providerUsageAvailability !== undefined && value.providerUsageAvailability !== null ||
-        value.providerUsageAvailable !== undefined && value.providerUsageAvailable !== null) return null
+        value.providerUsageAvailable !== undefined && value.providerUsageAvailable !== null &&
+        (value.stage !== 'Implementation' || value.providerUsageAvailable !== value.usageAvailable ||
+          value.verificationDispatchDisposition !== 'ResponseReceived' || value.providerHttpStatusCode === null ||
+          value.providerHttpStatusCode === undefined)) return null
     if (value.usageAvailable) {
       if (value.inputTokens === null || value.outputTokens === null ||
           value.cachedInputTokens !== null && value.cachedInputTokens > value.inputTokens ||
@@ -451,12 +694,155 @@ function canCompleteManualAttempt(
   if (!passed) return currentResults.some(result =>
     (result.result === 'Failed' || result.result === 'Blocked') && result.failureDetails !== null)
   if (currentResults.some(result => result.result === 'Failed' || result.result === 'Blocked')) return false
+  if ((plan.testCases as Array<Record<string, unknown>>).some(testCase =>
+    Array.isArray(testCase.regressionFailureReportIds) && testCase.regressionFailureReportIds.length > 0 &&
+    currentResults.find(item => item.testCaseId === testCase.testCaseId)?.result !== 'Passed')) return false
   return (plan.testCases as Array<Record<string, unknown>>).filter(testCase => testCase.isRequired).every(testCase => {
     const result = currentResults.find(item => item.testCaseId === testCase.testCaseId)
     return !!result && (result.result === 'Passed' || result.result === 'NotApplicable') &&
       ((testCase.evidenceRequirements as unknown[]).length === 0 ||
         (result.evidenceDescriptions as unknown[]).length > 0)
   })
+}
+
+function validateCorrectionRelationships(task: Record<string, unknown>, telemetry: ModelTelemetry) {
+  const analyses = (task.failureAnalyses ?? []) as Array<Record<string, unknown>>
+  const proposals = (task.correctionProposals ?? []) as Array<Record<string, unknown>>
+  const failureAttempts = (task.failureAnalysisGenerationAttempts ?? []) as Array<Record<string, unknown>>
+  const correctionAttempts = (task.correctionGenerationAttempts ?? []) as Array<Record<string, unknown>>
+  const approvals = (task.correctionApprovalAudit ?? []) as Array<Record<string, unknown>>
+  const revisions = task.implementationRevisions as Array<Record<string, unknown>>
+  const plans = task.verificationPlans as Array<Record<string, unknown>>
+  const manualAttempts = task.manualVerificationAttempts as Array<Record<string, unknown>>
+  if (!areUnique(analyses.map(item => item.analysisId as string)) ||
+      !areUnique(failureAttempts.map(item => item.commandId as string)) ||
+      !areUnique(correctionAttempts.map(item => item.commandId as string)) ||
+      !areUnique(approvals.map(item => item.commandId as string))) return false
+  const modelCalls = telemetry.calls
+  for (const analysis of analyses) {
+    const attempt = failureAttempts.find(item => item.commandId === analysis.generationCommandId)
+    const failedAttempt = manualAttempts.find(item => item.attemptId === analysis.failedAttemptId)
+    const failedPlan = plans.find(item => item.planId === analysis.verificationPlanId)
+    const failedRevision = revisions.find(item => item.revisionId === analysis.implementationRevisionId)
+    if (!attempt || attempt.status !== 'Completed' || attempt.resultAnalysisId !== analysis.analysisId ||
+        !failedAttempt || failedAttempt.status !== 'CompletedFailed' ||
+        failedAttempt.attemptFingerprint !== analysis.failedAttemptFingerprint ||
+        failedAttempt.verificationPlanId !== analysis.verificationPlanId ||
+        failedAttempt.verificationPlanFingerprint !== analysis.verificationPlanFingerprint ||
+        failedAttempt.implementationRevisionId !== analysis.implementationRevisionId ||
+        failedAttempt.implementationResultFingerprint !== analysis.implementationResultFingerprint ||
+        !failedPlan || failedPlan.planFingerprint !== analysis.verificationPlanFingerprint ||
+        failedPlan.implementationRevisionId !== analysis.implementationRevisionId ||
+        failedPlan.implementationResultFingerprint !== analysis.implementationResultFingerprint ||
+        !failedRevision || failedRevision.resultFingerprint !== analysis.implementationResultFingerprint ||
+        (analysis.modelCallIds as string[]).some(id => !(attempt.modelCallIds as string[]).includes(id))) return false
+    const calls = (analysis.modelCallIds as string[]).map(id => modelCalls.find(call => call.id === id))
+    if (analysis.source === 'DeterministicFake') {
+      if (analysis.model !== null || analysis.reasoningEffort !== null || calls.length !== 0) return false
+    } else if (analysis.source !== 'OpenAI' || typeof analysis.model !== 'string' ||
+        typeof analysis.reasoningEffort !== 'string' || calls.length === 0 || calls.some(call => !call ||
+          call.stage !== 'FailureAnalysis' || call.provider !== 'OpenAI' || call.model !== analysis.model ||
+          call.reasoningEffort.toLowerCase() !== (analysis.reasoningEffort as string).toLowerCase() ||
+          call.verificationDispatchDisposition !== 'ResponseReceived')) return false
+  }
+  for (const proposal of proposals) {
+    const analysis = analyses.find(item => item.analysisId === proposal.analysisId)
+    if (!analysis || analysis.analysisFingerprint !== proposal.analysisFingerprint ||
+        analysis.failedAttemptId !== proposal.failedAttemptId ||
+        analysis.failedAttemptFingerprint !== proposal.failedAttemptFingerprint ||
+        analysis.implementationRevisionId !== proposal.previousApprovedRevisionId ||
+        analysis.implementationResultFingerprint !== proposal.previousResultFingerprint) return false
+    const matches = approvals.filter(item => item.proposalId === proposal.proposalId)
+    if (proposal.status === 'Approved' ? matches.length !== 1 || matches[0].proposalFingerprint !== proposal.proposalFingerprint :
+        matches.length !== 0) return false
+  }
+  for (const attempt of correctionAttempts) {
+    const proposal = proposals.find(item => item.proposalId === attempt.proposalId)
+    const revision = revisions.find(item => item.revisionId === attempt.revisionId)
+    if (!proposal || !revision || proposal.proposalFingerprint !== attempt.proposalFingerprint ||
+        revision.correctionProposalId !== proposal.proposalId ||
+        revision.correctionProposalFingerprint !== proposal.proposalFingerprint ||
+        revision.previousRevisionId !== proposal.previousApprovedRevisionId) return false
+  }
+
+  const currentAnalysis = task.currentFailureAnalysisId === null ? null :
+    analyses.find(item => item.analysisId === task.currentFailureAnalysisId) ?? null
+  const currentProposal = task.currentCorrectionProposalId === null ? null :
+    proposals.find(item => item.proposalId === task.currentCorrectionProposalId) ?? null
+  const currentManualAttempt = manualAttempts
+    .find(item => item.attemptId === task.currentVerificationAttemptId)
+  const status = task.status as string
+  const latestFailure = failureAttempts.at(-1)
+  const latestCorrection = correctionAttempts.at(-1)
+  const revision1 = revisions[0]
+  const revision2 = revisions[1]
+  const correctedRevisionIsEffective = revision2 !== undefined &&
+    task.activeImplementationRevisionId === revision2.revisionId &&
+    task.approvedImplementationRevisionId === revision2.revisionId &&
+    revision1.reviewState === 'HistoricallyApproved' && revision2.reviewState === 'Approved'
+  const correctionReviewWithHistoricalVerification = status === 'AwaitingImplementationReview' &&
+    revisions.length === 2 && revision1.kind === 'Initial' && revision2.kind === 'Correction' &&
+    revision1.reviewState === 'Approved' && revision1.isCurrent === false && revision1.isApproved === true &&
+    revision2.reviewState === 'Current' && revision2.isCurrent === true && revision2.isApproved === false &&
+    task.activeImplementationRevisionId === revision2.revisionId &&
+    task.approvedImplementationRevisionId === revision1.revisionId && task.pendingImplementationRevisionId === null &&
+    currentAnalysis !== null && currentProposal !== null && currentProposal.status === 'Approved' &&
+    currentManualAttempt?.status === 'CompletedFailed' &&
+    currentManualAttempt.verificationPlanId === task.currentVerificationPlanId &&
+    currentManualAttempt.implementationRevisionId === revision1.revisionId &&
+    plans.find(plan => plan.planId === task.currentVerificationPlanId)?.status === 'Completed' &&
+    plans.find(plan => plan.planId === task.currentVerificationPlanId)?.implementationRevisionId === revision1.revisionId &&
+    latestCorrection?.status === 'Completed' && latestCorrection.revisionId === revision2.revisionId &&
+    latestCorrection.proposalId === currentProposal.proposalId &&
+    revision2.correctionProposalId === currentProposal.proposalId &&
+    revision2.correctionProposalFingerprint === currentProposal.proposalFingerprint
+  if (currentAnalysis && !correctedRevisionIsEffective &&
+      (!currentManualAttempt || currentAnalysis.failedAttemptId !== currentManualAttempt.attemptId ||
+       currentAnalysis.failedAttemptFingerprint !== currentManualAttempt.attemptFingerprint ||
+       currentAnalysis.verificationPlanId !== task.currentVerificationPlanId ||
+       currentAnalysis.implementationRevisionId !== currentManualAttempt.implementationRevisionId)) return false
+  if (currentAnalysis && correctedRevisionIsEffective) {
+    const historicalPlan = plans.find(item => item.planId === currentAnalysis.verificationPlanId)
+    const historicalAttempt = manualAttempts.find(item => item.attemptId === currentAnalysis.failedAttemptId)
+    if (historicalPlan?.status !== 'Superseded' || historicalAttempt?.status !== 'CompletedFailed' ||
+        historicalPlan.implementationRevisionId !== revision1.revisionId ||
+        historicalAttempt.implementationRevisionId !== revision1.revisionId) return false
+  }
+  if (currentProposal && (!currentAnalysis || currentProposal.analysisId !== currentAnalysis.analysisId ||
+      currentProposal.analysisFingerprint !== currentAnalysis.analysisFingerprint)) return false
+  if (status === 'FailureAnalysisPending' && (!latestFailure ||
+      !['Prepared', 'DispatchMayHaveStarted', 'ResponseReceived'].includes(latestFailure.status as string))) return false
+  if (status === 'FailureAnalysisRecoveryRequired' && (!latestFailure?.recoveryRequired || latestFailure.retryEligible ||
+      currentAnalysis !== null || currentProposal !== null)) return false
+  if (status === 'AwaitingCorrectionApproval' && (!currentProposal || currentProposal.status !== 'AwaitingApproval')) return false
+  if ((status === 'CorrectionApproved' || status === 'ImplementingCorrection' || status === 'CorrectionRecoveryRequired') &&
+      (!currentProposal || currentProposal.status !== 'Approved')) return false
+  if (status === 'ImplementingCorrection' && (!latestCorrection || latestCorrection.completedAt !== null ||
+      latestCorrection.recoveryRequired || revision2 === undefined || task.activeImplementationRevisionId !== revision1.revisionId ||
+      task.approvedImplementationRevisionId !== revision1.revisionId || task.pendingImplementationRevisionId !== revision2.revisionId)) return false
+  if (status === 'CorrectionRecoveryRequired' && (!latestCorrection?.recoveryRequired || latestCorrection.retryEligible ||
+      revision2 === undefined || task.activeImplementationRevisionId !== revision1.revisionId ||
+      task.approvedImplementationRevisionId !== revision1.revisionId || task.pendingImplementationRevisionId !== revision2.revisionId)) return false
+  if (status === 'AwaitingImplementationReview' && revision2 !== undefined &&
+      !correctionReviewWithHistoricalVerification) return false
+  if (['ImplementationApproved', 'VerificationPlanning', 'AwaitingManualVerification', 'ManualVerificationFailed', 'ReadyForDelivery'].includes(status) &&
+      revision2 !== undefined && (task.activeImplementationRevisionId !== revision2.revisionId ||
+        task.approvedImplementationRevisionId !== revision2.revisionId || revision1.reviewState !== 'HistoricallyApproved' ||
+        revision2.reviewState !== 'Approved' || task.pendingImplementationRevisionId !== null)) return false
+  if (status === 'ImplementationApproved' && revision2 !== undefined &&
+      (task.currentVerificationPlanId !== null || task.currentVerificationAttemptId !== null)) return false
+
+  const expected = {
+    canGenerateFailureAnalysis: status === 'ManualVerificationFailed' && revisions.length === 1 && revision1.kind === 'Initial',
+    canApproveCorrection: status === 'AwaitingCorrectionApproval',
+    canGenerateCorrection: status === 'CorrectionApproved',
+    canApproveCorrectedRevision: correctionReviewWithHistoricalVerification,
+    canGenerateReplacementVerificationPlan: status === 'ImplementationApproved' && revisions.length === 2 &&
+      task.currentVerificationPlanId === null,
+  }
+  if (!isRecord(task.correctionEligibility)) return false
+  const eligibility = task.correctionEligibility
+  return Object.entries(expected).every(([key, value]) => eligibility[key] === value)
 }
 
 function validateTaskRelationships(task: Record<string, unknown>, telemetry: ModelTelemetry) {
@@ -477,7 +863,11 @@ function validateTaskRelationships(task: Record<string, unknown>, telemetry: Mod
   if (task.implementationResult !== null) {
     const result = task.implementationResult as Record<string, unknown>
     if (currentRevisions.length !== 1 || currentRevisions[0].resultFingerprint === null ||
-        currentRevisions[0].changedFileCount !== (result.changedFiles as unknown[]).length) return false
+        currentRevisions[0].changedFileCount !== (result.changedFiles as unknown[]).length ||
+        currentRevisions[0].baseCommitSha !== result.baseCommitSha ||
+        currentRevisions[0].generationCompletedAt === null ||
+        Date.parse(result.completedAt as string) < Date.parse(currentRevisions[0].generationStartedAt as string) ||
+        Date.parse(result.completedAt as string) > Date.parse(currentRevisions[0].generationCompletedAt as string)) return false
   }
 
   const evidence = task.evidenceItems as Array<Record<string, unknown>>
@@ -555,6 +945,8 @@ function validateTaskRelationships(task: Record<string, unknown>, telemetry: Mod
           : attempt.failedAt === null || attempt.passedAt !== null)) return false
   }
   if (!areUnique(resultIds)) return false
+  if (!validateCorrectionRelationships(task, telemetry)) return false
+  if (!validateDeliveryRelationships(task)) return false
 
   const currentPlan = task.currentVerificationPlanId === null ? null :
     plans.find(plan => plan.planId === task.currentVerificationPlanId) ?? null
@@ -573,11 +965,11 @@ function validateTaskRelationships(task: Record<string, unknown>, telemetry: Mod
 
   if (task.status === 'AwaitingManualVerification') {
     if (currentPlan === null || currentPlan.status !== 'Current') return false
-    if (currentAttempt === null) return attempts.length === 0 &&
+    if (currentAttempt === null) return !attempts.some(attempt => attempt.verificationPlanId === currentPlan.planId) &&
       eligibility.canRecordVerificationResult === false &&
       eligibility.canCompleteVerificationPassed === false && eligibility.canCompleteVerificationFailed === false &&
       eligibility.readyForDelivery === false
-    return attempts.length === 1 && currentBindingIsValid && currentAttempt.status === 'InProgress' &&
+    return currentBindingIsValid && currentAttempt.status === 'InProgress' &&
       eligibility.canStartVerificationAttempt === false && eligibility.readyForDelivery === false &&
       eligibility.canCompleteVerificationPassed === canCompleteManualAttempt(currentPlan, currentAttempt, true) &&
       eligibility.canCompleteVerificationFailed === canCompleteManualAttempt(currentPlan, currentAttempt, false)
@@ -621,7 +1013,28 @@ export function decodeEngineeringTask(value: unknown): EngineeringTask {
       !value.verificationPlanGenerationAttempts.every(decodeGenerationAttempt) ||
       !Array.isArray(value.manualVerificationAttempts) || value.manualVerificationAttempts.length > 100 ||
       !value.manualVerificationAttempts.every(decodeManualAttempt) || !isNullableGuid(value.currentVerificationPlanId) ||
-      !isNullableGuid(value.currentVerificationAttemptId)) fail()
+      !isNullableGuid(value.currentVerificationAttemptId) ||
+      !(value.pendingImplementationRevisionId === undefined || isNullableGuid(value.pendingImplementationRevisionId)) ||
+      !(value.currentFailureAnalysisId === undefined || isNullableGuid(value.currentFailureAnalysisId)) ||
+      !(value.currentCorrectionProposalId === undefined || isNullableGuid(value.currentCorrectionProposalId)) ||
+      !(value.failureAnalyses === undefined || Array.isArray(value.failureAnalyses) && value.failureAnalyses.length <= 6 &&
+        value.failureAnalyses.every(decodeFailureAnalysis)) ||
+      !(value.correctionProposals === undefined || Array.isArray(value.correctionProposals) &&
+        value.correctionProposals.length <= 1 && value.correctionProposals.every(decodeCorrectionProposal)) ||
+      !(value.failureAnalysisGenerationAttempts === undefined || Array.isArray(value.failureAnalysisGenerationAttempts) &&
+        value.failureAnalysisGenerationAttempts.length <= 6 && value.failureAnalysisGenerationAttempts.every(decodeFailureAnalysisAttempt)) ||
+      !(value.correctionGenerationAttempts === undefined || Array.isArray(value.correctionGenerationAttempts) &&
+        value.correctionGenerationAttempts.length <= 6 && value.correctionGenerationAttempts.every(decodeCorrectionGenerationAttempt)) ||
+      !(value.correctionApprovalAudit === undefined || Array.isArray(value.correctionApprovalAudit) &&
+        value.correctionApprovalAudit.length <= 1 && value.correctionApprovalAudit.every(decodeCorrectionApprovalAudit)) ||
+      !(value.correctionEligibility === undefined || decodeCorrectionEligibility(value.correctionEligibility)) ||
+      !(value.currentDeliveryProposalId === undefined || isNullableGuid(value.currentDeliveryProposalId)) ||
+      !(value.currentDeliveryAttemptId === undefined || isNullableGuid(value.currentDeliveryAttemptId)) ||
+      !(value.deliveryProposals === undefined || Array.isArray(value.deliveryProposals) &&
+        value.deliveryProposals.length <= 1 && value.deliveryProposals.every(decodeDeliveryProposal)) ||
+      !(value.deliveryAttempts === undefined || Array.isArray(value.deliveryAttempts) &&
+        value.deliveryAttempts.length <= 3 && value.deliveryAttempts.every(decodeDeliveryAttempt)) ||
+      !(value.deliveryEligibility === undefined || decodeDeliveryEligibility(value.deliveryEligibility))) fail()
   const telemetry = decodeTelemetry(value.telemetry)
   const eligibility = normalizeVerificationEligibility(value)
   if (!telemetry || !eligibility || !validateTaskRelationships(value, telemetry))
@@ -646,6 +1059,7 @@ export function decodeEngineeringTask(value: unknown): EngineeringTask {
     implementationRuntime: decoded.implementationRuntime, rowVersion: decoded.rowVersion,
     activeImplementationRevisionId: decoded.activeImplementationRevisionId,
     approvedImplementationRevisionId: decoded.approvedImplementationRevisionId,
+    pendingImplementationRevisionId: decoded.pendingImplementationRevisionId ?? null,
     implementationRevisions: decoded.implementationRevisions, telemetry,
     currentVerificationPlanId: decoded.currentVerificationPlanId,
     currentVerificationAttemptId: decoded.currentVerificationAttemptId,
@@ -653,6 +1067,25 @@ export function decodeEngineeringTask(value: unknown): EngineeringTask {
     verificationPlanGenerationAttempts: decoded.verificationPlanGenerationAttempts,
     manualVerificationAttempts: decoded.manualVerificationAttempts,
     verificationEligibility: eligibility as typeof eligibility & EngineeringTask['verificationEligibility'],
+    currentFailureAnalysisId: decoded.currentFailureAnalysisId ?? null,
+    currentCorrectionProposalId: decoded.currentCorrectionProposalId ?? null,
+    failureAnalyses: decoded.failureAnalyses ?? [],
+    correctionProposals: decoded.correctionProposals ?? [],
+    failureAnalysisGenerationAttempts: decoded.failureAnalysisGenerationAttempts ?? [],
+    correctionGenerationAttempts: decoded.correctionGenerationAttempts ?? [],
+    correctionApprovalAudit: decoded.correctionApprovalAudit ?? [],
+    correctionEligibility: decoded.correctionEligibility ?? {
+      canGenerateFailureAnalysis: false, canApproveCorrection: false, canGenerateCorrection: false,
+      canApproveCorrectedRevision: false, canGenerateReplacementVerificationPlan: false,
+    },
+    currentDeliveryProposalId: decoded.currentDeliveryProposalId ?? null,
+    currentDeliveryAttemptId: decoded.currentDeliveryAttemptId ?? null,
+    deliveryProposals: decoded.deliveryProposals ?? [],
+    deliveryAttempts: decoded.deliveryAttempts ?? [],
+    deliveryEligibility: decoded.deliveryEligibility ?? {
+      canPrepareDelivery: decoded.status === 'ReadyForDelivery', canApproveDelivery: false,
+      canExecuteDelivery: false, canReconcileDelivery: false, deliveryRecoveryRequired: false, pullRequestCreated: false,
+    },
   }
 }
 
@@ -668,7 +1101,37 @@ export function decodeEngineeringTaskSummaries(value: unknown): EngineeringTaskS
 }
 
 async function taskRequest(url: string, init?: RequestInit): Promise<EngineeringTask> {
-  return decodeEngineeringTask(await request<unknown>(url, init))
+  const task = decodeEngineeringTask(await request<unknown>(url, init))
+  const expectedTaskId = /^\/api\/tasks\/([^/]+)/.exec(url)?.[1]
+  if (expectedTaskId && isGuid(expectedTaskId) && task.id !== expectedTaskId)
+    throw new ForgeApiError('The task response could not be validated safely.')
+  return task
+}
+
+export function decodeSystemCapabilities(value: unknown): SystemCapabilities {
+  const stringFields = ['aiMode', 'clarificationProvider', 'clarificationModel', 'reasoningEffort',
+    'planningProvider', 'planningModel', 'planningReasoningEffort', 'implementationProvider',
+    'verificationPlanningProvider', 'verificationPlanningModel', 'verificationPlanningReasoningEffort']
+  const booleanFields = ['clarificationConfigured', 'planningConfigured', 'implementationConfigured', 'aiConfigured',
+    'repositoryInspectionAvailable', 'planningAvailable', 'targetModificationAvailable',
+    'implementationApprovalAvailable', 'implementationCorrectionAvailable', 'validationAvailable', 'reviewAvailable',
+    'pullRequestCreationAvailable', 'fakeImplementationAvailable', 'openAiImplementationAvailable',
+    'silentFallbackSupported', 'commitAvailable', 'pushAvailable', 'deliveryPullRequestAvailable',
+    'verificationPlanningConfigured', 'manualResultRecordingAvailable', 'automatedValidationAvailable',
+    'failureAnalysisAvailable', 'failureAnalysisConfigured', 'implementationCorrectionConfigured',
+    'deliveryPullRequestConfigured', 'autoMergeAvailable', 'deliveryGitAvailable', 'deliveryGitHubCliAvailable']
+  if (!isRecord(value) || stringFields.some(field => !isSafeString(value[field], 200)) ||
+      booleanFields.some(field => typeof value[field] !== 'boolean') ||
+      !(value.implementationModel === null || isSafeString(value.implementationModel, 200)) ||
+      !(value.implementationReasoningEffort === null || isSafeString(value.implementationReasoningEffort, 50)))
+    throw new ForgeApiError('The system-capabilities response could not be validated safely.')
+  const deliveryConfigured = value.deliveryGitAvailable === true && value.deliveryGitHubCliAvailable === true
+  if (value.deliveryPullRequestConfigured !== deliveryConfigured || value.commitAvailable !== deliveryConfigured ||
+      value.pushAvailable !== deliveryConfigured || value.deliveryPullRequestAvailable !== deliveryConfigured ||
+      value.pullRequestCreationAvailable !== deliveryConfigured || value.automatedValidationAvailable !== false ||
+      value.autoMergeAvailable !== false)
+    throw new ForgeApiError('The system-capabilities response could not be validated safely.')
+  return value as unknown as SystemCapabilities
 }
 
 async function throwResponseError(response: Response): Promise<never> {
@@ -706,6 +1169,16 @@ export const forgeApi = {
   generateImplementation: (id: string) => taskRequest(`/api/tasks/${id}/implementation`, { method: 'POST' }),
   approveImplementation: (id: string, payload: { commandId: string; expectedRowVersion: number; expectedRevisionId: string; expectedResultFingerprint: string }) =>
     taskRequest(`/api/tasks/${id}/implementation-approval`, { method: 'POST', body: JSON.stringify(payload) }),
+  generateFailureAnalysis: (id: string, payload: { commandId: string; expectedRowVersion: number; expectedFailedAttemptId: string; expectedFailedAttemptFingerprint: string }) =>
+    taskRequest(`/api/tasks/${id}/failure-analysis`, { method: 'POST', body: JSON.stringify(payload) }),
+  reconcileFailureAnalysis: (id: string, attemptId: string, payload: { commandId: string; expectedRowVersion: number }) =>
+    taskRequest(`/api/tasks/${id}/failure-analysis-attempts/${attemptId}/reconcile`, { method: 'POST', body: JSON.stringify(payload) }),
+  approveCorrectionProposal: (id: string, proposalId: string, payload: Record<string, unknown>) =>
+    taskRequest(`/api/tasks/${id}/correction-proposals/${proposalId}/approve`, { method: 'POST', body: JSON.stringify(payload) }),
+  generateImplementationCorrection: (id: string, payload: { commandId: string; expectedRowVersion: number; proposalId: string; proposalFingerprint: string; previousRevisionId: string; previousResultFingerprint: string }) =>
+    taskRequest(`/api/tasks/${id}/implementation-corrections`, { method: 'POST', body: JSON.stringify(payload) }),
+  reconcileImplementationCorrection: (id: string, attemptId: string, payload: { commandId: string; expectedRowVersion: number; proposalId: string; proposalFingerprint: string; previousRevisionId: string; previousResultFingerprint: string; revisionId: string }) =>
+    taskRequest(`/api/tasks/${id}/implementation-corrections/${attemptId}/reconcile`, { method: 'POST', body: JSON.stringify(payload) }),
   generateVerificationPlan: (id: string, payload: { commandId: string; expectedRowVersion: number; expectedImplementationRevisionId: string; expectedImplementationResultFingerprint: string }) =>
     taskRequest(`/api/tasks/${id}/verification-plans`, { method: 'POST', body: JSON.stringify(payload) }),
   startVerificationAttempt: (id: string, payload: { commandId: string; expectedRowVersion: number; expectedVerificationPlanId: string; expectedVerificationPlanFingerprint: string; expectedImplementationRevisionId: string; expectedImplementationResultFingerprint: string }) =>
@@ -714,6 +1187,14 @@ export const forgeApi = {
     taskRequest(`/api/tasks/${id}/verification-attempts/${attemptId}/cases/${caseId}`, { method: 'PUT', body: JSON.stringify(payload) }),
   completeVerification: (id: string, attemptId: string, passed: boolean, payload: { commandId: string; expectedRowVersion: number; expectedVerificationPlanId: string; expectedVerificationPlanFingerprint: string; expectedImplementationRevisionId: string; expectedImplementationResultFingerprint: string; confirmedByHuman: boolean; summary: string | null }) =>
     taskRequest(`/api/tasks/${id}/verification-attempts/${attemptId}/${passed ? 'complete-passed' : 'complete-failed'}`, { method: 'POST', body: JSON.stringify(payload) }),
+  prepareDelivery: (id: string, payload: Record<string, unknown>) =>
+    taskRequest(`/api/tasks/${id}/delivery-proposals`, { method: 'POST', body: JSON.stringify(payload) }),
+  approveDelivery: (id: string, proposalId: string, payload: Record<string, unknown>) =>
+    taskRequest(`/api/tasks/${id}/delivery-proposals/${proposalId}/approve`, { method: 'POST', body: JSON.stringify(payload) }),
+  executeDelivery: (id: string, payload: Record<string, unknown>) =>
+    taskRequest(`/api/tasks/${id}/deliveries`, { method: 'POST', body: JSON.stringify(payload) }),
+  reconcileDelivery: (id: string, attemptId: string, payload: Record<string, unknown>) =>
+    taskRequest(`/api/tasks/${id}/delivery-attempts/${attemptId}/reconcile`, { method: 'POST', body: JSON.stringify(payload) }),
   exportTaskPdf: async (id: string): Promise<TaskPdfDownload> => {
     const response = await fetch(`/api/tasks/${id}/export/pdf`, { headers: { Accept: 'application/pdf' } })
     if (!response.ok) await throwResponseError(response)
@@ -735,5 +1216,5 @@ export const forgeApi = {
     if (!response.ok) await throwResponseError(response)
     return { blob: await response.blob(), filename: parseSafePdfFilename(response.headers.get('Content-Disposition'), planId, 'plan') }
   },
-  getCapabilities: () => request<SystemCapabilities>('/api/system/capabilities'),
+  getCapabilities: async () => decodeSystemCapabilities(await request<unknown>('/api/system/capabilities')),
 }

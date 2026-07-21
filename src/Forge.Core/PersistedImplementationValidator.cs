@@ -21,7 +21,8 @@ public static class PersistedImplementationValidator
         Guid? taskId = null,
         IReadOnlyList<ImplementationRevision>? revisions = null,
         Guid? activeRevisionId = null,
-        Guid? approvedRevisionId = null)
+        Guid? approvedRevisionId = null,
+        Guid? pendingRevisionId = null)
     {
         ArgumentNullException.ThrowIfNull(limits);
         if (workspace is not null) ValidateWorkspace(workspace);
@@ -40,7 +41,7 @@ public static class PersistedImplementationValidator
         if (lease is not null) ValidateLease(lease, limits, now);
 
         ValidateRevisionLedger(status, taskId, plan, workspace, result, failure, lease,
-            revisions ?? [], activeRevisionId, approvedRevisionId, limits, taskUpdatedAt, now);
+            revisions ?? [], activeRevisionId, approvedRevisionId, pendingRevisionId, limits, taskUpdatedAt, now);
 
         if ((workspace is not null || result is not null || failure is not null || lease is not null) &&
             (plan is null || planApprovedAt is null)) Corrupt();
@@ -72,9 +73,23 @@ public static class PersistedImplementationValidator
             case WorkflowStatus.VerificationPlanning:
             case WorkflowStatus.AwaitingManualVerification:
             case WorkflowStatus.ManualVerificationFailed:
+            case WorkflowStatus.FailureAnalysisPending:
+            case WorkflowStatus.FailureAnalysisRecoveryRequired:
+            case WorkflowStatus.AwaitingFailureResolution:
+            case WorkflowStatus.AwaitingCorrectionApproval:
+            case WorkflowStatus.CorrectionApproved:
             case WorkflowStatus.ReadyForDelivery:
+            case WorkflowStatus.AwaitingDeliveryApproval:
+            case WorkflowStatus.Delivering:
+            case WorkflowStatus.PullRequestCreated:
+            case WorkflowStatus.DeliveryRecoveryRequired:
+            case WorkflowStatus.CorrectionRecoveryRequired:
                 ValidateCompletedArtifacts(workspace, result, failure, lease, implementationStartedAt,
                     implementationCompletedAt, allowLegacyEmpty: false);
+                break;
+            case WorkflowStatus.ImplementingCorrection:
+                ValidateImplementingCorrection(workspace, result, failure, lease, implementationStartedAt,
+                    implementationCompletedAt, revisions ?? [], pendingRevisionId);
                 break;
             case WorkflowStatus.Validating:
             case WorkflowStatus.Reviewing:
@@ -103,6 +118,7 @@ public static class PersistedImplementationValidator
         IReadOnlyList<ImplementationRevision> revisions,
         Guid? activeRevisionId,
         Guid? approvedRevisionId,
+        Guid? pendingRevisionId,
         ImplementationLimits limits,
         DateTimeOffset? taskUpdatedAt,
         DateTimeOffset? now)
@@ -110,7 +126,7 @@ public static class PersistedImplementationValidator
         if (revisions.Count == 0)
         {
             if (activeRevisionId is not null || approvedRevisionId is not null ||
-                IsImplementationApprovedOrLater(status)) Corrupt();
+                RequiresApprovedRevision(status)) Corrupt();
             return;
         }
         if (taskId is null || taskId == Guid.Empty || plan is null || revisions.Count > limits.MaximumImplementationRevisions)
@@ -123,10 +139,16 @@ public static class PersistedImplementationValidator
             var revision = revisions[index];
             if (revision.RevisionId == Guid.Empty || !ids.Add(revision.RevisionId) ||
                 revision.RevisionNumber != index + 1 || !Enum.IsDefined(revision.Kind) ||
-                revision.Kind != ImplementationRevisionKind.Initial || index != 0 ||
-                revision.PreviousRevisionId is not null ||
-                revision.CorrectionInstruction is not null || revision.CorrectionSubmittedAt is not null ||
-                revision.CorrectionCommandId is not null || revision.GenerationCommandId == Guid.Empty ||
+                (index == 0 && (revision.Kind != ImplementationRevisionKind.Initial || revision.PreviousRevisionId is not null ||
+                    revision.CorrectionInstruction is not null || revision.CorrectionSubmittedAt is not null ||
+                    revision.CorrectionCommandId is not null || revision.CorrectionProposalId is not null ||
+                    revision.CorrectionProposalFingerprint is not null) ||
+                 index == 1 && (revision.Kind != ImplementationRevisionKind.Correction ||
+                    revision.PreviousRevisionId != revisions[0].RevisionId ||
+                    string.IsNullOrWhiteSpace(revision.CorrectionInstruction) || revision.CorrectionSubmittedAt is null ||
+                    revision.CorrectionCommandId is null || revision.CorrectionProposalId is null ||
+                    !IsLowerSha256(revision.CorrectionProposalFingerprint)) || index > 1) ||
+                revision.GenerationCommandId == Guid.Empty ||
                 !Enum.IsDefined(revision.GenerationState) || !Enum.IsDefined(revision.ReviewState) ||
                 !IsLowerSha256(revision.PlanFingerprint) ||
                 !string.Equals(revision.PlanFingerprint, planFingerprint, StringComparison.Ordinal) ||
@@ -141,6 +163,9 @@ public static class PersistedImplementationValidator
             if (revision.Lease is not null) ValidateLease(revision.Lease, limits, now);
             if (revision.Workspace is not null &&
                 !string.Equals(revision.BaseCommitSha, revision.Workspace.BaseCommitSha, StringComparison.Ordinal)) Corrupt();
+            if (revision.Workspace is not null && revision.Workspace.RevisionNumber != revision.RevisionNumber) Corrupt();
+            if (revision.RevisionNumber == 2 && revision.Workspace is not null &&
+                !string.Equals(revision.Workspace.TaskToken, taskId.Value.ToString("N"), StringComparison.OrdinalIgnoreCase)) Corrupt();
 
             if (revision.GenerationState == ImplementationGenerationState.Succeeded)
             {
@@ -157,7 +182,7 @@ public static class PersistedImplementationValidator
                      revision.GenerationCompletedAt is not null ||
                      revision.ReviewState != ImplementationReviewState.NotReviewable) Corrupt();
 
-            if (revision.ReviewState == ImplementationReviewState.Approved)
+            if (revision.ReviewState is ImplementationReviewState.Approved or ImplementationReviewState.HistoricallyApproved)
             {
                 if (revision.GenerationState != ImplementationGenerationState.Succeeded ||
                     revision.ApprovedAt is null || revision.ApprovalCommandId is null || revision.ApprovalCommandId == Guid.Empty ||
@@ -173,12 +198,7 @@ public static class PersistedImplementationValidator
         var active = activeRevisionId is { } activeId
             ? revisions.SingleOrDefault(revision => revision.RevisionId == activeId)
             : null;
-        var reviewableCount = revisions.Count(revision =>
-            revision.ReviewState is ImplementationReviewState.Current or ImplementationReviewState.Approved);
-        if (active is null || status == WorkflowStatus.Implementing && reviewableCount != 0 ||
-            status is not WorkflowStatus.Implementing && reviewableCount != 1) Corrupt();
-        if (active.ReviewState is not (ImplementationReviewState.Current or ImplementationReviewState.Approved) &&
-            status is not WorkflowStatus.Implementing) Corrupt();
+        if (active is null) Corrupt();
 
         var approved = approvedRevisionId is { } approvedId
             ? revisions.SingleOrDefault(revision => revision.RevisionId == approvedId)
@@ -186,10 +206,11 @@ public static class PersistedImplementationValidator
         if (revisions.Count(revision => revision.ReviewState == ImplementationReviewState.Approved) > 1 ||
             (approvedRevisionId is null) != (approved is null)) Corrupt();
 
-        if (IsImplementationApprovedOrLater(status))
+        var requiresApprovedRevision = RequiresApprovedRevision(status) ||
+            status == WorkflowStatus.AwaitingImplementationReview && revisions.Count == 2;
+        if (requiresApprovedRevision)
         {
-            if (approved is null || active.RevisionId != approved.RevisionId ||
-                active.ReviewState != ImplementationReviewState.Approved ||
+            if (approved is null || approved.ReviewState != ImplementationReviewState.Approved ||
                 approved.Result?.ActiveCheckoutVerified != true) Corrupt();
         }
         else if (approvedRevisionId is not null || approved is not null) Corrupt();
@@ -199,27 +220,85 @@ public static class PersistedImplementationValidator
             if (active.GenerationState != ImplementationGenerationState.Generating ||
                 active.ReviewState != ImplementationReviewState.NotReviewable) Corrupt();
         }
+        else if (status == WorkflowStatus.ImplementingCorrection)
+        {
+            var pending = pendingRevisionId is { } pendingId
+                ? revisions.SingleOrDefault(revision => revision.RevisionId == pendingId)
+                : null;
+            if (revisions.Count != 2 || active.RevisionNumber != 1 || pending?.RevisionNumber != 2 ||
+                pending.GenerationState is not (ImplementationGenerationState.Requested or ImplementationGenerationState.Generating or ImplementationGenerationState.Succeeded) ||
+                (pending.GenerationState == ImplementationGenerationState.Succeeded
+                    ? pending.ReviewState != ImplementationReviewState.Current
+                    : pending.ReviewState != ImplementationReviewState.NotReviewable) ||
+                revisions[0].ReviewState != ImplementationReviewState.Approved || approved?.RevisionNumber != 1) Corrupt();
+        }
+        else if (status == WorkflowStatus.CorrectionRecoveryRequired)
+        {
+            var pending = pendingRevisionId is { } pendingId
+                ? revisions.SingleOrDefault(revision => revision.RevisionId == pendingId)
+                : null;
+            if (revisions.Count != 2 || active.RevisionNumber != 1 || approved?.RevisionNumber != 1 ||
+                pending?.RevisionNumber != 2 ||
+                (pending.GenerationState == ImplementationGenerationState.Succeeded
+                    ? pending.ReviewState != ImplementationReviewState.Current
+                    : pending.ReviewState != ImplementationReviewState.NotReviewable) ||
+                revisions[0].ReviewState != ImplementationReviewState.Approved) Corrupt();
+        }
         else if (status == WorkflowStatus.AwaitingImplementationReview)
         {
             if (active.GenerationState != ImplementationGenerationState.Succeeded ||
-                active.ReviewState != ImplementationReviewState.Current) Corrupt();
+                active.ReviewState != ImplementationReviewState.Current || pendingRevisionId is not null) Corrupt();
+            if (active.RevisionNumber == 2 && (approved?.RevisionNumber != 1 || revisions[0].ReviewState != ImplementationReviewState.Approved)) Corrupt();
         }
+        else if (revisions.Count == 2 && status is (WorkflowStatus.ImplementationApproved or
+                 WorkflowStatus.VerificationPlanning or WorkflowStatus.AwaitingManualVerification or
+                 WorkflowStatus.ManualVerificationFailed or WorkflowStatus.ReadyForDelivery or
+                 WorkflowStatus.AwaitingDeliveryApproval or WorkflowStatus.Delivering or
+                 WorkflowStatus.PullRequestCreated or WorkflowStatus.DeliveryRecoveryRequired))
+        {
+            if (active.RevisionNumber != 2 || approved?.RevisionNumber != 2 ||
+                revisions[0].ReviewState != ImplementationReviewState.HistoricallyApproved ||
+                active.ReviewState != ImplementationReviewState.Approved || pendingRevisionId is not null) Corrupt();
+        }
+        else if (revisions.Count == 2 && status != WorkflowStatus.AwaitingImplementationReview)
+            Corrupt();
 
-        if (!Equals(active.Workspace, workspace) || !Equals(active.Failure, failure) || !Equals(active.Lease, lease)) Corrupt();
-        if (active.Result is null != (result is null)) Corrupt();
+        if (revisions.Count == 2 && (!string.Equals(revisions[0].BaseCommitSha, revisions[1].BaseCommitSha, StringComparison.Ordinal) ||
+            !string.Equals(revisions[0].PlanFingerprint, revisions[1].PlanFingerprint, StringComparison.Ordinal))) Corrupt();
+        if (revisions.Count == 2 && revisions[0].Workspace is { } firstWorkspace && revisions[1].Workspace is { } secondWorkspace &&
+            (!string.Equals(firstWorkspace.RepositoryIdentity, secondWorkspace.RepositoryIdentity, StringComparison.Ordinal) ||
+             !string.Equals(firstWorkspace.GitCommonDirectoryIdentity, secondWorkspace.GitCommonDirectoryIdentity, StringComparison.Ordinal))) Corrupt();
+
+        var correctionProjection = status == WorkflowStatus.ImplementingCorrection && pendingRevisionId is { } pendingProjectionId
+            ? revisions.Single(revision => revision.RevisionId == pendingProjectionId)
+            : null;
+        var projection = correctionProjection is not null
+            ? correctionProjection.Workspace is null || correctionProjection.GenerationState == ImplementationGenerationState.Succeeded
+                ? approved!
+                : correctionProjection
+            : status == WorkflowStatus.AwaitingImplementationReview
+            ? active
+            : approved ?? active;
+        if (!Equals(projection.Workspace, workspace) || !Equals(projection.Failure, failure) || !Equals(projection.Lease, lease)) Corrupt();
+        if (projection.Result is null != (result is null)) Corrupt();
         if (result is not null)
         {
             var projectionFingerprint = ImplementationReviewFingerprint.ComputeResult(
-                taskId.Value, active.RevisionId, active.RevisionNumber, active.Kind,
-                active.PlanFingerprint, result);
-            if (!string.Equals(projectionFingerprint, active.ResultFingerprint, StringComparison.Ordinal)) Corrupt();
+                taskId.Value, projection.RevisionId, projection.RevisionNumber, projection.Kind,
+                projection.PlanFingerprint, result);
+            if (!string.Equals(projectionFingerprint, projection.ResultFingerprint, StringComparison.Ordinal)) Corrupt();
         }
     }
 
-    private static bool IsImplementationApprovedOrLater(WorkflowStatus status) => status is
+    private static bool RequiresApprovedRevision(WorkflowStatus status) => status is
         WorkflowStatus.ImplementationApproved or WorkflowStatus.VerificationPlanning or
         WorkflowStatus.AwaitingManualVerification or WorkflowStatus.ManualVerificationFailed or
-        WorkflowStatus.ReadyForDelivery;
+        WorkflowStatus.FailureAnalysisPending or WorkflowStatus.AwaitingFailureResolution or
+        WorkflowStatus.FailureAnalysisRecoveryRequired or WorkflowStatus.CorrectionRecoveryRequired or
+        WorkflowStatus.AwaitingCorrectionApproval or WorkflowStatus.CorrectionApproved or
+        WorkflowStatus.ImplementingCorrection or WorkflowStatus.ReadyForDelivery or
+        WorkflowStatus.AwaitingDeliveryApproval or WorkflowStatus.Delivering or
+        WorkflowStatus.PullRequestCreated or WorkflowStatus.DeliveryRecoveryRequired;
 
     private static void ValidateImplementing(
         ImplementationWorkspace? workspace,
@@ -311,14 +390,50 @@ public static class PersistedImplementationValidator
         if (!Enum.IsDefined(value.Phase) || value.Token is null || value.Token.Length != 32 || value.Token.Any(character => !Uri.IsHexDigit(character)) ||
             value.Branch is null || value.BaseCommitSha is null || value.RepositoryIdentity is null ||
             value.GitCommonDirectoryIdentity is null || value.OwnershipReference is null ||
-            !string.Equals(value.Branch, $"forge/task-{value.Token}", StringComparison.Ordinal) ||
+            !IsWorkspaceIdentity(value) ||
             !IsObjectId(value.BaseCommitSha) || value.CreatedAt > value.UpdatedAt ||
             !IsSha256(value.RepositoryIdentity) || !IsSha256(value.GitCommonDirectoryIdentity) ||
-            !string.Equals(value.OwnershipReference, $"refs/forge/tasks/{value.Token}", StringComparison.Ordinal) ||
             value.ActiveCheckoutContentFingerprint.Length > 0 && (!IsSha256(value.ActiveCheckoutContentFingerprint) ||
                 value.ActiveCheckoutTrackedFileCount < 0 || value.ActiveCheckoutTrackedBytes < 0) ||
             value.ActiveCheckoutContentFingerprint.Length == 0 &&
                 (value.ActiveCheckoutTrackedFileCount != 0 || value.ActiveCheckoutTrackedBytes != 0)) Corrupt();
+    }
+
+    private static void ValidateImplementingCorrection(
+        ImplementationWorkspace? workspace,
+        ImplementationResult? result,
+        ImplementationFailure? failure,
+        ImplementationLease? lease,
+        DateTimeOffset? started,
+        DateTimeOffset? completed,
+        IReadOnlyList<ImplementationRevision> revisions,
+        Guid? pendingRevisionId)
+    {
+        if (revisions.Count != 2 || pendingRevisionId is null) Corrupt();
+        var pending = revisions.SingleOrDefault(item => item.RevisionId == pendingRevisionId);
+        if (pending is null) Corrupt();
+        if (pending.GenerationState == ImplementationGenerationState.Succeeded)
+        {
+            ValidateCompletedArtifacts(workspace, result, failure, lease, started, completed, allowLegacyEmpty: false);
+            return;
+        }
+        if (pending.Workspace is null)
+        {
+            if (workspace is null || result is null || lease is not null) Corrupt();
+            return;
+        }
+        ValidateImplementing(workspace, result, failure, lease, started, completed);
+    }
+
+    private static bool IsWorkspaceIdentity(ImplementationWorkspace value)
+    {
+        if (value.RevisionNumber == 1 && (string.IsNullOrEmpty(value.TaskToken) || value.TaskToken == value.Token) &&
+            string.Equals(value.Branch, $"forge/task-{value.Token}", StringComparison.Ordinal) &&
+            string.Equals(value.OwnershipReference, $"refs/forge/tasks/{value.Token}", StringComparison.Ordinal)) return true;
+        var marker = $"refs/forge/tasks/{value.TaskToken}-revision-2";
+        return value.RevisionNumber == 2 && value.TaskToken.Length == 32 && value.TaskToken.All(Uri.IsHexDigit) &&
+               string.Equals(value.Branch, $"forge/task-{value.TaskToken}-revision-2", StringComparison.Ordinal) &&
+               string.Equals(value.OwnershipReference, marker, StringComparison.Ordinal);
     }
 
     private static void ValidateLease(ImplementationLease value, ImplementationLimits limits, DateTimeOffset? now)

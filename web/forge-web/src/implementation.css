@@ -24,7 +24,13 @@
 .changed-file-review summary > span { text-transform: uppercase; color: var(--green); font: 600 8px 'IBM Plex Mono', monospace; }
 .diff-counts { white-space: nowrap; color: #2f6b4f; font: 600 10px 'IBM Plex Mono', monospace; }
 .changed-file-metadata { display: flex; gap: 15px; padding: 0 13px 10px; color: var(--muted); font: 9px 'IBM Plex Mono', monospace; }
-.unified-diff { max-width: 100%; overflow-x: auto; white-space: pre; margin: 0; padding: 14px; background: #101914; color: #dff5e8; font: 10px/1.55 'IBM Plex Mono', monospace; }
+.unified-diff { max-width: 100%; overflow-x: auto; white-space: pre; margin: 0; padding: 0; background: #101914; color: #dff5e8; font: 10px/1.55 'IBM Plex Mono', monospace; }
+.unified-diff code { display: block; width: max-content; min-width: 100%; padding: 12px 0; color: inherit; font: inherit; }
+.diff-line { display: block; min-width: 100%; padding: 0 14px; box-sizing: border-box; white-space: pre; }
+.diff-line-added { background: #173827; color: #c9f4d6; }
+.diff-line-deleted { background: #402323; color: #ffd4d1; }
+.diff-line-hunk { background: #1c3038; color: #c5e3ee; }
+.diff-line-metadata { color: #b8c8be; }
 .implementation-approved { display: grid; gap: 7px; padding: 18px; border: 1px solid #7cae8f; background: #eef8f1; }
 .implementation-approved p, .implementation-approved small { margin: 0; }
 .implementation-approved code { width: fit-content; font-size: 11px; }
@@ -65,6 +71,11 @@
 .verification-preconditions ul { margin: 0; padding: 0 32px 13px; color: var(--muted); font-size: 11px; line-height: 1.6; }
 .verification-plan-actions { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 10px; }
 .verification-plan-actions > .primary-button { flex: 0 0 auto; }
+.verification-implementation-action { display: flex; flex: 1 1 360px; justify-content: space-between; align-items: center; gap: 12px; padding: 10px 12px; border: 1px solid var(--line); background: #f7f9f6; }
+.verification-implementation-action span { color: var(--muted); font-size: 10px; }
+.case-diff-action { width: fit-content; padding: 0; }
+.implementation-review-return { display: flex; align-items: center; gap: 14px; padding: 12px 14px; border: 1px solid var(--line); background: #f7f9f6; }
+.implementation-review-return p { margin: 0; color: var(--muted); font-size: 10px; }
 .verification-documents { display: flex; flex: 1 1 520px; justify-content: space-between; align-items: center; gap: 14px; padding: 12px 14px; border: 1px solid var(--line); background: #f7f9f6; }
 .verification-documents > div:first-child { min-width: 120px; }
 .verification-documents strong { font-size: 11px; }
@@ -106,10 +117,21 @@
 .verification-case-guidance li small, .verification-case-guidance li code { display: block; max-width: 100%; margin-top: 4px; overflow-wrap: anywhere; font-size: 9px; }
 .manual-label { width: fit-content; padding: 4px 7px; border: 1px solid #cbd6cc; background: #eef4ef; color: var(--green-dark); font: 600 8px 'IBM Plex Mono', monospace; letter-spacing: .04em; }
 .verification-form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.verification-result-recording { display: grid; gap: 9px; }
+.verification-result-recording > strong { color: var(--green-dark); font: 600 10px 'IBM Plex Mono', monospace; text-transform: uppercase; }
 .verification-case label, .verification-completion label, .verification-failure-fields label { min-width: 0; display: grid; gap: 5px; color: #536158; font-size: 10px; font-weight: 600; }
 .verification-case textarea, .verification-completion textarea, .verification-case input, .verification-case select, .verification-failure-fields textarea, .verification-failure-fields input, .verification-failure-fields select { width: 100%; max-width: 100%; box-sizing: border-box; }
 .verification-case textarea, .verification-completion textarea, .verification-failure-fields textarea { min-height: 76px; resize: vertical; }
-.verification-failure-fields { padding: 13px; border: 1px solid #e1c7bb; background: #fff8f4; }
+.verification-full-width { grid-column: 1 / -1; }
+.verification-failure-fields { padding: 14px; border: 1px solid var(--line); border-left: 3px solid #a8654a; background: #fff; }
+.verification-failure-fields legend { width: 100%; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.verification-failure-fields legend small { padding: 3px 6px; background: #fff0e9; color: #8b4d32; font: 600 8px 'IBM Plex Mono', monospace; }
+.verification-failure-fields .failure-title { color: var(--ink); font-size: 11px; }
+.verification-failure-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.verification-failure-fields .failure-error textarea { min-height: 58px; }
+.verification-failure-footer { display: grid; grid-template-columns: minmax(150px, .4fr) minmax(0, 1fr); align-items: end; gap: 14px; padding-top: 2px; }
+.verification-failure-save { display: flex; justify-content: flex-end; align-items: center; gap: 12px; }
+.verification-failure-save span { color: var(--muted); font-size: 9px; text-align: right; }
 .verification-save-row { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
 .verification-save-row span { color: var(--muted); font-size: 9px; }
 .verification-case-history { margin-top: 12px; border: 1px solid var(--line); background: #f7f9f6; }
@@ -117,11 +139,12 @@
 .verification-case-history article strong, .verification-case-history article span { font: 600 9px/1.45 'IBM Plex Mono', monospace; }
 .verification-case-history article span { color: var(--muted); }
 .verification-case-history article p { margin: 2px 0 0; color: var(--muted); font-size: 10px; }
-.verification-completion { margin-top: 6px; padding: 16px; border: 1px solid var(--line); background: #f7f9f6; }
+.verification-completion { margin-top: 4px; padding: 13px 14px; gap: 9px; border: 1px solid var(--line); background: #f7f9f6; }
 .verification-completion > p { margin: 0; color: var(--muted); font-size: 11px; }
-.verification-confirmation { display: flex!important; grid-template-columns: none; align-items: flex-start; gap: 9px!important; }
-.verification-confirmation input { width: auto; margin-top: 2px; }
-.verification-completion-actions { justify-content: flex-start; }
+.verification-confirmation { display: flex!important; grid-template-columns: none; align-items: center; gap: 9px!important; }
+.verification-confirmation input { width: auto; margin: 0; }
+.verification-completion textarea { min-height: 58px; }
+.verification-completion-actions { justify-content: flex-start; align-items: center; }
 .verification-boundary { margin: 0; padding: 11px 12px; border-left: 3px solid var(--green); background: #f5f8f3; color: var(--muted); font-size: 10px; line-height: 1.55; }
 .verification-terminal { text-align: left; }
 .verification-terminal .verification-documents { flex: none; }
@@ -140,6 +163,7 @@
   .diff-truncation-banner.compact { display: grid; }
   .verification-panel { padding: 24px 20px 28px; }
   .verification-generation-action, .verification-documents, .verification-save-row { align-items: stretch; flex-direction: column; }
+  .verification-implementation-action, .implementation-review-return { align-items: stretch; flex-direction: column; }
   .verification-status-strip span { padding-left: 0; border-left: 0; }
   .verification-metadata div { grid-template-columns: 1fr; gap: 3px; }
   .verification-document-actions, .verification-completion-actions { display: grid; grid-template-columns: 1fr; }
@@ -151,5 +175,10 @@
   .case-result { margin-left: 66px; }
   .case-disclosure { grid-column: 3; grid-row: 1 / span 2; }
   .verification-form-grid { grid-template-columns: 1fr; }
+  .verification-failure-grid, .verification-failure-footer { grid-template-columns: 1fr; }
+  .verification-full-width { grid-column: auto; }
+  .verification-failure-save { align-items: stretch; flex-direction: column; }
+  .verification-failure-save span { text-align: left; }
+  .verification-failure-save button { width: 100%; }
   .verification-result-summary dl div { grid-template-columns: 1fr; gap: 2px; }
 }

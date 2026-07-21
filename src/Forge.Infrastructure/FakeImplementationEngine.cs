@@ -15,10 +15,12 @@ public sealed class FakeImplementationEngine : IImplementationEngine
         ArgumentNullException.ThrowIfNull(context);
         var operations = context.Files
             .Where(file => file.PlannedAction != PlannedFileAction.Inspect)
-            .Select(CreateOperation)
+            .Select(file => context.Correction is null ? CreateOperation(file) : CreateCorrectionOperation(file, context.Correction))
             .ToArray();
         var output = new ImplementationOutput(
-            "Created deterministic Fake-mode changes for isolated diff-review workflow validation.",
+            context.Correction is null
+                ? "Created deterministic Fake-mode changes for isolated diff-review workflow validation."
+                : "Created a deterministic Fake correction candidate in a separate revision worktree.",
             [
                 "This is a mechanical workflow demonstration, not AI-authored implementation.",
                 "Validation commands were not run."
@@ -29,6 +31,72 @@ public sealed class FakeImplementationEngine : IImplementationEngine
             null,
             context.ContextFingerprint);
         return Task.FromResult(new ImplementationEvaluation(output));
+    }
+
+    private static ImplementationOperation CreateCorrectionOperation(
+        ImplementationFileContext file,
+        CorrectionImplementationContext correction)
+    {
+        var action = file.PlannedAction switch
+        {
+            PlannedFileAction.Create => ImplementationOperationAction.Create,
+            PlannedFileAction.Modify => ImplementationOperationAction.Modify,
+            PlannedFileAction.Delete => ImplementationOperationAction.Delete,
+            _ => throw new ImplementationException("implementation_unsupported_action", "Inspect paths cannot be corrected.")
+        };
+        var path = RepositoryPathRules.Normalize(file.Path);
+        correction.PreviousFinalContent.TryGetValue(path, out var previous);
+        var selected = correction.CorrectionOperations.Any(item =>
+            RepositoryPathRules.Comparer.Equals(RepositoryPathRules.Normalize(item.Path), path));
+        var content = action == ImplementationOperationAction.Delete ? null : previous;
+        if (selected)
+        {
+            if (action == ImplementationOperationAction.Delete)
+                throw new ImplementationException("correction_no_material_change",
+                    "Deterministic Fake correction cannot materially revise a delete-only operation.");
+            content = AddCorrectionMarker(path, previous ?? string.Empty);
+        }
+        return new ImplementationOperation(path, action, file.OriginalContentSha256, content,
+            selected ? "Apply the explicitly approved deterministic Fake correction marker."
+                : "Preserve the previously approved generated output byte-for-byte.",
+            file.OriginalUtf8Bytes, file.SourceContextIdentity);
+    }
+
+    private static string AddCorrectionMarker(string path, string previous)
+    {
+        if (FakeImplementationCapabilityMatrix.GetStyle(path, PlannedFileAction.Modify) == FakeImplementationContentStyle.JsonObject)
+        {
+            try
+            {
+                var node = JsonNode.Parse(previous);
+                if (node is JsonObject objectNode)
+                    objectNode["forgeDeterministicFakeCorrection"] = "Mechanical correction workflow demonstration; not AI-authored implementation.";
+                else if (node is JsonArray arrayNode)
+                    arrayNode.Add(new JsonObject { ["forgeDeterministicFakeCorrection"] = "Mechanical correction workflow demonstration; not AI-authored implementation." });
+                else
+                    node = new JsonObject { ["forgeDeterministicFakeCorrection"] = "Mechanical correction workflow demonstration; not AI-authored implementation.", ["previousValue"] = node?.DeepClone() };
+                return node!.ToJsonString(new JsonSerializerOptions { WriteIndented = true }) + "\n";
+            }
+            catch (JsonException)
+            {
+                throw new ImplementationException("implementation_terminal_incompatibility",
+                    $"Approved JSON path '{path}' is not valid deterministic Fake correction input.");
+            }
+        }
+        var newline = previous.Contains("\r\n", StringComparison.Ordinal) ? "\r\n" : "\n";
+        var prefix = previous.Length == 0 || previous.EndsWith('\n') || previous.EndsWith('\r') ? string.Empty : newline;
+        var style = FakeImplementationCapabilityMatrix.GetStyle(path, PlannedFileAction.Modify);
+        var marker = style switch
+        {
+            FakeImplementationContentStyle.SlashLine => "// Forge deterministic Fake correction marker; not AI-authored code.",
+            FakeImplementationContentStyle.HashLine => "# Forge deterministic Fake correction marker; not AI-authored code.",
+            FakeImplementationContentStyle.SqlLine => "-- Forge deterministic Fake correction marker; not AI-authored code.",
+            FakeImplementationContentStyle.CommandLine => "REM Forge deterministic Fake correction marker; not AI-authored code.",
+            FakeImplementationContentStyle.CssBlock => "/* Forge deterministic Fake correction marker; not AI-authored code. */",
+            FakeImplementationContentStyle.XmlBlock or FakeImplementationContentStyle.MarkdownBlock => "<!-- Forge deterministic Fake correction marker; not AI-authored code. -->",
+            _ => throw Unsupported(path)
+        };
+        return $"{previous}{prefix}{marker}{newline}";
     }
 
     private static ImplementationOperation CreateOperation(ImplementationFileContext file)

@@ -106,6 +106,7 @@ public static class PersistedVerificationValidator
                 VerificationGenerationAttemptStatus.DispatchMayHaveStarted or VerificationGenerationAttemptStatus.ResponseReceived;
             var terminalFailure = generation.Status is VerificationGenerationAttemptStatus.FailedBeforeDispatch or
                 VerificationGenerationAttemptStatus.RetryableProviderResponse or
+                VerificationGenerationAttemptStatus.RejectedProviderOutput or
                 VerificationGenerationAttemptStatus.AmbiguousAfterDispatch or
                 VerificationGenerationAttemptStatus.InterruptedBeforeDispatch;
             if (active && generation.CompletedAt is not null || terminalFailure &&
@@ -119,10 +120,13 @@ public static class PersistedVerificationValidator
                 (generation.Status is VerificationGenerationAttemptStatus.DispatchMayHaveStarted or
                     VerificationGenerationAttemptStatus.ResponseReceived or
                     VerificationGenerationAttemptStatus.RetryableProviderResponse or
+                    VerificationGenerationAttemptStatus.RejectedProviderOutput or
                     VerificationGenerationAttemptStatus.AmbiguousAfterDispatch) &&
                 (generation.LogicalCallCount < 1 || generation.LastLogicalCallId is null) ||
                 generation.Status == VerificationGenerationAttemptStatus.ResponseReceived &&
-                generation.ProviderResponses.All(response => response.LogicalCallId != generation.LastLogicalCallId)) Corrupt();
+                generation.ProviderResponses.All(response => response.LogicalCallId != generation.LastLogicalCallId) ||
+                generation.Status == VerificationGenerationAttemptStatus.RejectedProviderOutput &&
+                !VerificationGenerationAttemptSemantics.HasRejectedProviderOutputEvidence(generation, task.ModelCalls)) Corrupt();
         }
         if (task.VerificationPlanGenerationAttempts.Count(attempt => attempt.Status is
                 VerificationGenerationAttemptStatus.Prepared or VerificationGenerationAttemptStatus.DispatchMayHaveStarted or
@@ -133,9 +137,10 @@ public static class PersistedVerificationValidator
             : null;
         foreach (var plan in task.VerificationPlans)
         {
-            if (approved?.Result is null || approved.ResultFingerprint is null ||
-                plan.ImplementationRevisionId != approved.RevisionId ||
-                !string.Equals(plan.ImplementationResultFingerprint, approved.ResultFingerprint, StringComparison.Ordinal) ||
+            var boundRevision = task.ImplementationRevisions.SingleOrDefault(revision =>
+                revision.RevisionId == plan.ImplementationRevisionId);
+            if (boundRevision?.Result is null || boundRevision.ResultFingerprint is null ||
+                !string.Equals(plan.ImplementationResultFingerprint, boundRevision.ResultFingerprint, StringComparison.Ordinal) ||
                 !string.Equals(plan.ApprovedRequirementFingerprint, VerificationFingerprint.ComputeApprovedRequirement(task), StringComparison.Ordinal) ||
                  task.ImplementationPlan is null || !string.Equals(plan.ApprovedPlanFingerprint,
                     ImplementationReviewFingerprint.ComputePlan(task.ImplementationPlan), StringComparison.Ordinal)) Corrupt();
@@ -144,11 +149,28 @@ public static class PersistedVerificationValidator
                 Corrupt();
             var commands = task.ImplementationPlan.ProposedValidationCommands.Select((command, index) =>
                 new ApprovedValidationCommand($"V{index + 1}", command)).ToArray();
+            var previousPlan = plan.SupersedesPlanId is { } supersedesId
+                ? task.VerificationPlans.SingleOrDefault(item => item.PlanId == supersedesId)
+                : null;
+            var failureAnalysis = previousPlan is null ? null : task.FailureAnalyses.SingleOrDefault(item =>
+                item.VerificationPlanId == previousPlan.PlanId && item.AnalysisId == task.CurrentFailureAnalysisId);
+            var correctionProposal = failureAnalysis is null ? null : task.CorrectionProposals.SingleOrDefault(item =>
+                item.AnalysisId == failureAnalysis.AnalysisId && item.ProposalId == task.CurrentCorrectionProposalId);
+            var failedAttempt = failureAnalysis is null ? null : task.ManualVerificationAttempts.SingleOrDefault(item =>
+                item.AttemptId == failureAnalysis.FailedAttemptId);
+            var previousFailures = failedAttempt is null ? null : VerificationFingerprint.CurrentResults(failedAttempt)
+                .Where(item => item.Result is ManualVerificationCaseResult.Failed or ManualVerificationCaseResult.Blocked)
+                .ToArray();
+            if ((plan.SupersedesPlanId is null) != (previousPlan is null) || previousPlan is not null &&
+                (failureAnalysis is null || correctionProposal is null || previousFailures is null || previousFailures.Length == 0))
+                Corrupt();
             var provisional = new VerificationPlanContext(
-                task.Id, task.RequirementSummary ?? string.Empty, task.ImplementationPlan, approved.RevisionId,
-                approved.ResultFingerprint, approved.Result, task.EvidenceItems, commands,
+                task.Id, task.RequirementSummary ?? string.Empty, task.ImplementationPlan, boundRevision.RevisionId,
+                boundRevision.ResultFingerprint, boundRevision.Result, task.EvidenceItems, commands,
                 plan.ApprovedRequirementFingerprint, plan.ApprovedPlanFingerprint, plan.GenerationContextFingerprint,
-                plan.GeneratedAt, task.EvidenceFilesInspected, task.EvidenceFilesSelected);
+                plan.GeneratedAt, task.EvidenceFilesInspected, task.EvidenceFilesSelected,
+                previousPlan, previousFailures, failureAnalysis, correctionProposal,
+                VerificationValidator.ExtractApprovedManualTestData(task));
             if (!string.Equals(plan.GenerationContextFingerprint, VerificationFingerprint.ComputeContext(provisional with
                 { ContextFingerprint = string.Empty }), StringComparison.Ordinal)) Corrupt();
             try { VerificationValidator.ValidatePersistedPlan(task.Id, plan, provisional, limits); }
@@ -219,8 +241,14 @@ public static class PersistedVerificationValidator
         switch (task.Status)
         {
             case WorkflowStatus.ImplementationApproved:
-                if (task.VerificationPlans.Count > 0 || task.CurrentVerificationPlanId is not null ||
-                    task.CurrentVerificationAttemptId is not null) Corrupt();
+                if (task.ImplementationRevisions.Count == 1)
+                {
+                    if (task.VerificationPlans.Count > 0 || task.CurrentVerificationPlanId is not null ||
+                        task.CurrentVerificationAttemptId is not null) Corrupt();
+                }
+                else if (task.CurrentVerificationPlanId is not null || task.CurrentVerificationAttemptId is not null ||
+                         task.VerificationPlans.Any(plan => plan.Status != VerificationPlanStatus.Superseded) ||
+                         task.ManualVerificationAttempts.Any(attempt => attempt.Status == ManualVerificationAttemptStatus.InProgress)) Corrupt();
                 break;
             case WorkflowStatus.VerificationPlanning:
                 if (task.CurrentVerificationAttemptId is not null ||
@@ -231,10 +259,28 @@ public static class PersistedVerificationValidator
                     currentAttempt is not null && currentAttempt.Status != ManualVerificationAttemptStatus.InProgress) Corrupt();
                 break;
             case WorkflowStatus.ReadyForDelivery:
+            case WorkflowStatus.AwaitingDeliveryApproval:
+            case WorkflowStatus.Delivering:
+            case WorkflowStatus.PullRequestCreated:
+            case WorkflowStatus.DeliveryRecoveryRequired:
                 if (currentPlan is not { Status: VerificationPlanStatus.Completed } ||
                     currentAttempt?.Status != ManualVerificationAttemptStatus.CompletedPassed) Corrupt();
                 break;
             case WorkflowStatus.ManualVerificationFailed:
+                if (currentPlan is not { Status: VerificationPlanStatus.Completed } ||
+                    currentAttempt?.Status != ManualVerificationAttemptStatus.CompletedFailed) Corrupt();
+                break;
+            case WorkflowStatus.FailureAnalysisPending:
+            case WorkflowStatus.FailureAnalysisRecoveryRequired:
+            case WorkflowStatus.AwaitingFailureResolution:
+            case WorkflowStatus.AwaitingCorrectionApproval:
+            case WorkflowStatus.CorrectionApproved:
+            case WorkflowStatus.ImplementingCorrection:
+            case WorkflowStatus.CorrectionRecoveryRequired:
+                if (currentPlan is not { Status: VerificationPlanStatus.Completed } ||
+                    currentAttempt?.Status != ManualVerificationAttemptStatus.CompletedFailed) Corrupt();
+                break;
+            case WorkflowStatus.AwaitingImplementationReview when task.ImplementationRevisions.Count == 2:
                 if (currentPlan is not { Status: VerificationPlanStatus.Completed } ||
                     currentAttempt?.Status != ManualVerificationAttemptStatus.CompletedFailed) Corrupt();
                 break;
@@ -276,7 +322,12 @@ public static class PersistedVerificationValidator
                 VerificationDataFormatVersions.Current)) Corrupt();
         var verificationStatus = status is WorkflowStatus.VerificationPlanning or
             WorkflowStatus.AwaitingManualVerification or WorkflowStatus.ManualVerificationFailed or
-            WorkflowStatus.ReadyForDelivery;
+            WorkflowStatus.FailureAnalysisPending or WorkflowStatus.AwaitingFailureResolution or
+            WorkflowStatus.FailureAnalysisRecoveryRequired or WorkflowStatus.CorrectionRecoveryRequired or
+            WorkflowStatus.AwaitingCorrectionApproval or WorkflowStatus.CorrectionApproved or
+            WorkflowStatus.ImplementingCorrection or WorkflowStatus.ReadyForDelivery or
+            WorkflowStatus.AwaitingDeliveryApproval or WorkflowStatus.Delivering or
+            WorkflowStatus.PullRequestCreated or WorkflowStatus.DeliveryRecoveryRequired;
         var hasArtifacts = hasCurrentPlanPointer || hasCurrentAttemptPointer || hasVerificationModelCalls ||
             hasPersistedVerificationRows || hasVerificationCommandBindings || verificationStatus;
         if (formatVersion == VerificationDataFormatVersions.Legacy && hasArtifacts ||

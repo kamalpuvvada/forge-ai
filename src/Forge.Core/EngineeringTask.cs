@@ -10,6 +10,14 @@ public sealed class EngineeringTask
     private readonly List<VerificationPlan> _verificationPlans = [];
     private readonly List<VerificationPlanGenerationAttempt> _verificationPlanGenerationAttempts = [];
     private readonly List<ManualVerificationAttempt> _manualVerificationAttempts = [];
+    private readonly List<FailureAnalysis> _failureAnalyses = [];
+    private readonly List<CorrectionProposal> _correctionProposals = [];
+    private readonly List<FailureAnalysisGenerationAttempt> _failureAnalysisGenerationAttempts = [];
+    private readonly List<CorrectionGenerationAttempt> _correctionGenerationAttempts = [];
+    private readonly List<CorrectionApprovalCommandBinding> _correctionApprovalCommands = [];
+    private readonly List<DeliveryProposal> _deliveryProposals = [];
+    private readonly List<DeliveryAttempt> _deliveryAttempts = [];
+    private readonly List<DeliveryApprovalCommandBinding> _deliveryApprovalCommands = [];
 
     private EngineeringTask() { }
 
@@ -25,6 +33,14 @@ public sealed class EngineeringTask
     public IReadOnlyList<VerificationPlan> VerificationPlans => _verificationPlans;
     public IReadOnlyList<VerificationPlanGenerationAttempt> VerificationPlanGenerationAttempts => _verificationPlanGenerationAttempts;
     public IReadOnlyList<ManualVerificationAttempt> ManualVerificationAttempts => _manualVerificationAttempts;
+    public IReadOnlyList<FailureAnalysis> FailureAnalyses => _failureAnalyses;
+    public IReadOnlyList<CorrectionProposal> CorrectionProposals => _correctionProposals;
+    public IReadOnlyList<FailureAnalysisGenerationAttempt> FailureAnalysisGenerationAttempts => _failureAnalysisGenerationAttempts;
+    public IReadOnlyList<CorrectionGenerationAttempt> CorrectionGenerationAttempts => _correctionGenerationAttempts;
+    public IReadOnlyList<CorrectionApprovalCommandBinding> CorrectionApprovalCommands => _correctionApprovalCommands;
+    public IReadOnlyList<DeliveryProposal> DeliveryProposals => _deliveryProposals;
+    public IReadOnlyList<DeliveryAttempt> DeliveryAttempts => _deliveryAttempts;
+    public IReadOnlyList<DeliveryApprovalCommandBinding> DeliveryApprovalCommands => _deliveryApprovalCommands;
     public string? CurrentPendingQuestion { get; private set; }
     public string? RequirementSummary { get; private set; }
     public WorkflowStatus Status { get; private set; }
@@ -49,9 +65,16 @@ public sealed class EngineeringTask
     public ImplementationLease? ImplementationLease { get; private set; }
     public Guid? ActiveImplementationRevisionId { get; private set; }
     public Guid? ApprovedImplementationRevisionId { get; private set; }
+    public Guid? PendingImplementationRevisionId { get; private set; }
     public Guid? CurrentVerificationPlanId { get; private set; }
     public Guid? CurrentVerificationAttemptId { get; private set; }
+    public Guid? CurrentFailureAnalysisId { get; private set; }
+    public Guid? CurrentCorrectionProposalId { get; private set; }
+    public Guid? CurrentDeliveryProposalId { get; private set; }
+    public Guid? CurrentDeliveryAttemptId { get; private set; }
     public int VerificationDataFormatVersion { get; private set; }
+    public int CorrectionDataFormatVersion { get; private set; }
+    public int DeliveryDataFormatVersion { get; private set; }
     public long RowVersion { get; private set; }
     public Guid? ExpectedImplementationLeaseIdForSave { get; private set; }
 
@@ -347,7 +370,8 @@ public sealed class EngineeringTask
 
     public void UpdateImplementationWorkspace(ImplementationWorkspace workspace, Guid attemptId, Guid ownerId, DateTimeOffset now)
     {
-        EnsureStatus(WorkflowStatus.Implementing);
+        if (Status is not (WorkflowStatus.Implementing or WorkflowStatus.ImplementingCorrection))
+            throw new WorkflowException($"Implementation workspace cannot be updated while task status is {Status}.");
         ArgumentNullException.ThrowIfNull(workspace);
         if (ImplementationWorkspace is null || !string.Equals(ImplementationWorkspace.Token, workspace.Token, StringComparison.Ordinal))
             throw new WorkflowException("The implementation workspace identity cannot be changed.");
@@ -371,7 +395,8 @@ public sealed class EngineeringTask
         Guid ownerId,
         DateTimeOffset now)
     {
-        EnsureStatus(WorkflowStatus.Implementing);
+        if (Status is not (WorkflowStatus.Implementing or WorkflowStatus.ImplementingCorrection))
+            throw new WorkflowException($"Implementation failure cannot be recorded while task status is {Status}.");
         ArgumentNullException.ThrowIfNull(failure);
         EnsureImplementationLease(attemptId, ownerId, now, allowExpired: true);
         ExpectedImplementationLeaseIdForSave = ImplementationLease!.LeaseId;
@@ -403,7 +428,8 @@ public sealed class EngineeringTask
 
     public void StoreImplementationResult(ImplementationResult result, Guid attemptId, Guid ownerId, DateTimeOffset now)
     {
-        EnsureStatus(WorkflowStatus.Implementing);
+        if (Status is not (WorkflowStatus.Implementing or WorkflowStatus.ImplementingCorrection))
+            throw new WorkflowException($"Implementation result cannot be stored while task status is {Status}.");
         ArgumentNullException.ThrowIfNull(result);
         if (ImplementationWorkspace is null)
             throw new WorkflowException("An isolated implementation workspace is required before storing generated changes.");
@@ -412,6 +438,9 @@ public sealed class EngineeringTask
         if (!string.Equals(result.BaseCommitSha, ImplementationWorkspace.BaseCommitSha, StringComparison.Ordinal) ||
             !string.Equals(result.Branch, ImplementationWorkspace.Branch, StringComparison.Ordinal))
             throw new WorkflowException("The implementation result does not match its reserved workspace.");
+        var correctionRevisionId = Status == WorkflowStatus.ImplementingCorrection
+            ? PendingImplementationRevisionId
+            : null;
         ImplementationResult = result;
         LastImplementationFailure = null;
         ImplementationWorkspace = ImplementationWorkspace with
@@ -439,7 +468,23 @@ public sealed class EngineeringTask
                 Lease = null
             };
         });
-        Status = WorkflowStatus.AwaitingImplementationReview;
+        if (correctionRevisionId is { } pendingCorrectionId)
+        {
+            ActiveImplementationRevisionId = ApprovedImplementationRevisionId;
+            var effective = _implementationRevisions.Single(item => item.RevisionId == ApprovedImplementationRevisionId);
+            ImplementationWorkspace = effective.Workspace;
+            ImplementationResult = effective.Result;
+            LastImplementationFailure = effective.Failure;
+            ImplementationStartedAt = effective.GenerationStartedAt;
+            ImplementationCompletedAt = effective.GenerationCompletedAt;
+            ImplementationLease = null;
+            PendingImplementationRevisionId = pendingCorrectionId;
+        }
+        else
+        {
+            Status = WorkflowStatus.AwaitingImplementationReview;
+            PendingImplementationRevisionId = null;
+        }
         UpdatedAt = now;
     }
 
@@ -529,6 +574,21 @@ public sealed class EngineeringTask
             ApprovalCommandId = commandId,
             ApprovalExpectedRowVersion = expectedRowVersion
         });
+        if (active.RevisionNumber == 2)
+        {
+            var previousIndex = _implementationRevisions.FindIndex(revision => revision.RevisionId == active.PreviousRevisionId);
+            if (previousIndex < 0 || _implementationRevisions[previousIndex].ReviewState != ImplementationReviewState.Approved)
+                throw new WorkflowException("The correction revision has no effective approved predecessor.");
+            _implementationRevisions[previousIndex] = _implementationRevisions[previousIndex] with
+            {
+                ReviewState = ImplementationReviewState.HistoricallyApproved
+            };
+            foreach (var index in Enumerable.Range(0, _verificationPlans.Count))
+                if (_verificationPlans[index].Status is VerificationPlanStatus.Current or VerificationPlanStatus.Completed)
+                    _verificationPlans[index] = _verificationPlans[index] with { Status = VerificationPlanStatus.Superseded };
+            CurrentVerificationPlanId = null;
+            CurrentVerificationAttemptId = null;
+        }
         ApprovedImplementationRevisionId = active.RevisionId;
         Status = WorkflowStatus.ImplementationApproved;
         UpdatedAt = now;
@@ -584,10 +644,13 @@ public sealed class EngineeringTask
                      VerificationGenerationAttemptStatus.DispatchMayHaveStarted or
                      VerificationGenerationAttemptStatus.ResponseReceived)
                 throw new WorkflowException("A verification-plan generation attempt is already active.");
-            else if (latest.Status == VerificationGenerationAttemptStatus.AmbiguousAfterDispatch)
+            else if (latest.Status == VerificationGenerationAttemptStatus.AmbiguousAfterDispatch &&
+                     !VerificationGenerationAttemptSemantics.IsLegacyRejectedProviderOutput(latest, _modelCalls))
                 throw new WorkflowException("The prior provider dispatch is ambiguous and cannot be retried safely.");
             else if (latest.Status is not (VerificationGenerationAttemptStatus.FailedBeforeDispatch or
                      VerificationGenerationAttemptStatus.RetryableProviderResponse or
+                     VerificationGenerationAttemptStatus.RejectedProviderOutput or
+                     VerificationGenerationAttemptStatus.AmbiguousAfterDispatch or
                      VerificationGenerationAttemptStatus.InterruptedBeforeDispatch))
                 throw new WorkflowException("The prior verification-plan generation is not retry eligible.");
         }
@@ -599,6 +662,560 @@ public sealed class EngineeringTask
         Status = WorkflowStatus.VerificationPlanning;
         UpdatedAt = now;
     }
+
+    public void BeginFailureAnalysis(GenerateFailureAnalysisCommand command, DateTimeOffset now, CorrectionLimits? limits = null)
+    {
+        ArgumentNullException.ThrowIfNull(command);
+        limits ??= new CorrectionLimits();
+        EnsureStatus(WorkflowStatus.ManualVerificationFailed);
+        if (command.CommandId == Guid.Empty || command.TaskId != Id || command.ExpectedRowVersion != RowVersion)
+            throw new TaskConcurrencyException("The failed verification changed. Reload it before generating fix analysis.");
+        var attempt = _manualVerificationAttempts.SingleOrDefault(item => item.AttemptId == command.ExpectedFailedAttemptId);
+        if (attempt is not { Status: ManualVerificationAttemptStatus.CompletedFailed } ||
+            string.IsNullOrWhiteSpace(attempt.AttemptFingerprint) ||
+            !string.Equals(attempt.AttemptFingerprint, command.ExpectedFailedAttemptFingerprint, StringComparison.Ordinal) ||
+            CurrentVerificationAttemptId != attempt.AttemptId)
+            throw new CorrectionException("failure_analysis_stale_binding", "The failed verification binding changed. Reload the task before continuing.");
+        if (_implementationRevisions.Count != 1 ||
+            _implementationRevisions[0].Kind != ImplementationRevisionKind.Initial)
+            throw new CorrectionException("correction_revision_limit", "A second correction revision is not supported in this submission build.");
+        if (_failureAnalyses.Count >= limits.MaximumAnalysesPerTask)
+            throw new CorrectionException("failure_analysis_limit", "The task has reached its failure-analysis history limit.");
+        if (_failureAnalysisGenerationAttempts.Any(item => item.CommandId == command.CommandId))
+            throw new TaskConcurrencyException("The failure-analysis command has already been recorded.");
+        _failureAnalysisGenerationAttempts.Add(new FailureAnalysisGenerationAttempt(
+            command.CommandId, Id, command.ExpectedRowVersion, command.ExpectedFailedAttemptId,
+            command.ExpectedFailedAttemptFingerprint, now, now, FailureAnalysisAttemptStatus.Prepared,
+            [], [], [], 0, 0, 0, null, null, null,
+            now.AddSeconds(limits.GenerationLeaseSeconds), null, 0, 0, false, false));
+        CorrectionDataFormatVersion = 1;
+        Status = WorkflowStatus.FailureAnalysisPending;
+        UpdatedAt = now;
+    }
+
+    public void RecordFailureAnalysisCheckpoint(Guid commandId, VerificationDispatchCheckpoint checkpoint,
+        Guid logicalCallId, DateTimeOffset now, DateTimeOffset? startedAt = null)
+    {
+        EnsureStatus(WorkflowStatus.FailureAnalysisPending);
+        var index = _failureAnalysisGenerationAttempts.FindIndex(item => item.CommandId == commandId);
+        if (index < 0 || logicalCallId == Guid.Empty) throw new WorkflowException("An active failure-analysis attempt is required.");
+        var attempt = _failureAnalysisGenerationAttempts[index];
+        if (IsTerminal(attempt.Status))
+            throw new WorkflowException("A terminal failure-analysis attempt is immutable.");
+        var calls = attempt.LogicalCalls;
+        if (checkpoint == VerificationDispatchCheckpoint.DispatchMayHaveStarted)
+        {
+            if (calls.Any(item => item.LogicalCallId == logicalCallId))
+                throw new WorkflowException("The failure-analysis dispatch intent was already recorded.");
+            calls = calls.Append(new VerificationLogicalCallRecord(logicalCallId, startedAt ?? now)).ToArray();
+        }
+        else if (calls.All(item => item.LogicalCallId != logicalCallId))
+            throw new WorkflowException("The failure-analysis checkpoint has no matching logical call.");
+        var status = checkpoint switch
+        {
+            VerificationDispatchCheckpoint.DispatchMayHaveStarted => FailureAnalysisAttemptStatus.DispatchMayHaveStarted,
+            VerificationDispatchCheckpoint.ResponseReceived => FailureAnalysisAttemptStatus.ResponseReceived,
+            VerificationDispatchCheckpoint.FailedBeforeDispatch => FailureAnalysisAttemptStatus.FailedBeforeDispatch,
+            VerificationDispatchCheckpoint.RetryableProviderResponse => FailureAnalysisAttemptStatus.RetryableProviderResponse,
+            VerificationDispatchCheckpoint.AmbiguousAfterDispatch => FailureAnalysisAttemptStatus.AmbiguousAfterDispatch,
+            _ => throw new WorkflowException("The failure-analysis checkpoint is unsupported.")
+        };
+        var updated = attempt with
+        {
+            UpdatedAt = now, Status = status, LogicalCalls = calls, LogicalCallCount = calls.Count
+        };
+        _failureAnalysisGenerationAttempts[index] = WithRequestAccounting(updated);
+        UpdatedAt = now;
+    }
+
+    public void RecordFailureAnalysisResponse(Guid commandId, VerificationProviderResponseTelemetry response, DateTimeOffset now)
+    {
+        var index = _failureAnalysisGenerationAttempts.FindIndex(item => item.CommandId == commandId);
+        if (index < 0) throw new WorkflowException("An active failure-analysis attempt is required.");
+        var attempt = _failureAnalysisGenerationAttempts[index];
+        if (attempt.LogicalCalls.All(item => item.LogicalCallId != response.LogicalCallId) ||
+            attempt.ProviderResponses.Any(item => item.LogicalCallId == response.LogicalCallId))
+            throw new WorkflowException("The failure-analysis response telemetry is invalid or duplicated.");
+        var updated = attempt with
+        {
+            UpdatedAt = now, Status = FailureAnalysisAttemptStatus.ResponseReceived,
+            ProviderResponses = attempt.ProviderResponses.Append(response).ToArray()
+        };
+        _failureAnalysisGenerationAttempts[index] = WithRequestAccounting(updated);
+        UpdatedAt = now;
+    }
+
+    public void RecordFailureAnalysisCall(Guid commandId, Guid logicalCallId, ModelCallRecord call, DateTimeOffset now)
+    {
+        var index = _failureAnalysisGenerationAttempts.FindIndex(item => item.CommandId == commandId);
+        if (index < 0 || _failureAnalysisGenerationAttempts[index].LogicalCalls.All(item => item.LogicalCallId != logicalCallId))
+            throw new WorkflowException("The failure-analysis model call has no matching dispatch.");
+        if (call.Id != logicalCallId) throw new WorkflowException("The failure-analysis model call identity does not match its logical call.");
+        if (_modelCalls.All(item => item.Id != call.Id)) RecordModelCall(call, now);
+        var attempt = _failureAnalysisGenerationAttempts[index];
+        if (!attempt.ModelCallIds.Contains(call.Id))
+            _failureAnalysisGenerationAttempts[index] = WithRequestAccounting(attempt with
+            {
+                UpdatedAt = now, ModelCallIds = attempt.ModelCallIds.Append(call.Id).ToArray(),
+            });
+    }
+
+    public void CompleteFailureAnalysisAttempt(Guid commandId, Guid analysisId, DateTimeOffset now)
+    {
+        var index = _failureAnalysisGenerationAttempts.FindIndex(item => item.CommandId == commandId);
+        if (index < 0) throw new WorkflowException("An active failure-analysis attempt is required.");
+        var attempt = _failureAnalysisGenerationAttempts[index];
+        _failureAnalysisGenerationAttempts[index] = attempt with
+        { UpdatedAt = now, CompletedAt = now, Status = FailureAnalysisAttemptStatus.Completed,
+            ResultAnalysisId = analysisId, RetryEligible = false, RecoveryRequired = false, ActiveRequestCount = 0 };
+    }
+
+    public void FailFailureAnalysisAttempt(Guid commandId, string category, string message,
+        FailureAnalysisAttemptStatus requestedStatus, DateTimeOffset now)
+    {
+        var index = _failureAnalysisGenerationAttempts.FindIndex(item => item.CommandId == commandId);
+        if (index < 0) throw new WorkflowException("An active failure-analysis attempt is required.");
+        var attempt = _failureAnalysisGenerationAttempts[index];
+        var status = requestedStatus;
+        var retryEligible = status is FailureAnalysisAttemptStatus.FailedBeforeDispatch or
+            FailureAnalysisAttemptStatus.ExpiredBeforeDispatch or FailureAnalysisAttemptStatus.RetryableProviderResponse or
+            FailureAnalysisAttemptStatus.RejectedProviderOutput;
+        var recoveryRequired = status is FailureAnalysisAttemptStatus.AmbiguousAfterDispatch or
+            FailureAnalysisAttemptStatus.InterruptedAfterResponse;
+        var failed = WithRequestAccounting(attempt with
+        {
+            UpdatedAt = now, CompletedAt = now, Status = status, FailureCategory = category,
+            FailureMessage = message, RetryEligible = retryEligible, RecoveryRequired = recoveryRequired,
+            ActiveRequestCount = 0
+        });
+        if (recoveryRequired && failed.ActiveRequestCount > 0)
+            failed = failed with { PossiblyDispatchedRequestCount = failed.PossiblyDispatchedRequestCount + failed.ActiveRequestCount,
+                ActiveRequestCount = 0 };
+        _failureAnalysisGenerationAttempts[index] = failed;
+        Status = recoveryRequired ? WorkflowStatus.FailureAnalysisRecoveryRequired : WorkflowStatus.ManualVerificationFailed;
+        UpdatedAt = now;
+    }
+
+    public bool ReconcileFailureAnalysis(ReconcileFailureAnalysisCommand command, DateTimeOffset now)
+    {
+        ArgumentNullException.ThrowIfNull(command);
+        if (command.CommandId == Guid.Empty || command.TaskId != Id || command.ExpectedRowVersion != RowVersion)
+            throw new TaskConcurrencyException("The failure-analysis recovery binding changed. Reload the task.");
+        var attempt = _failureAnalysisGenerationAttempts.SingleOrDefault(item => item.CommandId == command.AttemptId)
+            ?? throw new CorrectionException("failure_analysis_reconcile_missing", "The failure-analysis attempt was not found.");
+        if (IsTerminal(attempt.Status)) return false;
+        if (attempt.LeaseExpiresAt is not { } expiry || now < expiry)
+            throw new TaskConcurrencyException("The failure-analysis attempt lease is still active.");
+        if (attempt.Status == FailureAnalysisAttemptStatus.Prepared && attempt.LogicalCalls.Count == 0)
+            FailFailureAnalysisAttempt(attempt.CommandId, "failure_analysis_expired_before_dispatch",
+                "The failure-analysis attempt expired before provider dispatch.", FailureAnalysisAttemptStatus.ExpiredBeforeDispatch, now);
+        else if (attempt.Status == FailureAnalysisAttemptStatus.DispatchMayHaveStarted && attempt.ProviderResponses.Count == 0)
+            FailFailureAnalysisAttempt(attempt.CommandId, "failure_analysis_ambiguous_after_dispatch",
+                "Provider dispatch may have started; automatic retry is disabled.", FailureAnalysisAttemptStatus.AmbiguousAfterDispatch, now);
+        else if (attempt.Status == FailureAnalysisAttemptStatus.ResponseReceived || attempt.ProviderResponses.Count > 0)
+            FailFailureAnalysisAttempt(attempt.CommandId, "failure_analysis_interrupted_after_response",
+                "A provider response was recorded, but the accepted analysis was not durably completed.", FailureAnalysisAttemptStatus.InterruptedAfterResponse, now);
+        else
+            FailFailureAnalysisAttempt(attempt.CommandId, "failure_analysis_recovery_required",
+                "The failure-analysis attempt requires explicit recovery.", FailureAnalysisAttemptStatus.AmbiguousAfterDispatch, now);
+        return true;
+    }
+
+    public void StoreFailureAnalysis(FailureAnalysis analysis, CorrectionProposal? proposal, DateTimeOffset now)
+    {
+        EnsureStatus(WorkflowStatus.FailureAnalysisPending);
+        ArgumentNullException.ThrowIfNull(analysis);
+        if (analysis.AnalysisId == Guid.Empty || analysis.GenerationCommandId == Guid.Empty ||
+            analysis.AnalysisNumber != _failureAnalyses.Count + 1 ||
+            _failureAnalyses.Any(item => item.AnalysisId == analysis.AnalysisId) ||
+            analysis.Status != FailureAnalysisStatus.Completed)
+            throw new CorrectionException("failure_analysis_invalid", "The failure analysis could not be stored safely.");
+        _failureAnalyses.Add(analysis);
+        CurrentFailureAnalysisId = analysis.AnalysisId;
+        if (analysis.Classification == FailureClassification.ImplementationDefect)
+        {
+            if (proposal is null || proposal.AnalysisId != analysis.AnalysisId ||
+                !string.Equals(proposal.AnalysisFingerprint, analysis.AnalysisFingerprint, StringComparison.Ordinal))
+                throw new CorrectionException("correction_scope_violation", "A valid correction proposal is required for an implementation defect.");
+            _correctionProposals.Add(proposal);
+            CurrentCorrectionProposalId = proposal.ProposalId;
+            Status = WorkflowStatus.AwaitingCorrectionApproval;
+        }
+        else
+        {
+            if (proposal is not null)
+                throw new CorrectionException("unsupported_failure_classification", "This failure classification cannot create an implementation correction.");
+            CurrentCorrectionProposalId = null;
+            Status = WorkflowStatus.AwaitingFailureResolution;
+        }
+        CorrectionDataFormatVersion = 1;
+        UpdatedAt = now;
+    }
+
+    public bool ApproveCorrectionProposal(ApproveCorrectionProposalCommand command, DateTimeOffset now)
+    {
+        ArgumentNullException.ThrowIfNull(command);
+        if (Status == WorkflowStatus.CorrectionApproved)
+        {
+            var replay = _correctionProposals.SingleOrDefault(item => item.ProposalId == command.ProposalId);
+            if (replay?.ApprovalCommandId == command.CommandId &&
+                replay.ApprovalExpectedRowVersion == command.ExpectedRowVersion &&
+                string.Equals(replay.ProposalFingerprint, command.ProposalFingerprint, StringComparison.Ordinal)) return false;
+            throw new WorkflowException("The correction proposal is already approved.");
+        }
+        EnsureStatus(WorkflowStatus.AwaitingCorrectionApproval);
+        if (RowVersion != command.ExpectedRowVersion || command.TaskId != Id)
+            throw new TaskConcurrencyException("The correction proposal changed. Reload it before approving.");
+        var index = _correctionProposals.FindIndex(item => item.ProposalId == command.ProposalId);
+        var analysis = _failureAnalyses.SingleOrDefault(item => item.AnalysisId == command.AnalysisId);
+        var previous = _implementationRevisions.SingleOrDefault(item => item.RevisionId == command.PreviousRevisionId);
+        if (index < 0 || analysis is null || previous is null ||
+            CurrentCorrectionProposalId != command.ProposalId || CurrentFailureAnalysisId != command.AnalysisId)
+            throw new CorrectionException("correction_stale_binding", "The correction proposal binding changed. Reload the task.");
+        var proposal = _correctionProposals[index];
+        if (proposal.Status != CorrectionProposalStatus.AwaitingApproval ||
+            !string.Equals(proposal.ProposalFingerprint, command.ProposalFingerprint, StringComparison.Ordinal) ||
+            !string.Equals(proposal.AnalysisFingerprint, command.AnalysisFingerprint, StringComparison.Ordinal) ||
+            proposal.FailedAttemptId != command.FailedAttemptId ||
+            !string.Equals(proposal.FailedAttemptFingerprint, command.FailedAttemptFingerprint, StringComparison.Ordinal) ||
+            proposal.PreviousApprovedRevisionId != command.PreviousRevisionId ||
+            !string.Equals(proposal.PreviousResultFingerprint, command.PreviousResultFingerprint, StringComparison.Ordinal) ||
+            !string.Equals(proposal.ApprovedRequirementFingerprint, command.ApprovedRequirementFingerprint, StringComparison.Ordinal) ||
+            !string.Equals(proposal.ApprovedPlanFingerprint, command.ApprovedPlanFingerprint, StringComparison.Ordinal) ||
+            !string.Equals(proposal.OriginalBaseCommitSha, command.OriginalBaseCommitSha, StringComparison.Ordinal) ||
+            ApprovedImplementationRevisionId != previous.RevisionId || previous.ReviewState != ImplementationReviewState.Approved)
+            throw new CorrectionException("correction_stale_binding", "The correction proposal no longer matches the approved workflow evidence.");
+        _correctionProposals[index] = proposal with
+        {
+            Status = CorrectionProposalStatus.Approved,
+            ApprovedAt = now,
+            ApprovalCommandId = command.CommandId,
+            ApprovalExpectedRowVersion = command.ExpectedRowVersion
+        };
+        Status = WorkflowStatus.CorrectionApproved;
+        UpdatedAt = now;
+        return true;
+    }
+
+    public void RecordCorrectionApprovalBinding(CorrectionApprovalCommandBinding binding)
+    {
+        ArgumentNullException.ThrowIfNull(binding);
+        if (_correctionApprovalCommands.Any(item => item.CommandId == binding.CommandId))
+            throw new WorkflowException("The correction approval binding is already recorded.");
+        _correctionApprovalCommands.Add(binding);
+    }
+
+    public void BeginCorrection(
+        GenerateCorrectionCommand command,
+        ImplementationWorkspace workspace,
+        ImplementationLease lease,
+        DateTimeOffset now)
+    {
+        ArgumentNullException.ThrowIfNull(command);
+        ArgumentNullException.ThrowIfNull(workspace);
+        ArgumentNullException.ThrowIfNull(lease);
+        if (Status == WorkflowStatus.CorrectionApproved) ClaimCorrection(command, now);
+        EnsureStatus(WorkflowStatus.ImplementingCorrection);
+        if (command.TaskId != Id || _implementationRevisions.Count != 2)
+            throw new CorrectionException("correction_revision_limit", "Exactly one correction revision is supported for this task.");
+        var proposal = _correctionProposals.SingleOrDefault(item => item.ProposalId == command.ProposalId);
+        var previous = _implementationRevisions[0];
+        var pendingIndex = _implementationRevisions.FindIndex(item => item.RevisionId == PendingImplementationRevisionId);
+        if (pendingIndex < 0) throw new CorrectionException("correction_stale_binding", "The claimed correction revision is missing.");
+        var pending = _implementationRevisions[pendingIndex];
+        if (proposal is not { Status: CorrectionProposalStatus.Approved } || previous is null ||
+            ApprovedImplementationRevisionId != previous.RevisionId || previous.ReviewState != ImplementationReviewState.Approved ||
+            !string.Equals(proposal.ProposalFingerprint, command.ProposalFingerprint, StringComparison.Ordinal) ||
+            !string.Equals(previous.ResultFingerprint, command.PreviousResultFingerprint, StringComparison.Ordinal) ||
+            !string.Equals(workspace.BaseCommitSha, previous.BaseCommitSha, StringComparison.Ordinal) ||
+            pending.GenerationCommandId != command.CommandId || pending.GenerationState != ImplementationGenerationState.Requested)
+            throw new CorrectionException("correction_stale_binding", "The approved correction no longer matches the effective implementation revision.");
+        EnsureValidLease(lease);
+        var currentWorkspace = workspace with { UpdatedAt = now };
+        _implementationRevisions[pendingIndex] = pending with
+        {
+            GenerationStartedAt = now,
+            GenerationState = ImplementationGenerationState.Generating,
+            Workspace = currentWorkspace,
+            Lease = lease
+        };
+        ImplementationWorkspace = currentWorkspace;
+        ImplementationResult = null;
+        LastImplementationFailure = null;
+        ImplementationStartedAt = now;
+        ImplementationCompletedAt = null;
+        ImplementationLease = lease;
+        Status = WorkflowStatus.ImplementingCorrection;
+        UpdatedAt = now;
+    }
+
+    public Guid ClaimCorrection(GenerateCorrectionCommand command, DateTimeOffset now, int generationLeaseSeconds = 300)
+    {
+        ArgumentNullException.ThrowIfNull(command);
+        EnsureStatus(WorkflowStatus.CorrectionApproved);
+        if (RowVersion != command.ExpectedRowVersion || command.TaskId != Id || _implementationRevisions.Count != 1)
+            throw new CorrectionException("correction_revision_limit", "Exactly one correction revision is supported for this task.");
+        var proposal = _correctionProposals.SingleOrDefault(item => item.ProposalId == command.ProposalId);
+        var previous = _implementationRevisions[0];
+        if (proposal is not { Status: CorrectionProposalStatus.Approved } ||
+            ApprovedImplementationRevisionId != previous.RevisionId || previous.ReviewState != ImplementationReviewState.Approved ||
+            previous.ResultFingerprint is null ||
+            !string.Equals(proposal.ProposalFingerprint, command.ProposalFingerprint, StringComparison.Ordinal) ||
+            !string.Equals(previous.ResultFingerprint, command.PreviousResultFingerprint, StringComparison.Ordinal))
+            throw new CorrectionException("correction_stale_binding", "The approved correction no longer matches the effective implementation revision.");
+        var revisionId = Guid.NewGuid();
+        _implementationRevisions.Add(new ImplementationRevision(
+            revisionId, 2, ImplementationRevisionKind.Correction, previous.RevisionId,
+            previous.PlanFingerprint, previous.BaseCommitSha, proposal.CorrectionStrategy, now,
+            command.CommandId, command.CommandId, now, null, ImplementationGenerationState.Requested,
+            ImplementationReviewState.NotReviewable, null, null, null, null, null, null, null, null,
+            proposal.ProposalId, proposal.ProposalFingerprint));
+        PendingImplementationRevisionId = revisionId;
+        _correctionGenerationAttempts.Add(new CorrectionGenerationAttempt(
+            Guid.NewGuid(), command.CommandId, Id, command.ExpectedRowVersion, command.ProposalId,
+            command.ProposalFingerprint, command.PreviousRevisionId, command.PreviousResultFingerprint,
+            now, now, CorrectionGenerationAttemptStatus.Prepared, [], [], [], 0, 0, 0,
+            null, revisionId, null, null, now.AddSeconds(generationLeaseSeconds), null, 0, 0, false, false));
+        Status = WorkflowStatus.ImplementingCorrection;
+        UpdatedAt = now;
+        return revisionId;
+    }
+
+    public void RecordCorrectionCheckpoint(Guid commandId, CorrectionGenerationAttemptStatus status,
+        DateTimeOffset now, Guid? logicalCallId = null, DateTimeOffset? startedAt = null)
+    {
+        var index = _correctionGenerationAttempts.FindIndex(item => item.CommandId == commandId);
+        if (index < 0) throw new WorkflowException("An active correction-generation attempt is required.");
+        var attempt = _correctionGenerationAttempts[index];
+        if (IsTerminal(attempt.Status))
+            throw new WorkflowException("A terminal correction-generation attempt is immutable.");
+        if (CorrectionPhaseRank(status) < CorrectionPhaseRank(attempt.Status))
+            throw new WorkflowException("The correction-generation phase cannot move backwards.");
+        var calls = attempt.LogicalCalls;
+        if (status == CorrectionGenerationAttemptStatus.DispatchMayHaveStarted)
+        {
+            if (logicalCallId is null || logicalCallId == Guid.Empty || calls.Any(item => item.LogicalCallId == logicalCallId.Value))
+                throw new WorkflowException("The correction dispatch identity is invalid or duplicated.");
+            calls = calls.Append(new VerificationLogicalCallRecord(logicalCallId.Value, startedAt ?? now)).ToArray();
+        }
+        var updated = attempt with
+        {
+            UpdatedAt = now, Status = status, LogicalCalls = calls, LogicalCallCount = calls.Count
+        };
+        _correctionGenerationAttempts[index] = WithRequestAccounting(updated);
+        UpdatedAt = now;
+    }
+
+    private static int CorrectionPhaseRank(CorrectionGenerationAttemptStatus status) => status switch
+    {
+        CorrectionGenerationAttemptStatus.Prepared => 0,
+        CorrectionGenerationAttemptStatus.DispatchMayHaveStarted => 1,
+        CorrectionGenerationAttemptStatus.ResponseReceived => 2,
+        CorrectionGenerationAttemptStatus.OutputAccepted => 3,
+        CorrectionGenerationAttemptStatus.CheckoutVerified => 4,
+        CorrectionGenerationAttemptStatus.RevisionReserved => 5,
+        CorrectionGenerationAttemptStatus.WorkspacePreparing => 6,
+        CorrectionGenerationAttemptStatus.WorkspacePrepared => 7,
+        CorrectionGenerationAttemptStatus.MutationStarted => 8,
+        CorrectionGenerationAttemptStatus.ApplyCompleted => 9,
+        CorrectionGenerationAttemptStatus.ResultPersisted => 10,
+        CorrectionGenerationAttemptStatus.Completed => 11,
+        _ => int.MaxValue
+    };
+
+    public void RecordCorrectionResponse(Guid commandId, VerificationProviderResponseTelemetry response, DateTimeOffset now)
+    {
+        var index = _correctionGenerationAttempts.FindIndex(item => item.CommandId == commandId);
+        if (index < 0) throw new WorkflowException("An active correction-generation attempt is required.");
+        var attempt = _correctionGenerationAttempts[index];
+        if (attempt.LogicalCalls.All(item => item.LogicalCallId != response.LogicalCallId) ||
+            attempt.ProviderResponses.Any(item => item.LogicalCallId == response.LogicalCallId))
+            throw new WorkflowException("The correction response telemetry is invalid or duplicated.");
+        var updated = attempt with
+        {
+            UpdatedAt = now, Status = CorrectionGenerationAttemptStatus.ResponseReceived,
+            ProviderResponses = attempt.ProviderResponses.Append(response).ToArray()
+        };
+        _correctionGenerationAttempts[index] = WithRequestAccounting(updated);
+        UpdatedAt = now;
+    }
+
+    public void RecordCorrectionCall(Guid commandId, Guid logicalCallId, ModelCallRecord call, DateTimeOffset now)
+    {
+        var index = _correctionGenerationAttempts.FindIndex(item => item.CommandId == commandId);
+        if (index < 0 || _correctionGenerationAttempts[index].LogicalCalls.All(item => item.LogicalCallId != logicalCallId))
+            throw new WorkflowException("The correction model call has no matching dispatch.");
+        if (call.Id != logicalCallId) throw new WorkflowException("The correction model call identity does not match its logical call.");
+        if (_modelCalls.All(item => item.Id != call.Id)) RecordModelCall(call, now);
+        var attempt = _correctionGenerationAttempts[index];
+        if (!attempt.ModelCallIds.Contains(call.Id))
+            _correctionGenerationAttempts[index] = WithRequestAccounting(attempt with
+            {
+                UpdatedAt = now, ModelCallIds = attempt.ModelCallIds.Append(call.Id).ToArray(),
+            });
+    }
+
+    public void RecordCorrectionOutputAccepted(Guid commandId, string outputFingerprint, DateTimeOffset now)
+    {
+        var index = _correctionGenerationAttempts.FindIndex(item => item.CommandId == commandId);
+        if (index < 0) throw new WorkflowException("An active correction-generation attempt is required.");
+        _correctionGenerationAttempts[index] = _correctionGenerationAttempts[index] with
+        { UpdatedAt = now, Status = CorrectionGenerationAttemptStatus.OutputAccepted, AcceptedOutputFingerprint = outputFingerprint };
+        UpdatedAt = now;
+    }
+
+    public void CompleteCorrectionAttempt(Guid commandId, Guid revisionId, DateTimeOffset now)
+    {
+        var index = _correctionGenerationAttempts.FindIndex(item => item.CommandId == commandId);
+        if (index < 0 || _correctionGenerationAttempts[index].RevisionId != revisionId)
+            throw new WorkflowException("The correction-generation attempt does not match the completed revision.");
+        var revision = _implementationRevisions.SingleOrDefault(item => item.RevisionId == revisionId);
+        if (revision?.Result is null || revision.ResultFingerprint is null)
+            throw new WorkflowException("The correction result is not durably persisted.");
+        ActiveImplementationRevisionId = revisionId;
+        PendingImplementationRevisionId = null;
+        ImplementationWorkspace = revision.Workspace;
+        ImplementationResult = revision.Result;
+        LastImplementationFailure = revision.Failure;
+        ImplementationStartedAt = revision.GenerationStartedAt;
+        ImplementationCompletedAt = revision.GenerationCompletedAt;
+        ImplementationLease = null;
+        Status = WorkflowStatus.AwaitingImplementationReview;
+        _correctionGenerationAttempts[index] = _correctionGenerationAttempts[index] with
+        { UpdatedAt = now, CompletedAt = now, Status = CorrectionGenerationAttemptStatus.Completed,
+            RetryEligible = false, RecoveryRequired = false, ActiveRequestCount = 0 };
+        UpdatedAt = now;
+    }
+
+    public void FailCorrectionAttempt(Guid commandId, string category, string message,
+        CorrectionGenerationAttemptStatus status, DateTimeOffset now)
+    {
+        var index = _correctionGenerationAttempts.FindIndex(item => item.CommandId == commandId);
+        if (index < 0) throw new WorkflowException("An active correction-generation attempt is required.");
+        var retryEligible = status is CorrectionGenerationAttemptStatus.FailedBeforeDispatch or
+            CorrectionGenerationAttemptStatus.FailedBeforeMutation;
+        var recoveryRequired = status is CorrectionGenerationAttemptStatus.AmbiguousAfterDispatch or
+            CorrectionGenerationAttemptStatus.InterruptedAfterResponse or CorrectionGenerationAttemptStatus.RecoveryRequired;
+        var failed = WithRequestAccounting(_correctionGenerationAttempts[index] with
+        { UpdatedAt = now, CompletedAt = now, Status = status, FailureCategory = category, FailureMessage = message,
+            RetryEligible = retryEligible, RecoveryRequired = recoveryRequired, ActiveRequestCount = 0 });
+        if (recoveryRequired && failed.ActiveRequestCount > 0)
+            failed = failed with { PossiblyDispatchedRequestCount = failed.PossiblyDispatchedRequestCount + failed.ActiveRequestCount,
+                ActiveRequestCount = 0 };
+        _correctionGenerationAttempts[index] = failed;
+        if (status is CorrectionGenerationAttemptStatus.FailedBeforeDispatch or CorrectionGenerationAttemptStatus.FailedBeforeMutation)
+        {
+            var revisionId = _correctionGenerationAttempts[index].RevisionId;
+            _implementationRevisions.RemoveAll(item => item.RevisionId == revisionId);
+            PendingImplementationRevisionId = null;
+            ActiveImplementationRevisionId = ApprovedImplementationRevisionId;
+            var effective = _implementationRevisions.Single(item => item.RevisionId == ApprovedImplementationRevisionId);
+            ImplementationWorkspace = effective.Workspace;
+            ImplementationResult = effective.Result;
+            LastImplementationFailure = effective.Failure;
+            ImplementationLease = null;
+            ImplementationStartedAt = effective.GenerationStartedAt;
+            ImplementationCompletedAt = effective.GenerationCompletedAt;
+            Status = WorkflowStatus.CorrectionApproved;
+        }
+        else if (recoveryRequired)
+        {
+            ActiveImplementationRevisionId = ApprovedImplementationRevisionId;
+            var effective = _implementationRevisions.Single(item => item.RevisionId == ApprovedImplementationRevisionId);
+            ImplementationWorkspace = effective.Workspace;
+            ImplementationResult = effective.Result;
+            LastImplementationFailure = effective.Failure;
+            ImplementationLease = null;
+            ImplementationStartedAt = effective.GenerationStartedAt;
+            ImplementationCompletedAt = effective.GenerationCompletedAt;
+            Status = WorkflowStatus.CorrectionRecoveryRequired;
+        }
+        UpdatedAt = now;
+    }
+
+    public bool ReconcileCorrection(ReconcileCorrectionCommand command, DateTimeOffset now)
+    {
+        ArgumentNullException.ThrowIfNull(command);
+        if (command.CommandId == Guid.Empty || command.TaskId != Id || command.ExpectedRowVersion != RowVersion)
+            throw new TaskConcurrencyException("The correction recovery binding changed. Reload the task.");
+        var attempt = _correctionGenerationAttempts.SingleOrDefault(item => item.AttemptId == command.AttemptId)
+            ?? throw new CorrectionException("correction_reconcile_missing", "The correction-generation attempt was not found.");
+        if (attempt.ProposalId != command.ProposalId || attempt.RevisionId != command.RevisionId ||
+            attempt.PreviousRevisionId != command.PreviousRevisionId ||
+            !string.Equals(attempt.ProposalFingerprint, command.ProposalFingerprint, StringComparison.Ordinal) ||
+            !string.Equals(attempt.PreviousResultFingerprint, command.PreviousResultFingerprint, StringComparison.Ordinal))
+            throw new CorrectionException("correction_stale_binding", "The correction recovery binding changed. Reload the task.");
+        if (IsTerminal(attempt.Status)) return false;
+        if (attempt.LeaseExpiresAt is not { } expiry || now < expiry)
+            throw new TaskConcurrencyException("The correction-generation attempt lease is still active.");
+        if (attempt.Status == CorrectionGenerationAttemptStatus.Prepared && attempt.LogicalCalls.Count == 0)
+            FailCorrectionAttempt(attempt.CommandId, "correction_expired_before_dispatch",
+                "The correction-generation attempt expired before provider dispatch.", CorrectionGenerationAttemptStatus.FailedBeforeDispatch, now);
+        else if (attempt.Status == CorrectionGenerationAttemptStatus.ResultPersisted)
+        {
+            var revision = _implementationRevisions.SingleOrDefault(item => item.RevisionId == attempt.RevisionId);
+            if (Status != WorkflowStatus.ImplementingCorrection || revision?.Result is null ||
+                revision.ResultFingerprint is null || ActiveImplementationRevisionId != ApprovedImplementationRevisionId ||
+                PendingImplementationRevisionId != revision.RevisionId)
+                FailCorrectionAttempt(attempt.CommandId, "correction_result_reconciliation_failed",
+                    "The persisted correction result could not be rebound safely.", CorrectionGenerationAttemptStatus.RecoveryRequired, now);
+            else
+                CompleteCorrectionAttempt(attempt.CommandId, revision.RevisionId, now);
+        }
+        else
+        {
+            var status = attempt.Status == CorrectionGenerationAttemptStatus.ResponseReceived
+                ? CorrectionGenerationAttemptStatus.InterruptedAfterResponse
+                : attempt.Status == CorrectionGenerationAttemptStatus.DispatchMayHaveStarted
+                    ? CorrectionGenerationAttemptStatus.AmbiguousAfterDispatch
+                    : CorrectionGenerationAttemptStatus.RecoveryRequired;
+            FailCorrectionAttempt(attempt.CommandId, "correction_recovery_required",
+                "The interrupted correction requires explicit recovery; no provider or filesystem action was repeated.", status, now);
+        }
+        return true;
+    }
+
+    private FailureAnalysisGenerationAttempt WithRequestAccounting(FailureAnalysisGenerationAttempt attempt)
+    {
+        var counts = RequestAccounting(attempt.LogicalCalls, attempt.ProviderResponses);
+        return attempt with { PhysicalRequestCount = counts.Physical, PossiblyDispatchedRequestCount = counts.Possible,
+            DefinitelyUndispatchedRequestCount = counts.Undispatched, ActiveRequestCount = counts.Active };
+    }
+
+    private CorrectionGenerationAttempt WithRequestAccounting(CorrectionGenerationAttempt attempt)
+    {
+        var counts = RequestAccounting(attempt.LogicalCalls, attempt.ProviderResponses);
+        return attempt with { PhysicalRequestCount = counts.Physical, PossiblyDispatchedRequestCount = counts.Possible,
+            DefinitelyUndispatchedRequestCount = counts.Undispatched, ActiveRequestCount = counts.Active };
+    }
+
+    private (int Physical, int Possible, int Undispatched, int Active) RequestAccounting(
+        IReadOnlyList<VerificationLogicalCallRecord> calls,
+        IReadOnlyList<VerificationProviderResponseTelemetry> responses)
+    {
+        var physical = 0; var possible = 0; var undispatched = 0; var active = 0;
+        foreach (var logical in calls)
+        {
+            var modelCall = _modelCalls.SingleOrDefault(item => item.Id == logical.LogicalCallId);
+            if (responses.Any(item => item.LogicalCallId == logical.LogicalCallId) ||
+                modelCall?.VerificationDispatchDisposition == VerificationCallDispatchDisposition.ResponseReceived) physical++;
+            else if (modelCall?.VerificationDispatchDisposition == VerificationCallDispatchDisposition.PossiblyDispatched) possible++;
+            else if (modelCall?.VerificationDispatchDisposition == VerificationCallDispatchDisposition.DefinitelyNotDispatched) undispatched++;
+            else active++;
+        }
+        return (physical, possible, undispatched, active);
+    }
+
+    private static bool IsTerminal(FailureAnalysisAttemptStatus status) => status is
+        FailureAnalysisAttemptStatus.Completed or FailureAnalysisAttemptStatus.FailedBeforeDispatch or
+        FailureAnalysisAttemptStatus.RetryableProviderResponse or FailureAnalysisAttemptStatus.RejectedProviderOutput or
+        FailureAnalysisAttemptStatus.AmbiguousAfterDispatch or FailureAnalysisAttemptStatus.ExpiredBeforeDispatch or
+        FailureAnalysisAttemptStatus.InterruptedAfterResponse;
+
+    private static bool IsTerminal(CorrectionGenerationAttemptStatus status) => status is
+        CorrectionGenerationAttemptStatus.Completed or CorrectionGenerationAttemptStatus.FailedBeforeDispatch or
+        CorrectionGenerationAttemptStatus.FailedBeforeMutation or CorrectionGenerationAttemptStatus.AmbiguousAfterDispatch or
+        CorrectionGenerationAttemptStatus.InterruptedAfterResponse or CorrectionGenerationAttemptStatus.RecoveryRequired;
 
     public void StoreVerificationPlan(
         Guid generationCommandId,
@@ -645,6 +1262,7 @@ public sealed class EngineeringTask
         var index = _verificationPlanGenerationAttempts.FindIndex(attempt => attempt.CommandId == generationCommandId);
         if (index < 0 || durableStatus is not (VerificationGenerationAttemptStatus.FailedBeforeDispatch or
             VerificationGenerationAttemptStatus.RetryableProviderResponse or
+            VerificationGenerationAttemptStatus.RejectedProviderOutput or
             VerificationGenerationAttemptStatus.AmbiguousAfterDispatch or
             VerificationGenerationAttemptStatus.InterruptedBeforeDispatch))
             throw new WorkflowException("An active verification-plan generation attempt is required.");
@@ -912,6 +1530,172 @@ public sealed class EngineeringTask
         UpdatedAt = now;
     }
 
+    public void StoreDeliveryProposal(DeliveryProposal proposal, DateTimeOffset now)
+    {
+        EnsureStatus(WorkflowStatus.ReadyForDelivery);
+        if (DeliveryDataFormatVersion == DeliveryDataFormatVersions.Legacy)
+            DeliveryDataFormatVersion = DeliveryDataFormatVersions.Current;
+        if (_deliveryProposals.Count > 0 || proposal.ProposalNumber != 1)
+            throw new DeliveryException("delivery_not_eligible", "Only one delivery proposal is supported for this task.");
+        DeliveryValidator.ValidateProposal(this, proposal);
+        _deliveryProposals.Add(proposal);
+        CurrentDeliveryProposalId = proposal.DeliveryProposalId;
+        Status = WorkflowStatus.AwaitingDeliveryApproval;
+        UpdatedAt = now;
+    }
+
+    public bool ApproveDeliveryProposal(ApproveDeliveryCommand command, DateTimeOffset now)
+    {
+        EnsureStatus(WorkflowStatus.AwaitingDeliveryApproval);
+        if (RowVersion != command.ExpectedRowVersion || CurrentDeliveryProposalId != command.ProposalId)
+            throw new DeliveryException("delivery_stale_binding", "The delivery proposal changed before approval.");
+        var index = _deliveryProposals.FindIndex(item => item.DeliveryProposalId == command.ProposalId);
+        if (index < 0) throw new DeliveryException("delivery_stale_binding", "The delivery proposal is unavailable.");
+        var proposal = _deliveryProposals[index];
+        if (!string.Equals(proposal.ProposalFingerprint, command.ProposalFingerprint, StringComparison.Ordinal) ||
+            proposal.CurrentApprovedRevisionId != command.RevisionId ||
+            !string.Equals(proposal.CurrentImplementationResultFingerprint, command.ResultFingerprint, StringComparison.Ordinal) ||
+            proposal.CurrentVerificationPlanId != command.VerificationPlanId ||
+            !string.Equals(proposal.CurrentVerificationPlanFingerprint, command.VerificationPlanFingerprint, StringComparison.Ordinal) ||
+            proposal.PassedManualAttemptId != command.ManualAttemptId ||
+            !string.Equals(proposal.PassedManualAttemptFingerprint, command.ManualAttemptFingerprint, StringComparison.Ordinal))
+            throw new DeliveryException("delivery_stale_binding", "The delivery approval does not match the exact proposal bindings.");
+        if (proposal.Status == DeliveryProposalStatus.Approved) return false;
+        if (proposal.Status != DeliveryProposalStatus.Prepared)
+            throw new DeliveryException("delivery_not_eligible", "The delivery proposal cannot be approved in its current state.");
+        _deliveryProposals[index] = proposal with
+        {
+            Status = DeliveryProposalStatus.Approved,
+            ApprovedAt = now,
+            ApprovalCommandId = command.CommandId,
+            ApprovalExpectedRowVersion = command.ExpectedRowVersion
+        };
+        UpdatedAt = now;
+        return true;
+    }
+
+    public void RecordDeliveryApprovalBinding(DeliveryApprovalCommandBinding binding)
+    {
+        if (_deliveryApprovalCommands.Any(item => item.CommandId == binding.CommandId)) return;
+        _deliveryApprovalCommands.Add(binding);
+    }
+
+    public DeliveryAttempt BeginDelivery(ExecuteDeliveryCommand command, DateTimeOffset now)
+    {
+        EnsureStatus(WorkflowStatus.AwaitingDeliveryApproval);
+        if (RowVersion != command.ExpectedRowVersion || CurrentDeliveryProposalId != command.ProposalId ||
+            _deliveryAttempts.Count >= 3 || _deliveryAttempts.Count > 0 &&
+            _deliveryAttempts[^1].Phase != DeliveryAttemptPhase.FailedBeforeMutation)
+            throw new DeliveryException("delivery_stale_binding", "The approved delivery proposal is stale or already has a delivery attempt.");
+        var proposal = _deliveryProposals.SingleOrDefault(item => item.DeliveryProposalId == command.ProposalId);
+        if (proposal is not { Status: DeliveryProposalStatus.Approved } ||
+            !string.Equals(proposal.ProposalFingerprint, command.ProposalFingerprint, StringComparison.Ordinal) ||
+            proposal.ApprovalCommandId is null || proposal.ApprovedAt is null)
+            throw new DeliveryException("delivery_not_eligible", "Exact human approval is required before delivery execution.");
+        var attempt = new DeliveryAttempt(Guid.NewGuid(), _deliveryAttempts.Count + 1, command.CommandId, Id, proposal.DeliveryProposalId,
+            proposal.ProposalFingerprint, now, now, null, now.AddMinutes(5), DeliveryAttemptPhase.Prepared,
+            null, null, null, null, null, null, false, false, false);
+        _deliveryAttempts.Add(attempt);
+        CurrentDeliveryAttemptId = attempt.AttemptId;
+        Status = WorkflowStatus.Delivering;
+        UpdatedAt = now;
+        return attempt;
+    }
+
+    public void RecordDeliveryPhase(Guid commandId, DeliveryAttemptPhase phase, DateTimeOffset now,
+        string? commitSha = null, string? remoteBranchSha = null)
+    {
+        EnsureStatus(WorkflowStatus.Delivering);
+        var index = _deliveryAttempts.FindIndex(item => item.CommandId == commandId && item.AttemptId == CurrentDeliveryAttemptId);
+        if (index < 0) throw new DeliveryException("delivery_stale_binding", "The active delivery attempt is unavailable.");
+        var attempt = _deliveryAttempts[index];
+        if ((int)phase <= (int)attempt.Phase || phase is DeliveryAttemptPhase.FailedBeforeMutation or DeliveryAttemptPhase.RecoveryRequired)
+            throw new DeliveryException("delivery_stale_binding", "The delivery phase transition is invalid.");
+        if (commitSha is not null && !DeliveryValidator.Sha(commitSha) ||
+            remoteBranchSha is not null && !DeliveryValidator.Sha(remoteBranchSha))
+            throw new DeliveryException("delivery_recovery_required", "The delivery commit identity is invalid.", true);
+        _deliveryAttempts[index] = attempt with
+        {
+            Phase = phase,
+            UpdatedAt = now,
+            CommitSha = commitSha ?? attempt.CommitSha,
+            RemoteBranchSha = remoteBranchSha ?? attempt.RemoteBranchSha,
+            ActiveCheckoutVerifiedBefore = phase >= DeliveryAttemptPhase.WorktreeVerified || attempt.ActiveCheckoutVerifiedBefore
+        };
+        UpdatedAt = now;
+    }
+
+    public void CompleteDelivery(Guid commandId, GitHubPullRequestResult pullRequest,
+        bool activeCheckoutVerifiedAfter, DateTimeOffset now)
+    {
+        EnsureStatus(WorkflowStatus.Delivering);
+        var index = _deliveryAttempts.FindIndex(item => item.CommandId == commandId && item.AttemptId == CurrentDeliveryAttemptId);
+        if (index < 0) throw new DeliveryException("delivery_recovery_required", "The delivery attempt is unavailable.", true);
+        var attempt = _deliveryAttempts[index];
+        var proposalIndex = _deliveryProposals.FindIndex(item => item.DeliveryProposalId == attempt.DeliveryProposalId);
+        if (attempt.Phase != DeliveryAttemptPhase.PullRequestCreationStarted || attempt.CommitSha is null ||
+            attempt.RemoteBranchSha != attempt.CommitSha || !activeCheckoutVerifiedAfter || proposalIndex < 0)
+            throw new DeliveryException("delivery_recovery_required", "The delivery outcome could not be accepted safely.", true);
+        _deliveryAttempts[index] = attempt with
+        {
+            Phase = DeliveryAttemptPhase.PullRequestCreated,
+            UpdatedAt = now,
+            CompletedAt = now,
+            PullRequestNumber = pullRequest.Number,
+            PullRequestUrl = pullRequest.Url,
+            ActiveCheckoutVerifiedAfter = true
+        };
+        _deliveryProposals[proposalIndex] = _deliveryProposals[proposalIndex] with { Status = DeliveryProposalStatus.Delivered };
+        Status = WorkflowStatus.PullRequestCreated;
+        UpdatedAt = now;
+    }
+
+    public void ReconcileDelivery(Guid commandId, string commitSha, GitHubPullRequestResult pullRequest,
+        bool activeCheckoutVerifiedAfter, bool legacyCanonicalizationUsed, DateTimeOffset now)
+    {
+        if (Status is not (WorkflowStatus.Delivering or WorkflowStatus.DeliveryRecoveryRequired))
+            throw new DeliveryException("delivery_recovery_required", "The delivery attempt cannot be reconciled.", true);
+        var index = _deliveryAttempts.FindIndex(item => item.CommandId == commandId && item.AttemptId == CurrentDeliveryAttemptId);
+        if (index < 0 || !DeliveryValidator.Sha(commitSha) || !activeCheckoutVerifiedAfter)
+            throw new DeliveryException("delivery_recovery_required", "The delivery outcome could not be reconciled exactly.", true);
+        var attempt = _deliveryAttempts[index];
+        var proposalIndex = _deliveryProposals.FindIndex(item => item.DeliveryProposalId == attempt.DeliveryProposalId);
+        if (proposalIndex < 0 || attempt.CommitSha is not null && attempt.CommitSha != commitSha ||
+            attempt.RemoteBranchSha is not null && attempt.RemoteBranchSha != commitSha)
+            throw new DeliveryException("delivery_recovery_required", "The delivery outcome conflicts with persisted evidence.", true);
+        _deliveryAttempts[index] = attempt with
+        {
+            Phase = DeliveryAttemptPhase.PullRequestCreated, CommitSha = commitSha, RemoteBranchSha = commitSha,
+            PullRequestNumber = pullRequest.Number, PullRequestUrl = pullRequest.Url, UpdatedAt = now,
+            CompletedAt = now, SafeFailureCategory = null, SafeFailureMessage = null, RecoveryRequired = false,
+            ActiveCheckoutVerifiedBefore = true, ActiveCheckoutVerifiedAfter = true,
+            LegacyCanonicalizationUsed = legacyCanonicalizationUsed
+        };
+        _deliveryProposals[proposalIndex] = _deliveryProposals[proposalIndex] with { Status = DeliveryProposalStatus.Delivered };
+        Status = WorkflowStatus.PullRequestCreated;
+        UpdatedAt = now;
+    }
+
+    public void FailDelivery(Guid commandId, DeliveryAttemptPhase phase, string category,
+        string safeMessage, bool recoveryRequired, DateTimeOffset now)
+    {
+        var index = _deliveryAttempts.FindIndex(item => item.CommandId == commandId && item.AttemptId == CurrentDeliveryAttemptId);
+        if (index < 0) throw new DeliveryException("delivery_recovery_required", "The delivery attempt is unavailable.", true);
+        if (SensitiveContentDetector.ContainsSensitiveValue(safeMessage) || safeMessage.Length > 500)
+            safeMessage = "Delivery failed safely.";
+        _deliveryAttempts[index] = _deliveryAttempts[index] with
+        {
+            Phase = phase,
+            UpdatedAt = now,
+            CompletedAt = now,
+            SafeFailureCategory = category,
+            SafeFailureMessage = safeMessage,
+            RecoveryRequired = recoveryRequired
+        };
+        Status = recoveryRequired ? WorkflowStatus.DeliveryRecoveryRequired : WorkflowStatus.AwaitingDeliveryApproval;
+        UpdatedAt = now;
+    }
+
     public void RequestPlanRevision(string correction, DateTimeOffset now)
     {
         EnsurePlanRevisionCanBeRequested(correction);
@@ -1030,7 +1814,22 @@ public sealed class EngineeringTask
         IEnumerable<ManualVerificationAttempt>? manualVerificationAttempts = null,
         Guid? currentVerificationPlanId = null,
         Guid? currentVerificationAttemptId = null,
-        int verificationDataFormatVersion = VerificationDataFormatVersions.Legacy)
+        int verificationDataFormatVersion = VerificationDataFormatVersions.Legacy,
+        Guid? pendingImplementationRevisionId = null,
+        IEnumerable<FailureAnalysis>? failureAnalyses = null,
+        IEnumerable<CorrectionProposal>? correctionProposals = null,
+        IEnumerable<FailureAnalysisGenerationAttempt>? failureAnalysisGenerationAttempts = null,
+        IEnumerable<CorrectionGenerationAttempt>? correctionGenerationAttempts = null,
+        IEnumerable<CorrectionApprovalCommandBinding>? correctionApprovalCommands = null,
+        Guid? currentFailureAnalysisId = null,
+        Guid? currentCorrectionProposalId = null,
+        int correctionDataFormatVersion = 0,
+        IEnumerable<DeliveryProposal>? deliveryProposals = null,
+        IEnumerable<DeliveryAttempt>? deliveryAttempts = null,
+        IEnumerable<DeliveryApprovalCommandBinding>? deliveryApprovalCommands = null,
+        Guid? currentDeliveryProposalId = null,
+        Guid? currentDeliveryAttemptId = null,
+        int deliveryDataFormatVersion = DeliveryDataFormatVersions.Legacy)
     {
         var task = new EngineeringTask
         {
@@ -1064,9 +1863,16 @@ public sealed class EngineeringTask
             ImplementationLease = implementationLease,
             ActiveImplementationRevisionId = activeImplementationRevisionId,
             ApprovedImplementationRevisionId = approvedImplementationRevisionId,
+            PendingImplementationRevisionId = pendingImplementationRevisionId,
             CurrentVerificationPlanId = currentVerificationPlanId,
             CurrentVerificationAttemptId = currentVerificationAttemptId,
             VerificationDataFormatVersion = verificationDataFormatVersion,
+            CurrentFailureAnalysisId = currentFailureAnalysisId,
+            CurrentCorrectionProposalId = currentCorrectionProposalId,
+            CorrectionDataFormatVersion = correctionDataFormatVersion,
+            CurrentDeliveryProposalId = currentDeliveryProposalId,
+            CurrentDeliveryAttemptId = currentDeliveryAttemptId,
+            DeliveryDataFormatVersion = deliveryDataFormatVersion,
             RowVersion = rowVersion
         };
         task._clarificationAnswers.AddRange(answers);
@@ -1077,6 +1883,14 @@ public sealed class EngineeringTask
         task._verificationPlans.AddRange(verificationPlans ?? []);
         task._verificationPlanGenerationAttempts.AddRange(verificationPlanGenerationAttempts ?? []);
         task._manualVerificationAttempts.AddRange(manualVerificationAttempts ?? []);
+        task._failureAnalyses.AddRange(failureAnalyses ?? []);
+        task._correctionProposals.AddRange(correctionProposals ?? []);
+        task._failureAnalysisGenerationAttempts.AddRange(failureAnalysisGenerationAttempts ?? []);
+        task._correctionGenerationAttempts.AddRange(correctionGenerationAttempts ?? []);
+        task._correctionApprovalCommands.AddRange(correctionApprovalCommands ?? []);
+        task._deliveryProposals.AddRange(deliveryProposals ?? []);
+        task._deliveryAttempts.AddRange(deliveryAttempts ?? []);
+        task._deliveryApprovalCommands.AddRange(deliveryApprovalCommands ?? []);
         if (task._implementationRevisions.Count == 0)
             task.SynthesizeLegacyInitialRevision();
         return task;
@@ -1114,8 +1928,9 @@ public sealed class EngineeringTask
 
     private void UpdateActiveRevision(Func<ImplementationRevision, ImplementationRevision> update)
     {
-        var id = ActiveImplementationRevisionId ??
-            throw new WorkflowException("An active implementation revision is required.");
+        var id = Status == WorkflowStatus.ImplementingCorrection && PendingImplementationRevisionId is { } pendingId
+            ? pendingId
+            : ActiveImplementationRevisionId ?? throw new WorkflowException("An active implementation revision is required.");
         var index = _implementationRevisions.FindIndex(revision => revision.RevisionId == id);
         if (index < 0) throw new WorkflowException("The active implementation revision is missing.");
         _implementationRevisions[index] = update(_implementationRevisions[index]);

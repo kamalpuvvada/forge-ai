@@ -10,7 +10,8 @@ public sealed class OpenAIVerificationPlanEngine(
     ForgeAiOptions options,
     IOpenAIResponsesGateway? gateway,
     ModelCostCalculator costCalculator,
-    TimeProvider timeProvider) : IVerificationPlanEngine
+    TimeProvider timeProvider,
+    bool allowInitialPlanLanguageOverride = false) : IVerificationPlanEngine
 {
     internal const int MaximumRequirementBytes = 8 * 1024;
     internal const int MaximumPlanBytes = 32 * 1024;
@@ -32,6 +33,8 @@ public sealed class OpenAIVerificationPlanEngine(
         path, file, completed result, provider identifier, workspace location, secret, or hidden context field.
         Never claim that a test, build, lint, command, check, commit, push, pull request, or delivery action ran.
         Keep cases concise, ordered, non-repetitive, and bounded. Echo the context fingerprint exactly.
+        When prior failure evidence is supplied, create required regression cases covering every exact failure-result
+        revision ID and use only supplied origin test-case IDs. An empty origin ID means no carried-forward origin.
         """;
 
     internal const string ResponseSchema = """
@@ -73,8 +76,8 @@ public sealed class OpenAIVerificationPlanEngine(
                   "regressionScope": { "type": "array", "maxItems": 6, "items": { "type": "string", "minLength": 1, "maxLength": 500 } },
                   "evidenceRequirements": { "type": "array", "maxItems": 4, "items": { "type": "string", "minLength": 1, "maxLength": 300 } },
                   "safetyNotes": { "type": "array", "maxItems": 4, "items": { "type": "string", "minLength": 1, "maxLength": 500 } },
-                  "originTestCaseId": { "type": "string", "maxLength": 0 },
-                  "regressionFailureReportIds": { "type": "array", "maxItems": 0, "items": { "type": "string" } }
+                  "originTestCaseId": { "type": "string", "maxLength": 36 },
+                  "regressionFailureReportIds": { "type": "array", "maxItems": 12, "items": { "type": "string", "minLength": 36, "maxLength": 36 } }
                 },
                 "required": ["order", "title", "objective", "category", "isRequired", "preconditions", "testData", "orderedSteps", "expectedResult", "negativeOrEdgeCases", "regressionScope", "evidenceRequirements", "safetyNotes", "originTestCaseId", "regressionFailureReportIds"],
                 "additionalProperties": false
@@ -148,7 +151,13 @@ public sealed class OpenAIVerificationPlanEngine(
                     Model = options.VerificationPlanningModel,
                     ReasoningEffort = options.VerificationPlanningReasoningEffort
                 };
-                try { VerificationValidator.ValidateCandidate(context, candidate, new VerificationLimits()); }
+                var initialPlanLanguageOverrideApplied = false;
+                try
+                {
+                    candidate = VerificationValidator.ValidateCandidateForGeneration(context, candidate,
+                        new VerificationLimits(), allowInitialPlanLanguageOverride,
+                        out initialPlanLanguageOverrideApplied);
+                }
                 catch (VerificationException exception)
                 {
                     throw Failure("verification_validation_rejected",
@@ -157,7 +166,7 @@ public sealed class OpenAIVerificationPlanEngine(
                 var successfulCall = CreateCall(callId, startedAt, response, true, null, pricing);
                 calls.Add(successfulCall);
                 await observer.RecordCallAsync(callId, successfulCall, CancellationToken.None);
-                return new VerificationPlanEvaluation(candidate, calls);
+                return new VerificationPlanEvaluation(candidate, calls, initialPlanLanguageOverrideApplied);
             }
             catch (OpenAITransportException exception) when (exception.Retryable &&
                 attempt + 1 < MaximumLogicalAttemptsPerCommand)
@@ -218,7 +227,9 @@ public sealed class OpenAIVerificationPlanEngine(
                     await observer.RecordCallAsync(callId, failedCall, CancellationToken.None);
                 }
                 throw new VerificationProviderException(SafeMessage(category), category, calls, exception,
-                    DurableStatus(checkpoint));
+                    category == VerificationGenerationAttemptSemantics.ValidationRejectedCategory
+                        ? VerificationGenerationAttemptStatus.RejectedProviderOutput
+                        : DurableStatus(checkpoint));
             }
         }
         throw new VerificationProviderException("OpenAI could not complete verification-plan generation.",
@@ -329,7 +340,39 @@ public sealed class OpenAIVerificationPlanEngine(
             omittedRepositoryEvidenceCount = omittedEvidence,
             approvedValidationCommands = commands,
             knownRisks = context.ApprovedPlan.Risks,
-            knownLimitations = context.ImplementationResult.Warnings
+            knownLimitations = context.ImplementationResult.Warnings,
+            replacementVerification = context.PreviousPlan is null ? null : new
+            {
+                previousPlan = new
+                {
+                    context.PreviousPlan.PlanId,
+                    context.PreviousPlan.PlanFingerprint,
+                    cases = context.PreviousPlan.TestCases.Select(item => new
+                    {
+                        item.TestCaseId, item.Order, item.Title, item.Objective, item.ExpectedResult
+                    })
+                },
+                failedResults = (context.PreviousFailureEvidence ?? []).Select(item => new
+                {
+                    item.ResultRevisionId, item.TestCaseId, result = item.Result.ToString(), item.FailureDetails
+                }),
+                failureAnalysis = new
+                {
+                    context.FailureAnalysis!.AnalysisId,
+                    context.FailureAnalysis.AnalysisFingerprint,
+                    context.FailureAnalysis.Classification,
+                    context.FailureAnalysis.RootCauseSummary,
+                    context.FailureAnalysis.VerificationImpact
+                },
+                correctionProposal = new
+                {
+                    context.CorrectionProposal!.ProposalId,
+                    context.CorrectionProposal.ProposalFingerprint,
+                    context.CorrectionProposal.CorrectionStrategy,
+                    context.CorrectionProposal.ExpectedBehavior,
+                    context.CorrectionProposal.VerificationImpact
+                }
+            }
         };
         var json = JsonSerializer.Serialize(payload, JsonOptions);
         if (Encoding.UTF8.GetByteCount(json) > MaximumCanonicalContextBytes)
@@ -362,6 +405,20 @@ public sealed class OpenAIVerificationPlanEngine(
                 item.RegressionFailureReportIds is null ||
                 !Enum.TryParse<VerificationTestCategory>(item.Category, false, out var category))
                 throw Failure("verification_invalid_structured_output", "OpenAI returned an incomplete verification case.");
+            Guid? origin = null;
+            if (!string.IsNullOrEmpty(item.OriginTestCaseId))
+            {
+                if (!Guid.TryParseExact(item.OriginTestCaseId, "D", out var parsedOrigin))
+                    throw Failure("verification_invalid_structured_output", "OpenAI returned an invalid prior-case identity.");
+                origin = parsedOrigin;
+            }
+            var regressionIds = new List<Guid>();
+            foreach (var value in item.RegressionFailureReportIds)
+            {
+                if (!Guid.TryParseExact(value, "D", out var id))
+                    throw Failure("verification_invalid_structured_output", "OpenAI returned an invalid failure-evidence identity.");
+                regressionIds.Add(id);
+            }
             cases.Add(new VerificationTestCaseCandidate(
                 item.Order, item.Title ?? string.Empty, item.Objective ?? string.Empty, category, item.IsRequired,
                 item.Preconditions, item.TestData, item.OrderedSteps.Select(step => new VerificationTestStepCandidate(
@@ -369,7 +426,7 @@ public sealed class OpenAIVerificationPlanEngine(
                     string.IsNullOrEmpty(step.ApprovedValidationCommandId) ? null : step.ApprovedValidationCommandId,
                     step.ExpectedObservation ?? string.Empty)).ToArray(), item.ExpectedResult ?? string.Empty,
                 item.NegativeOrEdgeCases, item.RegressionScope, item.EvidenceRequirements, item.SafetyNotes,
-                null, []));
+                origin, regressionIds));
         }
         return new VerificationPlanCandidate(
             parsed.ContextFingerprint ?? string.Empty, parsed.Summary ?? string.Empty, parsed.Scope ?? string.Empty,
@@ -486,7 +543,7 @@ public sealed class OpenAIVerificationPlanEngine(
         "verification_empty_response" => "OpenAI returned no structured verification plan.",
         "verification_incomplete_response" => "OpenAI returned an incomplete verification-plan response.",
         "verification_unexpected_output" => "OpenAI returned an unexpected verification-plan response shape.",
-        "verification_validation_rejected" => "OpenAI completed the request, but Forge rejected the manual verification plan.",
+        "verification_validation_rejected" => "OpenAI completed the request, but Forge rejected the generated plan. You may explicitly generate a new plan; another provider request may incur a charge.",
         _ => "OpenAI could not complete verification-plan generation."
     };
 

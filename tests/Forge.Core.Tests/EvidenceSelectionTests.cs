@@ -164,7 +164,7 @@ public sealed class EvidenceSelectionTests(ITestOutputHelper output)
 
         var evidence = Selector().Select(snapshot, files, "report export", "report export", []);
         var plan = (await new FakePlanningEngine().CreatePlanAsync(new PlanningContext(
-            "report export", "report export", [], [], snapshot, evidence.Items, Now))).Plan;
+            "report export", "Modify only `src/report.json` for report export.", [], [], snapshot, evidence.Items, Now))).Plan;
         var serializedPlan = System.Text.Json.JsonSerializer.Serialize(plan);
 
         Assert.DoesNotContain(credential, string.Join(' ', evidence.Items.Select(item => item.Excerpt)));

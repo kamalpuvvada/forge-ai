@@ -224,6 +224,90 @@ public sealed class SqlitePersistenceTests : IDisposable
     }
 
     [Fact]
+    public async Task Previous_main_task_schema_migrates_additively_without_inventing_correction_state()
+    {
+        Directory.CreateDirectory(_directory);
+        var sourcePath = Path.Combine(_directory, "source-current.db");
+        var sourceConnectionString = $"Data Source={sourcePath};Pooling=False";
+        await new SqliteDatabaseInitializer(sourceConnectionString).InitializeAsync();
+        var source = new SqliteEngineeringTaskRepository(sourceConnectionString);
+        var now = new DateTimeOffset(2026, 7, 21, 0, 0, 0, TimeSpan.Zero);
+        var draft = EngineeringTask.Create("C:/migration/draft", "Draft migration task", now);
+        await source.SaveAsync(draft);
+        var planned = EngineeringTask.Create("C:/migration/planned", "Plan migration task", now.AddMinutes(1));
+        planned.ApplyClarificationEvaluation(ClarificationEvaluation.Summarize("Plan migration task"), now.AddMinutes(1));
+        planned.ApproveRequirementSummary(now.AddMinutes(1));
+        planned.BeginRepositoryAnalysis(now.AddMinutes(1));
+        var snapshot = PlanningWorkflowTests.Snapshot(now.AddMinutes(1));
+        var evidence = PlanningWorkflowTests.Evidence();
+        planned.StoreRepositorySnapshot(snapshot, now.AddMinutes(1));
+        planned.StoreEvidence(new EvidenceSelection([evidence], 1, 1, evidence.Excerpt.Length), now.AddMinutes(1));
+        planned.StoreImplementationPlan(PlanningWorkflowTests.Plan(snapshot, [evidence]), now.AddMinutes(1), TimeSpan.FromMinutes(30));
+        planned.ApproveImplementationPlan(now.AddMinutes(2));
+        await source.SaveAsync(planned);
+
+        await using (var target = new SqliteConnection(ConnectionString))
+        {
+            await target.OpenAsync();
+            await using var create = target.CreateCommand();
+            create.CommandText = """
+                CREATE TABLE EngineeringTasks (
+                    Id TEXT PRIMARY KEY, Repository TEXT NOT NULL, OriginalRequirement TEXT NOT NULL,
+                    CurrentClarifiedRequirement TEXT NOT NULL, ClarificationAnswers TEXT NOT NULL,
+                    RequirementRevisionNotes TEXT NOT NULL DEFAULT '[]', PlanRevisionNotes TEXT NOT NULL DEFAULT '[]',
+                    ModelCalls TEXT NOT NULL DEFAULT '[]', CurrentPendingQuestion TEXT NULL, RequirementSummary TEXT NULL,
+                    Status TEXT NOT NULL, CreatedAt TEXT NOT NULL, UpdatedAt TEXT NOT NULL,
+                    RequirementApprovedAt TEXT NULL, PlanApprovedAt TEXT NULL, RepositorySnapshot TEXT NULL,
+                    EvidenceItems TEXT NOT NULL DEFAULT '[]', EvidenceFilesInspected INTEGER NOT NULL DEFAULT 0,
+                    EvidenceFilesSelected INTEGER NOT NULL DEFAULT 0, TotalEvidenceCharacters INTEGER NOT NULL DEFAULT 0,
+                    ImplementationPlan TEXT NULL, RepositoryAnalyzedAt TEXT NULL, RepositoryFingerprint TEXT NULL,
+                    PlanCreatedAt TEXT NULL, ImplementationWorkspace TEXT NULL, ImplementationResult TEXT NULL,
+                    LastImplementationFailure TEXT NULL, ImplementationStartedAt TEXT NULL,
+                    ImplementationCompletedAt TEXT NULL, ImplementationLease TEXT NULL,
+                    ImplementationRevisions TEXT NOT NULL DEFAULT '[]', ActiveImplementationRevisionId TEXT NULL,
+                    ApprovedImplementationRevisionId TEXT NULL, CurrentVerificationPlanId TEXT NULL,
+                    CurrentVerificationAttemptId TEXT NULL, VerificationDataFormatVersion INTEGER NOT NULL DEFAULT 0,
+                    RowVersion INTEGER NOT NULL DEFAULT 0);
+                """;
+            await create.ExecuteNonQueryAsync();
+            await using var copy = target.CreateCommand();
+            copy.CommandText = $"""
+                ATTACH DATABASE '{sourcePath.Replace("'", "''", StringComparison.Ordinal)}' AS source;
+                INSERT INTO EngineeringTasks SELECT Id,Repository,OriginalRequirement,CurrentClarifiedRequirement,
+                    ClarificationAnswers,RequirementRevisionNotes,PlanRevisionNotes,ModelCalls,CurrentPendingQuestion,
+                    RequirementSummary,Status,CreatedAt,UpdatedAt,RequirementApprovedAt,PlanApprovedAt,
+                    RepositorySnapshot,EvidenceItems,EvidenceFilesInspected,EvidenceFilesSelected,TotalEvidenceCharacters,
+                    ImplementationPlan,RepositoryAnalyzedAt,RepositoryFingerprint,PlanCreatedAt,ImplementationWorkspace,
+                    ImplementationResult,LastImplementationFailure,ImplementationStartedAt,ImplementationCompletedAt,
+                    ImplementationLease,ImplementationRevisions,ActiveImplementationRevisionId,
+                    ApprovedImplementationRevisionId,CurrentVerificationPlanId,CurrentVerificationAttemptId,
+                    VerificationDataFormatVersion,RowVersion FROM source.EngineeringTasks;
+                DETACH DATABASE source;
+                """;
+            await copy.ExecuteNonQueryAsync();
+        }
+
+        var initializer = new SqliteDatabaseInitializer(ConnectionString);
+        await initializer.InitializeAsync();
+        await initializer.InitializeAsync();
+        var migrated = new SqliteEngineeringTaskRepository(ConnectionString);
+        var loadedDraft = (await migrated.GetAsync(draft.Id))!;
+        var loadedPlanned = (await migrated.GetAsync(planned.Id))!;
+
+        Assert.Equal(WorkflowStatus.Draft, loadedDraft.Status);
+        Assert.Equal(WorkflowStatus.PlanApproved, loadedPlanned.Status);
+        Assert.Equal(0, loadedDraft.CorrectionDataFormatVersion);
+        Assert.Equal(0, loadedPlanned.CorrectionDataFormatVersion);
+        Assert.Empty(loadedDraft.FailureAnalyses);
+        Assert.Empty(loadedPlanned.FailureAnalysisGenerationAttempts);
+        Assert.Empty(loadedPlanned.CorrectionProposals);
+        Assert.Empty(loadedPlanned.CorrectionGenerationAttempts);
+        Assert.Null(loadedPlanned.CurrentFailureAnalysisId);
+        Assert.Null(loadedPlanned.CurrentCorrectionProposalId);
+        Assert.Null(loadedPlanned.PendingImplementationRevisionId);
+    }
+
+    [Fact]
     public async Task Initializer_adds_recent_history_index_and_recent_query_uses_it()
     {
         await new SqliteDatabaseInitializer(ConnectionString).InitializeAsync();

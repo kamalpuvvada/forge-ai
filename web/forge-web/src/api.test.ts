@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { decodeEngineeringTask, decodeEngineeringTaskSummaries, ForgeApiError, forgeApi, parseSafePdfFilename } from './api'
+import { decodeEngineeringTask, decodeEngineeringTaskSummaries, decodeSystemCapabilities, ForgeApiError, forgeApi, parseSafePdfFilename } from './api'
 
 function taskJson(overrides: Record<string, unknown> = {}) {
   return {
@@ -25,6 +25,10 @@ function taskJson(overrides: Record<string, unknown> = {}) {
       canStartVerificationAttempt: false, canRecordVerificationResult: false,
       canCompleteVerificationPassed: false, canCompleteVerificationFailed: false,
       readyForDelivery: false, ineligibilityReason: null,
+    },
+    correctionEligibility: {
+      canGenerateFailureAnalysis: false, canApproveCorrection: false, canGenerateCorrection: false,
+      canApproveCorrectedRevision: false, canGenerateReplacementVerificationPlan: false,
     },
     ...overrides,
   }
@@ -115,6 +119,11 @@ function manualTaskJson(options: {
     currentVerificationPlanId: plan.planId, verificationPlans: [plan],
     currentVerificationAttemptId: attempt?.attemptId ?? null,
     manualVerificationAttempts: attempt === null ? [] : [attempt], verificationEligibility: eligibility,
+    correctionEligibility: {
+      canGenerateFailureAnalysis: status === 'ManualVerificationFailed', canApproveCorrection: false,
+      canGenerateCorrection: false, canApproveCorrectedRevision: false,
+      canGenerateReplacementVerificationPlan: false,
+    },
     ...options.taskOverrides })
 }
 
@@ -122,6 +131,188 @@ function completedAttempt(status: 'CompletedPassed' | 'CompletedFailed') {
   return manualAttemptJson({ status, completedAt: '2026-07-20T12:10:00Z', completionConfirmation: true,
     attemptFingerprint: 'f'.repeat(64), passedAt: status === 'CompletedPassed' ? '2026-07-20T12:10:00Z' : null,
     failedAt: status === 'CompletedFailed' ? '2026-07-20T12:10:00Z' : null })
+}
+
+function correctionTaskJson(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  const failedAttempt = completedAttempt('CompletedFailed')
+  const analysis = {
+    analysisId: '66666666-6666-4666-8666-666666666666', analysisNumber: 1,
+    generationCommandId: '77777777-7777-4777-8777-777777777777', contextFingerprint: '1'.repeat(64),
+    failedAttemptId: failedAttempt.attemptId, failedAttemptFingerprint: failedAttempt.attemptFingerprint,
+    verificationPlanId: '11111111-1111-4111-8111-111111111111', verificationPlanFingerprint: 'e'.repeat(64),
+    implementationRevisionId: '22222222-2222-4222-8222-222222222222',
+    implementationResultFingerprint: 'a'.repeat(64), classification: 'ImplementationDefect', confidencePercent: 50,
+    rootCauseSummary: 'Bounded synthetic root cause.', rationale: 'Bounded synthetic rationale.',
+    evidenceReferences: [failedAttempt.attemptId], affectedApprovedOperations: [{ path: 'src/App.cs', action: 'Modify' }],
+    correctionStrategy: 'Modify the approved file only.', expectedBehavior: 'The manual case passes.',
+    verificationImpact: 'Repeat the failed case.', risks: ['Human review remains required.'],
+    source: 'DeterministicFake', model: null, reasoningEffort: null, modelCallIds: [],
+    analysisFingerprint: '2'.repeat(64), status: 'Completed', createdAt: '2026-07-20T12:11:00Z',
+    trustLabel: 'FORGE GENERATED', safeRoute: 'Correction proposal available after explicit approval.',
+  }
+  const proposal = {
+    proposalId: '88888888-8888-4888-8888-888888888888', proposalNumber: 1,
+    analysisId: analysis.analysisId, analysisFingerprint: analysis.analysisFingerprint,
+    failedAttemptId: analysis.failedAttemptId, failedAttemptFingerprint: analysis.failedAttemptFingerprint,
+    previousApprovedRevisionId: analysis.implementationRevisionId,
+    previousResultFingerprint: analysis.implementationResultFingerprint,
+    approvedRequirementFingerprint: '3'.repeat(64), approvedPlanFingerprint: '4'.repeat(64),
+    originalBaseCommitSha: '5'.repeat(40), affectedApprovedOperations: analysis.affectedApprovedOperations,
+    rootCauseSummary: analysis.rootCauseSummary, correctionStrategy: analysis.correctionStrategy,
+    expectedBehavior: analysis.expectedBehavior, verificationImpact: analysis.verificationImpact,
+    risks: analysis.risks, proposalFingerprint: '6'.repeat(64), status: 'AwaitingApproval',
+    createdAt: '2026-07-20T12:12:00Z', approvedAt: null,
+  }
+  const generation = {
+    commandId: analysis.generationCommandId, expectedFailedAttemptId: analysis.failedAttemptId,
+    expectedFailedAttemptFingerprint: analysis.failedAttemptFingerprint, startedAt: '2026-07-20T12:10:00Z',
+    leaseExpiresAt: '2026-07-20T12:15:00Z', updatedAt: '2026-07-20T12:11:00Z',
+    completedAt: '2026-07-20T12:11:00Z', status: 'Completed', logicalCallCount: 0,
+    physicalRequestCount: 0, possiblyDispatchedRequestCount: 0, definitelyUndispatchedRequestCount: 0,
+    activeRequestCount: 0, modelCallIds: [], providerResponses: [], resultAnalysisId: analysis.analysisId,
+    failureCategory: null, failureMessage: null, retryEligible: false, recoveryRequired: false,
+  }
+  return manualTaskJson({ status: 'AwaitingCorrectionApproval', attempt: failedAttempt,
+    taskOverrides: {
+      currentFailureAnalysisId: analysis.analysisId, currentCorrectionProposalId: proposal.proposalId,
+      failureAnalyses: [analysis], correctionProposals: [proposal], failureAnalysisGenerationAttempts: [generation],
+      correctionGenerationAttempts: [], correctionApprovalAudit: [],
+      correctionEligibility: { canGenerateFailureAnalysis: false, canApproveCorrection: true,
+        canGenerateCorrection: false, canApproveCorrectedRevision: false,
+        canGenerateReplacementVerificationPlan: false },
+      ...overrides,
+    } })
+}
+
+function approvedRevisionTwoTaskJson(withPlanTwo = false) {
+  const value = correctionTaskJson()
+  const revision1 = (value.implementationRevisions as Array<Record<string, unknown>>)[0]
+  const plan1 = (value.verificationPlans as Array<Record<string, unknown>>)[0]
+  const proposal = (value.correctionProposals as Array<Record<string, unknown>>)[0]
+  const revision2Id = '99999999-9999-4999-8999-999999999999'
+  const revision2Fingerprint = '9'.repeat(64)
+  const correctionCommandId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+  revision1.reviewState = 'HistoricallyApproved'
+  revision1.isCurrent = false
+  revision1.isApproved = false
+  plan1.status = 'Superseded'
+  proposal.status = 'Approved'
+  proposal.approvedAt = '2026-07-20T12:13:00Z'
+  const revision2 = implementationRevisionJson({
+    revisionId: revision2Id, revisionNumber: 2, kind: 'Correction',
+    previousRevisionId: revision1.revisionId, resultFingerprint: revision2Fingerprint,
+    reviewState: 'Approved', isCurrent: true, isApproved: true,
+    approvedAt: '2026-07-20T12:20:00Z', correctionSubmittedAt: '2026-07-20T12:13:00Z',
+    correctionProposalId: proposal.proposalId, correctionProposalFingerprint: proposal.proposalFingerprint,
+  })
+  const correctionAttempt = {
+    attemptId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', commandId: correctionCommandId,
+    proposalId: proposal.proposalId, proposalFingerprint: proposal.proposalFingerprint,
+    previousRevisionId: revision1.revisionId, previousResultFingerprint: revision1.resultFingerprint,
+    startedAt: '2026-07-20T12:14:00Z', leaseExpiresAt: '2026-07-20T12:19:00Z',
+    updatedAt: '2026-07-20T12:18:00Z', completedAt: '2026-07-20T12:18:00Z', status: 'Completed',
+    logicalCallCount: 0, physicalRequestCount: 0, possiblyDispatchedRequestCount: 0,
+    definitelyUndispatchedRequestCount: 0, activeRequestCount: 0, modelCallIds: [], providerResponses: [],
+    acceptedOutputFingerprint: '8'.repeat(64), revisionId: revision2Id,
+    failureCategory: null, failureMessage: null, retryEligible: false, recoveryRequired: false,
+  }
+  const approval = {
+    commandId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', proposalId: proposal.proposalId,
+    proposalFingerprint: proposal.proposalFingerprint, expectedRowVersion: 20, completedRowVersion: 21,
+    createdAt: '2026-07-20T12:12:30Z', completedAt: '2026-07-20T12:13:00Z', result: 'Approved',
+  }
+  const plan2 = planJson({
+    planId: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd', planNumber: 2,
+    implementationRevisionId: revision2Id, implementationResultFingerprint: revision2Fingerprint,
+    generatedAt: '2026-07-20T12:21:00Z', planFingerprint: '7'.repeat(64), status: 'Current',
+  })
+  return {
+    ...value,
+    status: withPlanTwo ? 'AwaitingManualVerification' : 'ImplementationApproved',
+    activeImplementationRevisionId: revision2Id,
+    approvedImplementationRevisionId: revision2Id,
+    pendingImplementationRevisionId: null,
+    implementationRevisions: [revision1, revision2],
+    implementationResult: implementationResultJson({
+      baseCommitSha: revision2.baseCommitSha, completedAt: revision2.generationCompletedAt,
+    }),
+    verificationPlans: withPlanTwo ? [plan1, plan2] : [plan1],
+    currentVerificationPlanId: withPlanTwo ? plan2.planId : null,
+    currentVerificationAttemptId: null,
+    correctionGenerationAttempts: [correctionAttempt],
+    correctionApprovalAudit: [approval],
+    correctionEligibility: {
+      canGenerateFailureAnalysis: false, canApproveCorrection: false, canGenerateCorrection: false,
+      canApproveCorrectedRevision: false, canGenerateReplacementVerificationPlan: !withPlanTwo,
+    },
+    verificationEligibility: {
+      canGenerateVerificationPlan: !withPlanTwo, isInitialVerificationPlanGeneration: false,
+      canRetryVerificationPlanGeneration: false, verificationGenerationStatus: withPlanTwo ? 'Completed' : 'NotStarted',
+      verificationGenerationStatusMessage: withPlanTwo ? 'Verification-plan generation completed.' : 'Replacement verification-plan generation is ready.',
+      canStartVerificationAttempt: withPlanTwo, canRecordVerificationResult: false,
+      canCompleteVerificationPassed: false, canCompleteVerificationFailed: false,
+      readyForDelivery: false, ineligibilityReason: null,
+    },
+  }
+}
+
+function persistedCorrectionReviewTaskJson(): Record<string, unknown> {
+  const value = approvedRevisionTwoTaskJson() as Record<string, unknown>
+  const revision1 = (value.implementationRevisions as Array<Record<string, unknown>>)[0]
+  const revision2 = (value.implementationRevisions as Array<Record<string, unknown>>)[1]
+  const plan1 = (value.verificationPlans as Array<Record<string, unknown>>)[0]
+  const attempt1 = (value.manualVerificationAttempts as Array<Record<string, unknown>>)[0]
+  const correctionAttempt = (value.correctionGenerationAttempts as Array<Record<string, unknown>>)[0]
+  const implementationCall = completeVerificationCall({
+    id: 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee', stage: 'Implementation',
+    providerUsageAvailability: null, providerUsageAvailable: true,
+  })
+
+  revision1.reviewState = 'Approved'
+  revision1.isCurrent = false
+  revision1.isApproved = true
+  revision2.reviewState = 'Current'
+  revision2.isCurrent = true
+  revision2.isApproved = false
+  revision2.approvedAt = null
+  plan1.status = 'Completed'
+  correctionAttempt.logicalCallCount = 1
+  correctionAttempt.physicalRequestCount = 1
+  correctionAttempt.modelCallIds = [implementationCall.id]
+
+  return {
+    ...value,
+    status: 'AwaitingImplementationReview',
+    activeImplementationRevisionId: revision2.revisionId,
+    approvedImplementationRevisionId: revision1.revisionId,
+    currentVerificationPlanId: plan1.planId,
+    currentVerificationAttemptId: attempt1.attemptId,
+    implementationResult: implementationResultJson({
+      source: 'OpenAI', model: 'gpt-test', isDeterministicFake: false,
+      baseCommitSha: revision2.baseCommitSha, completedAt: revision2.generationCompletedAt,
+    }),
+    implementationRuntime: {
+      workspaceAvailable: true, activeCheckoutVerified: true, disposition: 'Completed',
+      safeMessage: 'The previous implementation attempt was interrupted.',
+    },
+    telemetry: telemetryJson({
+      totalCalls: 1, totalInputTokens: 12, totalCachedInputTokens: 2, totalOutputTokens: 7,
+      totalReasoningTokens: 1, totalEstimatedCostUsd: 0.000244, completeEstimatedSubtotalUsd: 0.000244,
+      availableEstimatedSubtotalUsd: 0.000244, calls: [implementationCall],
+    }),
+    correctionEligibility: {
+      canGenerateFailureAnalysis: false, canApproveCorrection: false, canGenerateCorrection: false,
+      canApproveCorrectedRevision: true, canGenerateReplacementVerificationPlan: false,
+    },
+    verificationEligibility: {
+      canGenerateVerificationPlan: false, isInitialVerificationPlanGeneration: false,
+      canRetryVerificationPlanGeneration: false, verificationGenerationStatus: 'Completed',
+      verificationGenerationStatusMessage: 'Verification-plan generation completed.',
+      canStartVerificationAttempt: false, canRecordVerificationResult: false,
+      canCompleteVerificationPassed: false, canCompleteVerificationFailed: false,
+      readyForDelivery: false, ineligibilityReason: 'The approved implementation is not ready for manual verification.',
+    },
+  }
 }
 
 function generationAttemptJson(overrides: Record<string, unknown> = {}) {
@@ -188,7 +379,212 @@ function completeTelemetry(overrides: Record<string, unknown> = {}) {
 }
 
 describe('task PDF API helper', () => {
+  it('decodes the persisted successful correction revision-two response shape', () => {
+    const decoded = decodeEngineeringTask(persistedCorrectionReviewTaskJson())
+
+    expect(decoded.status).toBe('AwaitingImplementationReview')
+    expect(decoded.activeImplementationRevisionId).toBe(decoded.implementationRevisions[1].revisionId)
+    expect(decoded.approvedImplementationRevisionId).toBe(decoded.implementationRevisions[0].revisionId)
+    expect(decoded.correctionEligibility?.canApproveCorrectedRevision).toBe(true)
+  })
+
+  it('decodes the same persisted correction response again through the refresh GET', async () => {
+    const persisted = persistedCorrectionReviewTaskJson()
+    const fetch = vi.fn().mockResolvedValue(new Response(JSON.stringify(persisted), {
+      status: 200, headers: { 'Content-Type': 'application/json' },
+    }))
+    vi.stubGlobal('fetch', fetch)
+
+    expect((await forgeApi.getTask(persisted.id as string)).status).toBe('AwaitingImplementationReview')
+    expect(fetch).toHaveBeenCalledWith(`/api/tasks/${persisted.id}`, expect.anything())
+  })
+
+  it('accepts historical completed plan one and failed attempt one during correction review', () => {
+    const decoded = decodeEngineeringTask(persistedCorrectionReviewTaskJson())
+
+    expect(decoded.verificationPlans?.[0].status).toBe('Completed')
+    expect(decoded.manualVerificationAttempts?.[0].status).toBe('CompletedFailed')
+    expect(decoded.verificationPlans?.[0].implementationRevisionId).toBe(decoded.implementationRevisions[0].revisionId)
+  })
+
+  it.each([
+    ['contradictory provider usage flag', { providerUsageAvailable: false }],
+    ['non-response dispatch with reported provider usage', { verificationDispatchDisposition: 'PossiblyDispatched' }],
+  ])('rejects implementation telemetry with %s', (_, callOverrides) => {
+    const value = persistedCorrectionReviewTaskJson()
+    Object.assign((value.telemetry as { calls: Array<Record<string, unknown>> }).calls[0], callOverrides)
+
+    expect(() => decodeEngineeringTask(value)).toThrowError('The task response could not be validated safely.')
+  })
+
+  it.each([
+    ['plan one revision', (value: Record<string, unknown>) => {
+      const revisions = value.implementationRevisions as Array<Record<string, unknown>>
+      ;(value.verificationPlans as Array<Record<string, unknown>>)[0].implementationRevisionId = revisions[1].revisionId
+    }],
+    ['attempt one plan', (value: Record<string, unknown>) => {
+      ;(value.manualVerificationAttempts as Array<Record<string, unknown>>)[0].verificationPlanId =
+        'ffffffff-ffff-4fff-8fff-ffffffffffff'
+    }],
+    ['attempt one revision', (value: Record<string, unknown>) => {
+      const revisions = value.implementationRevisions as Array<Record<string, unknown>>
+      ;(value.manualVerificationAttempts as Array<Record<string, unknown>>)[0].implementationRevisionId = revisions[1].revisionId
+    }],
+  ])('rejects a persisted correction review with a mismatched %s binding', (_, mutate) => {
+    const value = persistedCorrectionReviewTaskJson()
+    mutate(value)
+
+    expect(() => decodeEngineeringTask(value)).toThrowError('The task response could not be validated safely.')
+  })
+
+  it('rejects reversed active and approved correction-review pointers', () => {
+    const value = persistedCorrectionReviewTaskJson()
+    const active = value.activeImplementationRevisionId
+    value.activeImplementationRevisionId = value.approvedImplementationRevisionId
+    value.approvedImplementationRevisionId = active
+
+    expect(() => decodeEngineeringTask(value)).toThrowError('The task response could not be validated safely.')
+  })
+
+  it('rejects a correction candidate already marked approved before explicit approval', () => {
+    const value = persistedCorrectionReviewTaskJson()
+    const candidate = (value.implementationRevisions as Array<Record<string, unknown>>)[1]
+    candidate.reviewState = 'Approved'
+    candidate.isApproved = true
+    candidate.approvedAt = '2026-07-20T12:20:00Z'
+
+    expect(() => decodeEngineeringTask(value)).toThrowError('The task response could not be validated safely.')
+  })
+
+  it.each([
+    ['premature historical state on revision one', (value: Record<string, unknown>) => {
+      ;(value.implementationRevisions as Array<Record<string, unknown>>)[0].reviewState = 'HistoricallyApproved'
+    }],
+    ['missing current correction proposal', (value: Record<string, unknown>) => {
+      value.currentCorrectionProposalId = null
+    }],
+    ['mismatched correction proposal fingerprint', (value: Record<string, unknown>) => {
+      ;(value.implementationRevisions as Array<Record<string, unknown>>)[1].correctionProposalFingerprint = 'f'.repeat(64)
+    }],
+  ])('rejects correction review with %s', (_, mutate) => {
+    const value = persistedCorrectionReviewTaskJson()
+    mutate(value)
+
+    expect(() => decodeEngineeringTask(value)).toThrowError('The task response could not be validated safely.')
+  })
+
+  it('rejects forged corrected-revision approval eligibility', () => {
+    const value = persistedCorrectionReviewTaskJson()
+    ;(value.correctionEligibility as Record<string, unknown>).canApproveCorrectedRevision = false
+
+    expect(() => decodeEngineeringTask(value)).toThrowError('The task response could not be validated safely.')
+  })
+
+  it('rejects a top-level implementation result that does not match revision two', () => {
+    const value = persistedCorrectionReviewTaskJson()
+    ;(value.implementationResult as Record<string, unknown>).baseCommitSha = 'f'.repeat(40)
+
+    expect(() => decodeEngineeringTask(value)).toThrowError('The task response could not be validated safely.')
+  })
+
+  it('rejects a third implementation revision in the bounded correction workflow', () => {
+    const value = persistedCorrectionReviewTaskJson()
+    const revisions = value.implementationRevisions as Array<Record<string, unknown>>
+    revisions.push(implementationRevisionJson({
+      revisionId: 'ffffffff-ffff-4fff-8fff-ffffffffffff', revisionNumber: 3, kind: 'Correction',
+      previousRevisionId: revisions[1].revisionId, isCurrent: false, isApproved: false,
+    }))
+
+    expect(() => decodeEngineeringTask(value)).toThrowError('The task response could not be validated safely.')
+  })
+
+  it('accepts a correction response only when its authoritative relationships agree', () => {
+    expect(decodeEngineeringTask(correctionTaskJson()).status).toBe('AwaitingCorrectionApproval')
+  })
+
+  it('accepts preserved historical correction evidence after revision-two approval and on refresh', () => {
+    const value = approvedRevisionTwoTaskJson()
+    expect(decodeEngineeringTask(value).status).toBe('ImplementationApproved')
+    expect(decodeEngineeringTask(structuredClone(value)).currentVerificationPlanId).toBeNull()
+  })
+
+  it('accepts a current replacement plan bound to approved revision two', () => {
+    const decoded = decodeEngineeringTask(approvedRevisionTwoTaskJson(true))
+    expect(decoded.currentVerificationPlanId).toBe('dddddddd-dddd-4ddd-8ddd-dddddddddddd')
+  })
+
+  it.each([
+    ['failed attempt', (value: Record<string, unknown>) => {
+      ;(value.failureAnalyses as Array<Record<string, unknown>>)[0].failedAttemptId = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee'
+    }],
+    ['superseded plan', (value: Record<string, unknown>) => {
+      ;(value.failureAnalyses as Array<Record<string, unknown>>)[0].verificationPlanId = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee'
+    }],
+    ['current plan pointer', (value: Record<string, unknown>) => { value.currentVerificationPlanId = '11111111-1111-4111-8111-111111111111' }],
+    ['current attempt pointer', (value: Record<string, unknown>) => { value.currentVerificationAttemptId = '55555555-5555-4555-8555-555555555555' }],
+  ])('rejects a forged revision-two historical %s binding', (_, mutate) => {
+    const value = approvedRevisionTwoTaskJson()
+    mutate(value)
+    expect(() => decodeEngineeringTask(value)).toThrowError('The task response could not be validated safely.')
+  })
+
+  it('rejects a validly shaped task returned for another requested task', async () => {
+    const fetch = vi.fn().mockResolvedValue(new Response(JSON.stringify(approvedRevisionTwoTaskJson()), {
+      status: 200, headers: { 'Content-Type': 'application/json' },
+    }))
+    vi.stubGlobal('fetch', fetch)
+    await expect(forgeApi.getTask('b2ec060f-d030-42f0-bffb-bf3e5402ddb2'))
+      .rejects.toThrow('The task response could not be validated safely.')
+  })
+
+  it('rejects forged correction eligibility', () => {
+    const value = correctionTaskJson({ correctionEligibility: {
+      canGenerateFailureAnalysis: false, canApproveCorrection: true, canGenerateCorrection: true,
+      canApproveCorrectedRevision: false, canGenerateReplacementVerificationPlan: false,
+    } })
+    expect(() => decodeEngineeringTask(value)).toThrowError('The task response could not be validated safely.')
+  })
+
+  it('rejects a proposal bound to a different analysis', () => {
+    const value = correctionTaskJson()
+    const proposal = (value.correctionProposals as Array<Record<string, unknown>>)[0]
+    proposal.analysisId = '99999999-9999-4999-8999-999999999999'
+    expect(() => decodeEngineeringTask(value)).toThrowError('The task response could not be validated safely.')
+  })
+
+  it('rejects an unknown failure-analysis attempt status', () => {
+    const value = correctionTaskJson()
+    ;(value.failureAnalysisGenerationAttempts as Array<Record<string, unknown>>)[0].status = 'StillGeneratingForever'
+    expect(() => decodeEngineeringTask(value)).toThrowError('The task response could not be validated safely.')
+  })
+
   afterEach(() => vi.unstubAllGlobals())
+
+  it('accepts internally consistent delivery capabilities and rejects legacy contradictions', () => {
+    const value = {
+      aiMode: 'Fake', clarificationProvider: 'Fake', clarificationModel: 'demo', reasoningEffort: 'low',
+      clarificationConfigured: true, planningProvider: 'Fake', planningModel: 'demo',
+      planningReasoningEffort: 'medium', planningConfigured: true, implementationProvider: 'Deterministic Fake',
+      implementationModel: null, implementationReasoningEffort: null, implementationConfigured: true,
+      aiConfigured: true, repositoryInspectionAvailable: true, planningAvailable: true,
+      targetModificationAvailable: true, implementationApprovalAvailable: true,
+      implementationCorrectionAvailable: true, validationAvailable: false, reviewAvailable: true,
+      pullRequestCreationAvailable: true, fakeImplementationAvailable: true, openAiImplementationAvailable: false,
+      silentFallbackSupported: false, commitAvailable: true, pushAvailable: true,
+      deliveryPullRequestAvailable: true, verificationPlanningProvider: 'Fake', verificationPlanningModel: 'demo',
+      verificationPlanningReasoningEffort: 'medium', verificationPlanningConfigured: true,
+      manualResultRecordingAvailable: true, automatedValidationAvailable: false, failureAnalysisAvailable: true,
+      failureAnalysisConfigured: true, implementationCorrectionConfigured: true,
+      deliveryPullRequestConfigured: true, autoMergeAvailable: false,
+      deliveryGitAvailable: true, deliveryGitHubCliAvailable: true,
+    }
+
+    expect(decodeSystemCapabilities(value).deliveryPullRequestConfigured).toBe(true)
+    expect(() => decodeSystemCapabilities({ ...value, commitAvailable: false })).toThrow(/validated safely/)
+    expect(() => decodeSystemCapabilities({ ...value, automatedValidationAvailable: true })).toThrow(/validated safely/)
+    expect(() => decodeSystemCapabilities({ ...value, autoMergeAvailable: true })).toThrow(/validated safely/)
+    expect(() => decodeSystemCapabilities({ ...value, deliveryGitHubCliAvailable: false })).toThrow(/validated safely/)
+  })
 
   it('requests the PDF endpoint and returns its blob and safe filename', async () => {
     const blob = new Blob(['%PDF-1.7'], { type: 'application/pdf' })
@@ -308,6 +704,7 @@ describe('task PDF API helper', () => {
   it.each([
     ['initial', 'NotStarted', true, true, false],
     ['safe retry', 'FailedBeforeDispatch', true, false, true],
+    ['rejected provider output', 'RejectedProviderOutput', true, false, true],
     ['active', 'Active', false, false, false],
     ['ambiguous', 'AmbiguousAfterDispatch', false, false, false],
     ['completed', 'Completed', false, false, false],
@@ -580,6 +977,112 @@ describe('task PDF API helper', () => {
     ['terminal state missing current attempt', manualTaskJson({ status: 'ReadyForDelivery', attempt: null })],
   ])('rejects manual eligibility or pointer contradiction: %s', (_label, value) => {
     expect(() => decodeEngineeringTask(value)).toThrowError('The task response could not be validated safely.')
+  })
+
+  it('accepts an exact PullRequestCreated delivery and rejects malformed canonical URLs', () => {
+    const proposal = {
+      deliveryProposalId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', proposalNumber: 1,
+      currentApprovedRevisionId: '22222222-2222-4222-8222-222222222222',
+      currentImplementationResultFingerprint: 'a'.repeat(64),
+      currentVerificationPlanId: '11111111-1111-4111-8111-111111111111',
+      currentVerificationPlanFingerprint: 'e'.repeat(64),
+      passedManualAttemptId: '55555555-5555-4555-8555-555555555555',
+      passedManualAttemptFingerprint: 'f'.repeat(64), baseCommitSha: 'b'.repeat(40), remoteName: 'origin',
+      gitHubRepositoryOwner: 'acme', gitHubRepositoryName: 'widget', targetBaseBranch: 'main',
+      targetBaseCommitShaAtPreparation: 'b'.repeat(40), deliveryBranch: 'forge-delivery-328cbf18-r1',
+      commitMessage: 'forge: deliver task 328cbf18 revision 1', pullRequestTitle: 'Forge AI: bounded change',
+      pullRequestBody: 'Manual verification passed — user reported\nNo automated target validation was executed by Forge\nThis pull request was created by Forge and has not been merged',
+      changedPaths: ['src/App.cs'], proposalFingerprint: 'c'.repeat(64), createdAt: '2026-07-20T12:20:00Z',
+      status: 'Delivered', approvedAt: '2026-07-20T12:21:00Z',
+    }
+    const attempt = {
+      attemptId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', attemptNumber: 1, commandId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+      deliveryProposalId: proposal.deliveryProposalId, deliveryProposalFingerprint: proposal.proposalFingerprint,
+      startedAt: '2026-07-20T12:22:00Z', updatedAt: '2026-07-20T12:23:00Z', completedAt: '2026-07-20T12:23:00Z',
+      leaseExpiresAt: '2026-07-20T12:27:00Z', phase: 'PullRequestCreated', commitSha: 'd'.repeat(40),
+      remoteBranchSha: 'd'.repeat(40), pullRequestNumber: 23,
+      pullRequestUrl: 'https://github.com/acme/widget/pull/23', safeFailureCategory: null, safeFailureMessage: null,
+      recoveryRequired: false, activeCheckoutVerifiedBefore: true, activeCheckoutVerifiedAfter: true,
+      legacyCanonicalizationUsed: false,
+    }
+    const value = manualTaskJson({ status: 'PullRequestCreated', attempt: completedAttempt('CompletedPassed'),
+      eligibility: { readyForDelivery: false }, taskOverrides: {
+        currentDeliveryProposalId: proposal.deliveryProposalId, currentDeliveryAttemptId: attempt.attemptId,
+        deliveryProposals: [proposal], deliveryAttempts: [attempt], deliveryEligibility: {
+          canPrepareDelivery: false, canApproveDelivery: false, canExecuteDelivery: false,
+          canReconcileDelivery: false,
+          deliveryRecoveryRequired: false, pullRequestCreated: true,
+        },
+      } })
+    expect(decodeEngineeringTask(value).status).toBe('PullRequestCreated')
+    expect(() => decodeEngineeringTask({ ...value, deliveryAttempts: [{ ...attempt,
+      pullRequestUrl: 'https://example.invalid/acme/widget/pull/23' }] })).toThrowError(
+      'The task response could not be validated safely.')
+  })
+
+  it('accepts bounded contiguous delivery retry history and rejects contradictory attempts', () => {
+    const proposal = {
+      deliveryProposalId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', proposalNumber: 1,
+      currentApprovedRevisionId: '22222222-2222-4222-8222-222222222222', currentImplementationResultFingerprint: 'a'.repeat(64),
+      currentVerificationPlanId: '11111111-1111-4111-8111-111111111111', currentVerificationPlanFingerprint: 'e'.repeat(64),
+      passedManualAttemptId: '55555555-5555-4555-8555-555555555555', passedManualAttemptFingerprint: 'f'.repeat(64),
+      baseCommitSha: 'b'.repeat(40), remoteName: 'origin', gitHubRepositoryOwner: 'acme', gitHubRepositoryName: 'widget',
+      targetBaseBranch: 'main', targetBaseCommitShaAtPreparation: 'b'.repeat(40), deliveryBranch: 'forge-delivery-328cbf18-r1',
+      commitMessage: 'forge: deliver task 328cbf18 revision 1', pullRequestTitle: 'Forge AI: bounded change',
+      pullRequestBody: 'Manual verification passed â€” user reported\nNo automated target validation was executed by Forge\nThis pull request was created by Forge and has not been merged',
+      changedPaths: ['src/App.cs'], proposalFingerprint: 'c'.repeat(64), createdAt: '2026-07-20T12:20:00Z',
+      status: 'Delivered', approvedAt: '2026-07-20T12:21:00Z',
+    }
+    const failed = (number: number, id: string, commandId: string) => ({
+      attemptId: id, attemptNumber: number, commandId, deliveryProposalId: proposal.deliveryProposalId,
+      deliveryProposalFingerprint: proposal.proposalFingerprint, startedAt: `2026-07-20T12:2${number}:00Z`,
+      updatedAt: `2026-07-20T12:2${number}:30Z`, completedAt: `2026-07-20T12:2${number}:30Z`,
+      leaseExpiresAt: `2026-07-20T12:3${number}:00Z`, phase: 'FailedBeforeMutation', commitSha: null,
+      remoteBranchSha: null, pullRequestNumber: null, pullRequestUrl: null,
+      safeFailureCategory: 'delivery_failed_before_mutation', safeFailureMessage: 'Preflight failed safely.',
+      recoveryRequired: false, activeCheckoutVerifiedBefore: false, activeCheckoutVerifiedAfter: false,
+      legacyCanonicalizationUsed: false,
+    })
+    const successful = (number: number, id: string, commandId: string) => ({
+      attemptId: id, attemptNumber: number, commandId, deliveryProposalId: proposal.deliveryProposalId,
+      deliveryProposalFingerprint: proposal.proposalFingerprint, startedAt: '2026-07-20T12:32:00Z',
+      updatedAt: '2026-07-20T12:33:00Z', completedAt: '2026-07-20T12:33:00Z',
+      leaseExpiresAt: '2026-07-20T12:37:00Z', phase: 'PullRequestCreated', commitSha: 'd'.repeat(40),
+      remoteBranchSha: 'd'.repeat(40), pullRequestNumber: 23,
+      pullRequestUrl: 'https://github.com/acme/widget/pull/23', safeFailureCategory: null, safeFailureMessage: null,
+      recoveryRequired: false, activeCheckoutVerifiedBefore: true, activeCheckoutVerifiedAfter: true,
+      legacyCanonicalizationUsed: false,
+    })
+    const first = failed(1, '11111111-1111-4111-8111-111111111111', '21111111-1111-4111-8111-111111111111')
+    const second = failed(2, '31111111-1111-4111-8111-111111111111', '41111111-1111-4111-8111-111111111111')
+    const third = successful(3, '51111111-1111-4111-8111-111111111111', '61111111-1111-4111-8111-111111111111')
+    const value = (attempts: unknown[], current: string, overrides: Record<string, unknown> = {}) => manualTaskJson({
+      status: 'PullRequestCreated', attempt: completedAttempt('CompletedPassed'), eligibility: { readyForDelivery: false },
+      taskOverrides: { currentDeliveryProposalId: proposal.deliveryProposalId, currentDeliveryAttemptId: current,
+        deliveryProposals: [proposal], deliveryAttempts: attempts, deliveryEligibility: {
+          canPrepareDelivery: false, canApproveDelivery: false, canExecuteDelivery: false,
+          canReconcileDelivery: false,
+          deliveryRecoveryRequired: false, pullRequestCreated: true,
+        }, ...overrides },
+    })
+
+    expect(decodeEngineeringTask(value([{ ...third, attemptNumber: 1 }], third.attemptId)).deliveryAttempts).toHaveLength(1)
+    expect(decodeEngineeringTask(value([first, { ...third, attemptNumber: 2 }], third.attemptId)).deliveryAttempts).toHaveLength(2)
+    expect(decodeEngineeringTask(value([first, second, third], third.attemptId)).deliveryAttempts).toHaveLength(3)
+    expect(() => decodeEngineeringTask(value([first, second, third, { ...third, attemptNumber: 4,
+      attemptId: '71111111-1111-4111-8111-111111111111', commandId: '81111111-1111-4111-8111-111111111111' }], third.attemptId))).toThrow(/validated safely/)
+    expect(() => decodeEngineeringTask(value([
+      { ...first, phase: 'Prepared', completedAt: null, safeFailureCategory: null, safeFailureMessage: null },
+      { ...second, phase: 'Prepared', completedAt: null, safeFailureCategory: null, safeFailureMessage: null },
+      third,
+    ], third.attemptId))).toThrow(/validated safely/)
+    expect(() => decodeEngineeringTask(value([first, { ...third, attemptNumber: 2 }], first.attemptId))).toThrow(/validated safely/)
+    expect(() => decodeEngineeringTask(value([first, { ...third, attemptNumber: 3 }], third.attemptId))).toThrow(/validated safely/)
+    expect(() => decodeEngineeringTask(value([first, { ...third, attemptNumber: 2 }], third.attemptId, {
+      deliveryEligibility: { canPrepareDelivery: false, canApproveDelivery: false, canExecuteDelivery: true,
+        canReconcileDelivery: false,
+        deliveryRecoveryRequired: false, pullRequestCreated: true },
+    }))).toThrow(/validated safely/)
   })
 
   it('uses a separate fail-closed decoder for compact history', () => {

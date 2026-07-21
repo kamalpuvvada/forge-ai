@@ -102,10 +102,16 @@ public sealed class TaskPdfExporter(
         if (task.RepositorySnapshot is { } snapshot) WriteRepositoryAnalysis(writer, task, snapshot);
         if (task.ImplementationPlan is { } plan) WriteImplementationPlan(writer, task, plan);
         if (task.ImplementationRevisions.Count > 0) WriteImplementationRevisionChronology(writer, task);
+        if (task.FailureAnalyses.Count > 0 || task.CorrectionProposals.Count > 0 ||
+            task.FailureAnalysisGenerationAttempts.Count > 0 || task.CorrectionGenerationAttempts.Count > 0 ||
+            task.Status == WorkflowStatus.ManualVerificationFailed && task.ImplementationRevisions.Count == 2)
+            WriteCorrectionChronology(writer, task);
         if (HasImplementationAttempt(task, runtimeStatus)) WriteImplementationAttempt(writer, task, runtimeStatus);
         if (task.ImplementationResult is { } result) WriteImplementationReview(writer, task, result);
         if (task.VerificationPlans.Count > 0 || task.VerificationPlanGenerationAttempts.Count > 0)
             WriteVerificationChronology(writer, task);
+        if (task.DeliveryProposals.Count > 0 || task.DeliveryAttempts.Count > 0)
+            WriteDeliveryChronology(writer, task);
 
         writer.Section("Model-call usage and estimated cost");
         writer.Field("Model-call count", task.ModelCalls.Count.ToString(CultureInfo.InvariantCulture));
@@ -198,7 +204,63 @@ public sealed class TaskPdfExporter(
             : null;
         writer.Field("Manual verification started", RecordedAt(currentAttempt?.StartedAt));
         writer.Field("Manual verification completed", RecordedAt(currentAttempt?.CompletedAt));
-        writer.Field("Ready for delivery", task.Status == WorkflowStatus.ReadyForDelivery ? "recorded" : "not recorded");
+        writer.Field("Ready for delivery", task.Status is WorkflowStatus.ReadyForDelivery or
+            WorkflowStatus.AwaitingDeliveryApproval or WorkflowStatus.Delivering or
+            WorkflowStatus.PullRequestCreated or WorkflowStatus.DeliveryRecoveryRequired ? "recorded" : "not recorded");
+    }
+
+    private static void WriteDeliveryChronology(FlowWriter writer, EngineeringTask task)
+    {
+        writer.Section("GitHub delivery chronology");
+        writer.Banner("DETERMINISTIC DELIVERY — NO AUTOMATED TARGET VALIDATION — NOT MERGED");
+        foreach (var proposal in task.DeliveryProposals.Take(1))
+        {
+            writer.Subsection($"Delivery proposal {proposal.ProposalNumber} — {proposal.Status}");
+            writer.Field("Proposal fingerprint", proposal.ProposalFingerprint);
+            writer.Field("Prepared at", FormatTimestamp(proposal.CreatedAt));
+            writer.Field("Repository", $"{proposal.GitHubRepositoryOwner}/{proposal.GitHubRepositoryName}");
+            writer.Field("Remote", proposal.RemoteName);
+            writer.Field("Target base", proposal.TargetBaseBranch);
+            writer.Field("Target base SHA at preparation", proposal.TargetBaseCommitShaAtPreparation);
+            writer.Field("Delivery branch", proposal.DeliveryBranch);
+            writer.Field("Commit message", proposal.CommitMessage);
+            writer.Field("Pull-request title", proposal.PullRequestTitle);
+            writer.Field("Pull-request body", proposal.PullRequestBody);
+            writer.Field("Approved implementation revision", proposal.CurrentApprovedRevisionId.ToString("D"));
+            writer.Field("Passed manual attempt", proposal.PassedManualAttemptId.ToString("D"));
+            foreach (var path in proposal.ChangedPaths) writer.Body($"Changed path: {path}");
+            writer.Field("Approved at", proposal.ApprovedAt is { } approved ? FormatTimestamp(approved) : "not approved");
+        }
+        foreach (var approval in task.DeliveryApprovalCommands.Take(1))
+        {
+            writer.Subsection("Delivery approval audit");
+            writer.Field("Approval command", approval.CommandId.ToString("D"));
+            writer.Field("Expected row version", approval.ExpectedRowVersion.ToString(CultureInfo.InvariantCulture));
+            writer.Field("Completed row version", approval.CompletedRowVersion.ToString(CultureInfo.InvariantCulture));
+            writer.Field("Completed", FormatTimestamp(approval.CompletedAt));
+        }
+        foreach (var attempt in task.DeliveryAttempts.Take(3))
+        {
+            writer.Subsection($"Delivery attempt {attempt.AttemptNumber} — {attempt.Phase}");
+            writer.Field("Started", FormatTimestamp(attempt.StartedAt));
+            writer.Field("Updated", FormatTimestamp(attempt.UpdatedAt));
+            writer.Field("Completed", attempt.CompletedAt is { } completed ? FormatTimestamp(completed) : "not completed");
+            writer.Field("Commit SHA", attempt.CommitSha ?? "not recorded");
+            writer.Field("Remote branch SHA", attempt.RemoteBranchSha ?? "not recorded");
+            writer.Field("Push verified", attempt.RemoteBranchSha is not null && attempt.RemoteBranchSha == attempt.CommitSha ? "yes" : "no");
+            writer.Field("Pull-request number", attempt.PullRequestNumber?.ToString(CultureInfo.InvariantCulture) ?? "not recorded");
+            writer.Field("Canonical pull-request URL", attempt.PullRequestUrl ?? "not recorded");
+            writer.Field("Active checkout verified before", attempt.ActiveCheckoutVerifiedBefore ? "yes" : "no");
+            writer.Field("Active checkout verified after", attempt.ActiveCheckoutVerifiedAfter ? "yes" : "no");
+            writer.Field("Recovery required", attempt.RecoveryRequired ? "yes — safe stop" : "no");
+            if (attempt.SafeFailureCategory is not null) writer.Field("Safe failure category", attempt.SafeFailureCategory);
+            if (attempt.SafeFailureMessage is not null) writer.Field("Safe failure message", attempt.SafeFailureMessage);
+        }
+        writer.Body(task.Status == WorkflowStatus.PullRequestCreated
+            ? "PULL REQUEST CREATED — NOT MERGED. Forge exposes no merge action in this milestone."
+            : task.Status == WorkflowStatus.DeliveryRecoveryRequired
+                ? "Delivery recovery is required. Forge will not blindly retry or create a second branch or pull request."
+                : "No pull request has been created by this delivery record.");
     }
 
     private static void WriteVerificationChronology(FlowWriter writer, EngineeringTask task)
@@ -239,8 +301,12 @@ public sealed class TaskPdfExporter(
             writer.Field("Implementation revision", plan.ImplementationRevisionId.ToString("D"));
             writer.Field("Implementation result fingerprint", plan.ImplementationResultFingerprint);
             writer.Field("Plan fingerprint", plan.PlanFingerprint);
+            writer.Field("Supersedes plan", plan.SupersedesPlanId?.ToString("D") ?? "not applicable");
+            writer.Field("Regeneration reason", plan.RegenerationReason ?? "not applicable");
             writer.Field("Summary", plan.Summary);
             writer.Field("Required cases", plan.TestCases.Count(testCase => testCase.IsRequired).ToString(CultureInfo.InvariantCulture));
+            foreach (var testCase in plan.TestCases.Where(item => item.RegressionFailureReportIds.Count > 0).Take(12))
+                writer.Body($"Regression case {testCase.Order}: origin {testCase.OriginTestCaseId?.ToString("D") ?? "not recorded"}; prior failed results {string.Join(", ", testCase.RegressionFailureReportIds.Select(item => item.ToString("D")))}.");
         }
         foreach (var attempt in task.ManualVerificationAttempts.Take(18))
         {
@@ -269,8 +335,90 @@ public sealed class TaskPdfExporter(
         }
         if (task.Status == WorkflowStatus.ReadyForDelivery)
             writer.Body("Manual verification passed — user reported. ReadyForDelivery does not mean committed, pushed, or submitted as a pull request.");
-        else if (task.Status == WorkflowStatus.ManualVerificationFailed)
-            writer.Body("Manual verification failed or was blocked — user reported. Failure analysis and correction are not available in this slice.");
+        else if (task.Status is WorkflowStatus.ManualVerificationFailed or WorkflowStatus.FailureAnalysisPending or
+                 WorkflowStatus.AwaitingFailureResolution or WorkflowStatus.AwaitingCorrectionApproval or
+                 WorkflowStatus.CorrectionApproved or WorkflowStatus.ImplementingCorrection or
+                 WorkflowStatus.FailureAnalysisRecoveryRequired or WorkflowStatus.CorrectionRecoveryRequired)
+            writer.Body("Manual verification failed or was blocked — user reported. Any subsequent analysis is Forge generated and does not replace the human report.");
+    }
+
+    private static void WriteCorrectionChronology(FlowWriter writer, EngineeringTask task)
+    {
+        writer.Section("Failure analysis and correction chronology");
+        foreach (var attempt in task.FailureAnalysisGenerationAttempts.Take(6))
+        {
+            writer.Subsection($"Failure-analysis generation attempt — {attempt.Status}");
+            writer.Field("Lease expires", FormatTimestamp(attempt.LeaseExpiresAt!.Value));
+            writer.Field("Completed", attempt.CompletedAt is { } completed ? FormatTimestamp(completed) : "not completed");
+            writer.Field("Logical calls", attempt.LogicalCallCount.ToString());
+            writer.Field("Physical requests", attempt.PhysicalRequestCount.ToString());
+            writer.Field("Possibly dispatched", attempt.PossiblyDispatchedRequestCount.ToString());
+            writer.Field("Definitely undispatched", attempt.DefinitelyUndispatchedRequestCount.ToString());
+            writer.Field("Active/unclassified", attempt.ActiveRequestCount.ToString());
+            writer.Field("Retry eligible", attempt.RetryEligible ? "yes — explicit new command required" : "no");
+            writer.Field("Recovery required", attempt.RecoveryRequired ? "yes" : "no");
+            foreach (var response in attempt.ProviderResponses.Take(2))
+                writer.Body($"Provider response: {response.Status}; dispatch {response.DispatchDisposition}; usage {response.EffectiveUsageAvailability}.");
+            if (attempt.FailureCategory is not null) writer.Field("Safe failure category", attempt.FailureCategory);
+            if (attempt.FailureMessage is not null) writer.Field("Safe failure message", attempt.FailureMessage);
+        }
+        foreach (var analysis in task.FailureAnalyses.Take(6))
+        {
+            writer.Subsection($"Failure analysis {analysis.AnalysisNumber} — {VerificationTrustLabels.ForgeGenerated}");
+            writer.Field("Classification", analysis.Classification.ToString());
+            writer.Field("Confidence", $"{analysis.ConfidencePercent}%");
+            writer.Field("Failed attempt", analysis.FailedAttemptId.ToString("D"));
+            writer.Field("Root-cause summary", analysis.RootCauseSummary);
+            writer.Field("Rationale", analysis.Rationale);
+            writer.Field("Correction strategy", string.IsNullOrWhiteSpace(analysis.CorrectionStrategy)
+                ? "no correction route" : analysis.CorrectionStrategy);
+            writer.Field("Expected behavior", analysis.ExpectedBehavior);
+            writer.Field("Verification impact", analysis.VerificationImpact);
+            writer.Field("Analysis fingerprint", analysis.AnalysisFingerprint);
+            writer.Field("Safe route", analysis.Classification == FailureClassification.ImplementationDefect
+                ? "Exact-scope correction proposal eligible for human approval."
+                : "Safe stop; no correction generation action is available in this milestone.");
+        }
+        foreach (var proposal in task.CorrectionProposals.Take(1))
+        {
+            writer.Subsection($"Correction proposal {proposal.ProposalNumber}");
+            writer.Field("Status", proposal.Status.ToString());
+            writer.Field("Proposal fingerprint", proposal.ProposalFingerprint);
+            writer.Field("Previous effective revision", proposal.PreviousApprovedRevisionId.ToString("D"));
+            foreach (var operation in proposal.AffectedApprovedOperations)
+                writer.Body($"Approved correction operation: {operation.Action} {operation.Path}");
+            writer.Field("Approved at", proposal.ApprovedAt is { } approved ? FormatTimestamp(approved) : "not approved");
+        }
+        foreach (var approval in task.CorrectionApprovalCommands.Take(1))
+        {
+            writer.Subsection("Correction approval audit");
+            writer.Field("Command", approval.CommandId.ToString("D"));
+            writer.Field("Proposal", approval.ProposalId.ToString("D"));
+            writer.Field("Expected row version", approval.ExpectedRowVersion.ToString());
+            writer.Field("Completed row version", approval.CompletedRowVersion.ToString());
+            writer.Field("Result", approval.Result);
+            writer.Field("Completed", FormatTimestamp(approval.CompletedAt));
+        }
+        foreach (var attempt in task.CorrectionGenerationAttempts.Take(2))
+        {
+            writer.Subsection($"Correction generation attempt — {attempt.Status}");
+            writer.Field("Lease expires", FormatTimestamp(attempt.LeaseExpiresAt!.Value));
+            writer.Field("Completed", attempt.CompletedAt is { } completed ? FormatTimestamp(completed) : "not completed");
+            writer.Field("Logical calls", attempt.LogicalCallCount.ToString());
+            writer.Field("Physical requests", attempt.PhysicalRequestCount.ToString());
+            writer.Field("Possibly dispatched", attempt.PossiblyDispatchedRequestCount.ToString());
+            writer.Field("Definitely undispatched", attempt.DefinitelyUndispatchedRequestCount.ToString());
+            writer.Field("Active/unclassified", attempt.ActiveRequestCount.ToString());
+            writer.Field("Retry eligible", attempt.RetryEligible ? "yes" : "no");
+            writer.Field("Recovery required", attempt.RecoveryRequired ? "yes" : "no");
+            writer.Field("Accepted output fingerprint", attempt.AcceptedOutputFingerprint ?? "not accepted");
+            if (attempt.FailureCategory is not null) writer.Field("Safe failure category", attempt.FailureCategory);
+            if (attempt.FailureMessage is not null) writer.Field("Safe failure message", attempt.FailureMessage);
+        }
+        if (task.Status == WorkflowStatus.ManualVerificationFailed && task.ImplementationRevisions.Count == 2)
+            writer.Body("A second correction revision is not supported in this submission build. The failed manual verification attempt remains preserved.");
+        if (task.Status is WorkflowStatus.FailureAnalysisRecoveryRequired or WorkflowStatus.CorrectionRecoveryRequired)
+            writer.Body("Recovery is required. Revision 1 remains effective; no retry, validation, or delivery action is available.");
     }
 
     private static void WriteImplementationRevisionChronology(FlowWriter writer, EngineeringTask task)
@@ -281,6 +429,9 @@ public sealed class TaskPdfExporter(
             var labels = new List<string>();
             if (task.ActiveImplementationRevisionId == revision.RevisionId) labels.Add("CURRENT");
             if (task.ApprovedImplementationRevisionId == revision.RevisionId) labels.Add("APPROVED");
+            if (revision.ReviewState == ImplementationReviewState.HistoricallyApproved) labels.Add("HISTORICAL");
+            else if (revision.RevisionNumber == 1 && revision.ReviewState == ImplementationReviewState.Approved) labels.Add("EFFECTIVE");
+            else if (revision.RevisionNumber == 2 && revision.ReviewState == ImplementationReviewState.Current) labels.Add("CANDIDATE");
             writer.Subsection($"Implementation revision {revision.RevisionNumber}" +
                               (labels.Count == 0 ? string.Empty : $" — {string.Join(" / ", labels)}"));
             writer.Field("Kind", revision.Kind.ToString());
@@ -293,6 +444,8 @@ public sealed class TaskPdfExporter(
             writer.Field("Generation disposition", revision.GenerationState.ToString());
             writer.Field("Review disposition", revision.ReviewState.ToString());
             writer.Field("Persisted result fingerprint", revision.ResultFingerprint ?? "not recorded");
+            writer.Field("Previous revision", revision.PreviousRevisionId?.ToString("D") ?? "not applicable");
+            writer.Field("Correction proposal fingerprint", revision.CorrectionProposalFingerprint ?? "not applicable");
             writer.Field("Changed-file count", FormatNumber(revision.Result?.ChangedFiles.Count ?? 0));
             writer.Field("Approved at", revision.ApprovedAt is { } approved
                 ? FormatTimestamp(approved)
@@ -818,7 +971,7 @@ public sealed class TaskPdfExporter(
     {
         var resolved = costResolver.Resolve(call);
         var usageAvailable = ModelCallUsageEvidence.IsAvailable(call);
-        var verificationUsage = call.Stage == ModelCallStage.VerificationPlanning
+        var verificationUsage = call.Stage is ModelCallStage.VerificationPlanning or ModelCallStage.FailureAnalysis
             ? call.ProviderUsageAvailability ?? VerificationUsage.Classify(call.InputTokens,
                 call.CachedInputTokens, call.OutputTokens, call.ReasoningTokens)
             : (VerificationUsageAvailability?)null;
@@ -830,7 +983,7 @@ public sealed class TaskPdfExporter(
         writer.Field("Client call ID", call.Id.ToString("D"));
         writer.Field("Provider request ID", call.ProviderRequestId ?? "unavailable");
         writer.Field("Provider response ID", call.ProviderResponseId ?? "unavailable");
-        if (call.Stage == ModelCallStage.VerificationPlanning)
+        if (call.Stage is ModelCallStage.VerificationPlanning or ModelCallStage.FailureAnalysis)
         {
             writer.Field("Dispatch disposition", call.VerificationDispatchDisposition?.ToString() ?? "legacy or unavailable");
             writer.Field("Provider HTTP status", call.ProviderHttpStatusCode?.ToString(CultureInfo.InvariantCulture) ?? "unavailable");

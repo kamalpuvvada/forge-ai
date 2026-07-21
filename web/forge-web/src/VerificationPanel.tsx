@@ -17,6 +17,7 @@ interface Props {
   task: EngineeringTask
   capabilities: SystemCapabilities | null
   busy: boolean
+  activeAction?: string | null
   documentsBusy?: boolean
   documentError?: string | null
   onGenerate: () => void
@@ -26,6 +27,7 @@ interface Props {
   onExportPlan: () => void
   onExportApprovedPlan: () => void
   onExportTaskReport: () => void
+  onViewImplementation: (plan: VerificationPlan) => void
 }
 
 const acceptableResults = new Set<VerificationCaseResult>(['Passed', 'NotApplicable'])
@@ -34,6 +36,7 @@ export function VerificationPanel({
   task,
   capabilities,
   busy,
+  activeAction = null,
   documentsBusy = false,
   documentError = null,
   onGenerate,
@@ -43,6 +46,7 @@ export function VerificationPanel({
   onExportPlan,
   onExportApprovedPlan,
   onExportTaskReport,
+  onViewImplementation,
 }: Props) {
   const plans = useMemo(() => task.verificationPlans ?? [], [task.verificationPlans])
   const attempts = useMemo(() => task.manualVerificationAttempts ?? [], [task.manualVerificationAttempts])
@@ -82,7 +86,7 @@ export function VerificationPanel({
     const revisionCount = attempt?.resultRevisions.length ?? 0
     if (revisionCount > previousRevisionCount.current && expandedCaseId) {
       const savedResult = currentResults.find(item => item.testCaseId === expandedCaseId)
-      if (savedResult && acceptableResults.has(savedResult.result)) {
+      if (savedResult && selectedResultIsComplete(plan?.testCases.find(item => item.testCaseId === expandedCaseId), savedResult.result)) {
         setExpandedCaseId(nextUnresolvedCaseId(plan, currentResults, expandedCaseId))
       }
       setDraft(null)
@@ -102,7 +106,7 @@ export function VerificationPanel({
   } : blankCaseFormValue, [current])
   const value = draft ?? initial
   const completedRequired = plan?.testCases.filter(item => item.isRequired &&
-    acceptableResults.has(currentResults.find(result => result.testCaseId === item.testCaseId)?.result ?? 'NotStarted')).length ?? 0
+    selectedResultIsComplete(item, currentResults.find(result => result.testCaseId === item.testCaseId)?.result ?? 'NotStarted')).length ?? 0
   const requiredCount = plan?.testCases.filter(item => item.isRequired).length ?? 0
   const eligibility = task.verificationEligibility
   const canStart = eligibility?.canStartVerificationAttempt === true &&
@@ -110,7 +114,7 @@ export function VerificationPanel({
     eligibility.canCompleteVerificationPassed === false &&
     eligibility.canCompleteVerificationFailed === false &&
     plan?.status === 'Current' && task.currentVerificationAttemptId === null &&
-    attempt === null && attempts.length === 0 && !busy
+    attempt === null && !attempts.some(item => item.verificationPlanId === plan.planId) && !busy
   const canSave = eligibility?.canRecordVerificationResult === true && plan?.status === 'Current' &&
     attempt?.status === 'InProgress' && selectedCase !== null &&
     plan.testCases.some(testCase => testCase.testCaseId === selectedCase.testCaseId) &&
@@ -124,7 +128,7 @@ export function VerificationPanel({
     actionGuard.current = true
     action()
   }
-  const safeRetryStatus = ['FailedBeforeDispatch', 'RetryableProviderResponse', 'InterruptedBeforeDispatch']
+  const safeRetryStatus = ['FailedBeforeDispatch', 'RetryableProviderResponse', 'RejectedProviderOutput', 'InterruptedBeforeDispatch']
     .includes(eligibility?.verificationGenerationStatus ?? '')
   const isInitial = eligibility?.canGenerateVerificationPlan === true &&
     eligibility.isInitialVerificationPlanGeneration === true &&
@@ -133,7 +137,13 @@ export function VerificationPanel({
   const canRetry = eligibility?.canGenerateVerificationPlan === true &&
     eligibility.canRetryVerificationPlanGeneration === true &&
     eligibility.isInitialVerificationPlanGeneration === false && safeRetryStatus
-  const canGenerate = isInitial || canRetry
+  const isReplacement = eligibility?.canGenerateVerificationPlan === true &&
+    eligibility.isInitialVerificationPlanGeneration === false &&
+    eligibility.canRetryVerificationPlanGeneration === false &&
+    eligibility.verificationGenerationStatus === 'NotStarted'
+  const canGenerate = isInitial || isReplacement || canRetry
+  const retryUsesFake = canRetry &&
+    (capabilities?.verificationPlanningProvider ?? capabilities?.planningProvider) === 'Fake'
   const eligibilityMessage = eligibility?.verificationGenerationStatusMessage ??
     (!canGenerate ? invalidVerificationEligibilityMessage : null)
 
@@ -153,8 +163,8 @@ export function VerificationPanel({
         <p role="status">{eligibilityMessage ?? 'Manual verification-plan generation is ready.'}</p>
         <button type="button" className="primary-button compact"
           disabled={busy || capabilities?.verificationPlanningConfigured === false || !canGenerate}
-          onClick={onGenerate}>
-          {canRetry ? 'Retry verification-plan generation' : isInitial ? 'Generate manual verification plan' : 'Verification generation unavailable'}
+          aria-busy={activeAction === 'replacement-verification-plan'} onClick={onGenerate}>
+          {activeAction === 'replacement-verification-plan' ? 'Generating verification plan 2…' : retryUsesFake ? 'Generate replacement plan with Fake mode' : canRetry ? 'Retry verification-plan generation' : isReplacement ? 'Generate replacement verification plan' : isInitial ? 'Generate manual verification plan' : 'Verification generation unavailable'}
         </button>
       </div>
     </section>
@@ -186,7 +196,7 @@ export function VerificationPanel({
     </section>
   }
 
-  if (task.status === 'ManualVerificationFailed') {
+  if (['ManualVerificationFailed', 'FailureAnalysisPending', 'FailureAnalysisRecoveryRequired', 'AwaitingFailureResolution', 'AwaitingCorrectionApproval', 'CorrectionApproved', 'ImplementingCorrection', 'CorrectionRecoveryRequired', 'AwaitingImplementationReview'].includes(task.status) && attempt?.status === 'CompletedFailed') {
     const failedResults = currentResults.filter(item => ['Failed', 'Blocked'].includes(item.result))
     return <section className="verification-panel verification-terminal verification-failed">
       <p className="eyebrow">MANUAL VERIFICATION FAILED · USER REPORTED</p>
@@ -207,7 +217,7 @@ export function VerificationPanel({
           </article>
         })}
       </div>
-      <p className="verification-boundary">Failure analysis and implementation correction are unavailable in this slice.</p>
+      <p className="verification-boundary">The failed attempt is immutable and remains bound to revision 1 while the governed correction workflow proceeds.</p>
       {documentActions}
     </section>
   }
@@ -217,6 +227,7 @@ export function VerificationPanel({
     <h2>Manual verification plan</h2>
     <p className="verification-summary">{plan.summary}</p>
     <p className="verification-scope">{plan.scope}</p>
+    {plans.some(item => item.status === 'Superseded') && <details className="verification-plan-history"><summary>Superseded verification plans</summary>{plans.filter(item => item.status === 'Superseded').map(item => <article key={item.planId}><strong>Plan {item.planNumber}</strong><p>{item.summary}</p><code>{item.planFingerprint}</code><button type="button" className="text-button" onClick={() => onViewImplementation(item)}>View approved implementation diff</button></article>)}</details>}
     <div className="verification-status-strip" role="note"><strong>{plan.executionLabel}</strong><span>{plan.trustLabel}</span></div>
     <VerificationMetadata rows={[
       ['Implementation revision', plan.implementationRevisionId],
@@ -228,7 +239,9 @@ export function VerificationPanel({
     </details>}
     <div className="verification-plan-actions">
       {!attempt && <button type="button" className="primary-button compact" disabled={!canStart}
-        onClick={() => invokeOnce(canStart, onStart)}>Start verification</button>}
+        aria-busy={activeAction === 'start-verification'}
+        onClick={() => invokeOnce(canStart, onStart)}>{activeAction === 'start-verification' ? 'Starting verification…' : 'Start verification'}</button>}
+      <div className="verification-implementation-action"><span>Review the exact approved diff used by this verification plan.</span><button type="button" className="secondary-button" onClick={() => onViewImplementation(plan)}>View approved implementation diff</button></div>
       {documentActions}
     </div>
     {attempt?.status === 'InProgress' && <>
@@ -254,7 +267,9 @@ export function VerificationPanel({
                   <legend>Record case {testCase.order}: {testCase.title}</legend>
                   <div className="verification-case-guidance">
                     <section><small>OBJECTIVE</small><p>{testCase.objective}</p></section>
+                    {(testCase.regressionFailureReportIds?.length ?? 0) > 0 && <p className="regression-badge">REGRESSION · {testCase.regressionFailureReportIds!.length} prior failed result{testCase.regressionFailureReportIds!.length === 1 ? '' : 's'}</p>}
                     <span className="manual-label">MANUAL — NOT EXECUTED BY FORGE</span>
+                    {isChangedFileReviewCase(testCase) && <button type="button" className="text-button case-diff-action" onClick={() => onViewImplementation(plan)}>View approved implementation diff</button>}
                     <section><small>STEPS</small><ol>{testCase.orderedSteps.map(step => <li key={step.order}>
                       <p>{step.instruction}</p>
                       {step.approvedValidationCommandId && <code title={step.approvedValidationCommandId}>{step.approvedValidationCommandId}</code>}
@@ -262,15 +277,19 @@ export function VerificationPanel({
                     </li>)}</ol></section>
                     <section><small>EXPECTED RESULT</small><p>{testCase.expectedResult}</p></section>
                   </div>
-                  <div className="verification-form-grid">
-                    <label>Result<select value={value.result} onChange={event => setDraft({ ...value, result: event.target.value as VerificationCaseResult })}><option>NotStarted</option><option>Passed</option><option>Failed</option><option>Blocked</option><option>NotApplicable</option></select></label>
-                    <label>Actual result<textarea rows={3} maxLength={2000} value={value.actualResult} onChange={event => setDraft({ ...value, actualResult: event.target.value })} /></label>
-                    <label>Notes<textarea rows={3} maxLength={2000} value={value.notes} onChange={event => setDraft({ ...value, notes: event.target.value })} /></label>
-                    <label>Evidence descriptions (one per line)<textarea rows={3} value={value.evidenceDescriptions.join('\n')} onChange={event => setDraft({ ...value, evidenceDescriptions: event.target.value.split('\n').filter(Boolean).slice(0, 6) })} /></label>
-                    {value.result === 'NotApplicable' && <label>Reason required<textarea rows={3} required value={value.notApplicableReason} onChange={event => setDraft({ ...value, notApplicableReason: event.target.value })} /></label>}
+                  <div className="verification-result-recording">
+                    <strong>Result recording</strong>
+                    <div className="verification-form-grid responsive-form-grid">
+                      <label>Result<select value={value.result} onChange={event => setDraft({ ...value, result: event.target.value as VerificationCaseResult })}><option>NotStarted</option><option>Passed</option><option>Failed</option><option>Blocked</option><option>NotApplicable</option></select></label>
+                      <label>Actual result<textarea rows={4} maxLength={2000} value={value.actualResult} onChange={event => setDraft({ ...value, actualResult: event.target.value })} /></label>
+                      <label>Notes<textarea rows={4} maxLength={2000} value={value.notes} onChange={event => setDraft({ ...value, notes: event.target.value })} /></label>
+                      <label>Evidence descriptions (one per line)<textarea rows={4} value={value.evidenceDescriptions.join('\n')} onChange={event => setDraft({ ...value, evidenceDescriptions: event.target.value.split('\n').filter(Boolean).slice(0, 6) })} /></label>
+                      {value.result === 'NotApplicable' && <label className="verification-full-width">Reason required<textarea rows={3} required value={value.notApplicableReason} onChange={event => setDraft({ ...value, notApplicableReason: event.target.value })} /></label>}
+                    </div>
                   </div>
-                  {['Failed', 'Blocked'].includes(value.result) && <FailureFields value={value} setValue={setDraft} expected={testCase.expectedResult} />}
-                  <div className="verification-save-row"><span>Results are appended to immutable history.</span><button className="primary-button compact" disabled={!canSave}>Save case result</button></div>
+                  {['Failed', 'Blocked'].includes(value.result)
+                    ? <FailureFields value={value} setValue={setDraft} expected={testCase.expectedResult} canSave={canSave} busy={busy} />
+                    : <div className="verification-save-row"><span>Results are appended to immutable history.</span><button className="primary-button compact" disabled={!canSave} aria-busy={busy}>Save case result</button></div>}
                 </fieldset>
               </form>
               <CaseHistory attempt={attempt} testCase={testCase} />
@@ -282,7 +301,7 @@ export function VerificationPanel({
         <legend>Complete manual verification</legend>
         <p>Completion is explicit. Forge will not infer or automatically submit an outcome.</p>
         <label className="verification-confirmation"><input type="checkbox" checked={confirmed} onChange={event => setConfirmed(event.target.checked)} /><span>I confirm these outcomes were recorded by a human.</span></label>
-        <label>Completion summary<textarea rows={3} maxLength={2000} value={summary} onChange={event => setSummary(event.target.value)} /></label>
+        <label>Completion summary<textarea rows={2} maxLength={2000} value={summary} onChange={event => setSummary(event.target.value)} /></label>
         <div className="verification-completion-actions">
           <button type="button" className="primary-button compact" disabled={!canCompletePassed} onClick={() => {
             if (canCompletePassed && window.confirm('Complete this attempt as passed?')) invokeOnce(true, () => onComplete(true, summary, confirmed))
@@ -294,6 +313,13 @@ export function VerificationPanel({
       </fieldset>
     </>}
   </section>
+}
+
+function isChangedFileReviewCase(testCase: VerificationTestCase) {
+  const text = [testCase.category, testCase.title, testCase.objective,
+    ...testCase.orderedSteps.flatMap(step => [step.instruction, step.expectedObservation]),
+    ...testCase.evidenceRequirements].join(' ').toLowerCase()
+  return ['diff', 'changed file', 'file review', 'source review'].some(term => text.includes(term))
 }
 
 function CaseSummaryButton({ testCase, result, expanded, onClick }: {
@@ -369,7 +395,7 @@ function DocumentActions({ busy, error, onExportApprovedPlan, onExportVerificati
 function firstUnresolvedCaseId(plan: VerificationPlan | null, results: ManualCaseResultRevision[]) {
   if (!plan) return null
   const unresolved = (testCase: VerificationTestCase) =>
-    !acceptableResults.has(results.find(item => item.testCaseId === testCase.testCaseId)?.result ?? 'NotStarted')
+    !selectedResultIsComplete(testCase, results.find(item => item.testCaseId === testCase.testCaseId)?.result ?? 'NotStarted')
   return plan.testCases.find(item => item.isRequired && unresolved(item))?.testCaseId ??
     plan.testCases.find(item => !item.isRequired && unresolved(item))?.testCaseId ?? null
 }
@@ -382,16 +408,22 @@ function nextUnresolvedCaseId(
   if (!plan) return null
   const currentOrder = plan.testCases.find(item => item.testCaseId === completedCaseId)?.order ?? 0
   const unresolved = plan.testCases.filter(item => item.testCaseId !== completedCaseId &&
-    !acceptableResults.has(results.find(result => result.testCaseId === item.testCaseId)?.result ?? 'NotStarted'))
+    !selectedResultIsComplete(item, results.find(result => result.testCaseId === item.testCaseId)?.result ?? 'NotStarted'))
   const ordered = (required: boolean) => unresolved.filter(item => item.isRequired === required)
     .sort((left, right) => Number(left.order <= currentOrder) - Number(right.order <= currentOrder) || left.order - right.order)
   return ordered(true)[0]?.testCaseId ?? ordered(false)[0]?.testCaseId ?? null
 }
 
-function FailureFields({ value, setValue, expected }: {
+function selectedResultIsComplete(testCase: VerificationTestCase | undefined, result: VerificationCaseResult) {
+  return testCase?.regressionFailureReportIds?.length ? result === 'Passed' : acceptableResults.has(result)
+}
+
+function FailureFields({ value, setValue, expected, canSave, busy }: {
   value: CaseFormValue
   setValue: (value: CaseFormValue) => void
   expected: string
+  canSave: boolean
+  busy: boolean
 }) {
   const failure = value.failureDetails ?? {
     title: '', expectedResult: expected, actualResult: value.actualResult, reproductionSteps: [],
@@ -400,13 +432,19 @@ function FailureFields({ value, setValue, expected }: {
   }
   const update = (patch: Partial<VerificationFailureDetails>) =>
     setValue({ ...value, failureDetails: { ...failure, ...patch } })
-  return <fieldset className="verification-failure-fields">
-    <legend>Failure details required</legend>
-    <label>Title<input required maxLength={160} value={failure.title} onChange={event => update({ title: event.target.value })} /></label>
-    <label>Actual result<textarea rows={3} required maxLength={2000} value={failure.actualResult} onChange={event => update({ actualResult: event.target.value })} /></label>
-    <label>Reproduction steps (one per line)<textarea rows={3} required value={failure.reproductionSteps.join('\n')} onChange={event => update({ reproductionSteps: event.target.value.split('\n').filter(Boolean).slice(0, 12) })} /></label>
-    <label>Environment notes (one per line)<textarea rows={3} value={failure.environmentNotes.join('\n')} onChange={event => update({ environmentNotes: event.target.value.split('\n').filter(Boolean).slice(0, 8) })} /></label>
-    <label>Error message<textarea rows={3} maxLength={2000} value={failure.errorMessage ?? ''} onChange={event => update({ errorMessage: event.target.value || null })} /></label>
-    <label>Severity<select value={failure.severity} onChange={event => update({ severity: event.target.value as VerificationFailureDetails['severity'] })}><option>Low</option><option>Medium</option><option>High</option><option>Critical</option></select></label>
+  return <fieldset className="verification-failure-fields compact-failure-card">
+    <legend><span>Failure details required</span><small>FAILED OR BLOCKED</small></legend>
+    <label className="verification-full-width failure-title">Title<input required maxLength={160} value={failure.title} onChange={event => update({ title: event.target.value })} /></label>
+    <div className="verification-failure-grid responsive-form-grid">
+      <label>Expected result<textarea rows={3} required maxLength={2000} value={failure.expectedResult} onChange={event => update({ expectedResult: event.target.value })} /></label>
+      <label>Actual result<textarea rows={3} required maxLength={2000} value={failure.actualResult} onChange={event => update({ actualResult: event.target.value })} /></label>
+      <label>Reproduction steps (one per line)<textarea rows={3} required value={failure.reproductionSteps.join('\n')} onChange={event => update({ reproductionSteps: event.target.value.split('\n').filter(Boolean).slice(0, 12) })} /></label>
+      <label>Environment notes (one per line)<textarea rows={3} value={failure.environmentNotes.join('\n')} onChange={event => update({ environmentNotes: event.target.value.split('\n').filter(Boolean).slice(0, 8) })} /></label>
+    </div>
+    <label className="verification-full-width failure-error">Error message<textarea rows={2} maxLength={2000} value={failure.errorMessage ?? ''} onChange={event => update({ errorMessage: event.target.value || null })} /></label>
+    <div className="verification-failure-footer">
+      <label>Severity<select value={failure.severity} onChange={event => update({ severity: event.target.value as VerificationFailureDetails['severity'] })}><option>Low</option><option>Medium</option><option>High</option><option>Critical</option></select></label>
+      <div className="verification-failure-save"><span>Results are appended to immutable history.</span><button className="primary-button compact" disabled={!canSave} aria-busy={busy}>Save case result</button></div>
+    </div>
   </fieldset>
 }

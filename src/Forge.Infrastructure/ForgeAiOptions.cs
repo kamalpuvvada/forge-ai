@@ -31,6 +31,10 @@ public sealed class ForgeAiOptions
     public string VerificationPlanningReasoningEffort { get; set; } = "medium";
     public int VerificationPlanningMaxOutputTokens { get; set; } = 8_000;
     public int VerificationPlanningTimeoutSeconds { get; set; } = 180;
+    public string FailureAnalysisModel { get; set; } = "gpt-5.6-sol";
+    public string FailureAnalysisReasoningEffort { get; set; } = "medium";
+    public int FailureAnalysisMaxOutputTokens { get; set; } = 6_000;
+    public int FailureAnalysisTimeoutSeconds { get; set; } = 180;
     public Dictionary<string, ModelPricing> Pricing { get; set; } = DefaultPricing();
 
     public bool IsClarificationConfigurationComplete(bool hasApiKey) =>
@@ -69,6 +73,13 @@ public sealed class ForgeAiOptions
         VerificationPlanningTimeoutSeconds is > 0 and <= MaximumImplementationTimeoutSeconds &&
         Pricing is not null && Pricing.TryGetValue(VerificationPlanningModel, out var pricing) && IsValidPricing(pricing);
 
+    public bool IsFailureAnalysisConfigurationComplete(bool hasApiKey) =>
+        hasApiKey && !string.IsNullOrWhiteSpace(FailureAnalysisModel) && FailureAnalysisModel.Length <= 160 &&
+        SupportedReasoningEfforts.Contains(FailureAnalysisReasoningEffort) &&
+        FailureAnalysisMaxOutputTokens is > 0 and <= MaximumImplementationOutputTokens &&
+        FailureAnalysisTimeoutSeconds is > 0 and <= MaximumImplementationTimeoutSeconds &&
+        Pricing is not null && Pricing.TryGetValue(FailureAnalysisModel, out var pricing) && IsValidPricing(pricing);
+
     public void ValidateSyntax()
     {
         if (!string.Equals(Mode, ForgeAiModes.Fake, StringComparison.OrdinalIgnoreCase) &&
@@ -87,6 +98,13 @@ public sealed class ForgeAiOptions
             Pricing is null || !Pricing.TryGetValue(VerificationPlanningModel, out var verificationPricing) ||
             !IsValidPricing(verificationPricing))
             throw new InvalidOperationException("Forge OpenAI verification-planning configuration is syntactically invalid.");
+        if (string.IsNullOrWhiteSpace(FailureAnalysisModel) || FailureAnalysisModel.Length > 160 ||
+            !SupportedReasoningEfforts.Contains(FailureAnalysisReasoningEffort) ||
+            FailureAnalysisMaxOutputTokens is <= 0 or > MaximumImplementationOutputTokens ||
+            FailureAnalysisTimeoutSeconds is <= 0 or > MaximumImplementationTimeoutSeconds ||
+            Pricing is null || !Pricing.TryGetValue(FailureAnalysisModel, out var failurePricing) ||
+            !IsValidPricing(failurePricing))
+            throw new InvalidOperationException("Forge OpenAI failure-analysis configuration is syntactically invalid.");
     }
 
     internal static bool IsValidPricing(ModelPricing? pricing) => pricing is not null &&
