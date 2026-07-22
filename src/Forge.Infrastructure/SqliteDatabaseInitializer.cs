@@ -405,34 +405,6 @@ public sealed class SqliteDatabaseInitializer(string connectionString)
             BEFORE UPDATE OF TaskId ON CorrectionGenerationCommands WHEN NEW.TaskId <> OLD.TaskId BEGIN
               SELECT RAISE(ABORT, 'correction child ownership is immutable');
             END;
-            DROP TRIGGER IF EXISTS RequireCurrentDeliveryFormatForProposal;
-            DROP TRIGGER IF EXISTS RequireCurrentDeliveryFormatForApproval;
-            DROP TRIGGER IF EXISTS RequireCurrentDeliveryFormatForAttempt;
-            DROP TRIGGER IF EXISTS RequireCurrentDeliveryFormatForBinding;
-            CREATE TRIGGER RequireCurrentDeliveryFormatForProposal
-            BEFORE INSERT ON DeliveryProposals BEGIN
-              SELECT CASE WHEN NOT EXISTS (
-                SELECT 1 FROM EngineeringTasks WHERE Id = NEW.TaskId AND DeliveryDataFormatVersion IN (1, 2))
-              THEN RAISE(ABORT, 'delivery parent format mismatch') END;
-            END;
-            CREATE TRIGGER RequireCurrentDeliveryFormatForApproval
-            BEFORE INSERT ON DeliveryApprovalCommands BEGIN
-              SELECT CASE WHEN NOT EXISTS (
-                SELECT 1 FROM EngineeringTasks WHERE Id = NEW.TaskId AND DeliveryDataFormatVersion IN (1, 2))
-              THEN RAISE(ABORT, 'delivery parent format mismatch') END;
-            END;
-            CREATE TRIGGER RequireCurrentDeliveryFormatForAttempt
-            BEFORE INSERT ON DeliveryAttempts BEGIN
-              SELECT CASE WHEN NOT EXISTS (
-                SELECT 1 FROM EngineeringTasks WHERE Id = NEW.TaskId AND DeliveryDataFormatVersion IN (1, 2))
-              THEN RAISE(ABORT, 'delivery parent format mismatch') END;
-            END;
-            CREATE TRIGGER RequireCurrentDeliveryFormatForBinding
-            BEFORE INSERT ON DeliveryCommandBindings BEGIN
-              SELECT CASE WHEN NOT EXISTS (
-                SELECT 1 FROM EngineeringTasks WHERE Id = NEW.TaskId AND DeliveryDataFormatVersion IN (1, 2))
-              THEN RAISE(ABORT, 'delivery parent format mismatch') END;
-            END;
             CREATE TRIGGER IF NOT EXISTS PreventDeliveryProposalTaskReassignment
             BEFORE UPDATE OF TaskId ON DeliveryProposals WHEN NEW.TaskId <> OLD.TaskId BEGIN
               SELECT RAISE(ABORT, 'delivery child ownership is immutable');
@@ -451,6 +423,38 @@ public sealed class SqliteDatabaseInitializer(string connectionString)
             END;
             """;
         await command.ExecuteNonQueryAsync(cancellationToken);
+        await EnsureSchemaObjectAsync(connection, "TRIGGER", "RequireCurrentDeliveryFormatForProposal", $"""
+            CREATE TRIGGER RequireCurrentDeliveryFormatForProposal
+            BEFORE INSERT ON DeliveryProposals BEGIN
+              SELECT CASE WHEN NOT EXISTS (
+                SELECT 1 FROM EngineeringTasks WHERE Id = NEW.TaskId AND DeliveryDataFormatVersion IN (1, 2))
+              THEN RAISE(ABORT, 'delivery parent format mismatch') END;
+            END;
+            """, cancellationToken);
+        await EnsureSchemaObjectAsync(connection, "TRIGGER", "RequireCurrentDeliveryFormatForApproval", $"""
+            CREATE TRIGGER RequireCurrentDeliveryFormatForApproval
+            BEFORE INSERT ON DeliveryApprovalCommands BEGIN
+              SELECT CASE WHEN NOT EXISTS (
+                SELECT 1 FROM EngineeringTasks WHERE Id = NEW.TaskId AND DeliveryDataFormatVersion IN (1, 2))
+              THEN RAISE(ABORT, 'delivery parent format mismatch') END;
+            END;
+            """, cancellationToken);
+        await EnsureSchemaObjectAsync(connection, "TRIGGER", "RequireCurrentDeliveryFormatForAttempt", $"""
+            CREATE TRIGGER RequireCurrentDeliveryFormatForAttempt
+            BEFORE INSERT ON DeliveryAttempts BEGIN
+              SELECT CASE WHEN NOT EXISTS (
+                SELECT 1 FROM EngineeringTasks WHERE Id = NEW.TaskId AND DeliveryDataFormatVersion IN (1, 2))
+              THEN RAISE(ABORT, 'delivery parent format mismatch') END;
+            END;
+            """, cancellationToken);
+        await EnsureSchemaObjectAsync(connection, "TRIGGER", "RequireCurrentDeliveryFormatForBinding", $"""
+            CREATE TRIGGER RequireCurrentDeliveryFormatForBinding
+            BEFORE INSERT ON DeliveryCommandBindings BEGIN
+              SELECT CASE WHEN NOT EXISTS (
+                SELECT 1 FROM EngineeringTasks WHERE Id = NEW.TaskId AND DeliveryDataFormatVersion IN (1, 2))
+              THEN RAISE(ABORT, 'delivery parent format mismatch') END;
+            END;
+            """, cancellationToken);
         await EnsureColumnAsync(connection, "RowVersion", "INTEGER NOT NULL DEFAULT 0", cancellationToken);
         await EnsureIndexAsync(connection, cancellationToken);
     }
@@ -507,13 +511,47 @@ public sealed class SqliteDatabaseInitializer(string connectionString)
             ON CorrectionGenerationCommands (TaskId);
             CREATE INDEX IF NOT EXISTS IX_CorrectionReconciliationCommands_TaskId
             ON CorrectionReconciliationCommands (TaskId);
-            DROP INDEX IF EXISTS UX_CorrectionGenerationCommands_ActiveTaskProposal;
-            CREATE UNIQUE INDEX IF NOT EXISTS UX_CorrectionGenerationCommands_ActiveTaskProposal
+            """;
+        await command.ExecuteNonQueryAsync(cancellationToken);
+        await EnsureSchemaObjectAsync(connection, "INDEX", "UX_CorrectionGenerationCommands_ActiveTaskProposal", """
+            CREATE UNIQUE INDEX UX_CorrectionGenerationCommands_ActiveTaskProposal
             ON CorrectionGenerationCommands (TaskId, ProposalId)
             WHERE Status IN ('Prepared','DispatchMayHaveStarted','ResponseReceived','OutputAccepted',
                 'CheckoutVerified','RevisionReserved','WorkspacePreparing','WorkspacePrepared',
                 'MutationStarted','ApplyCompleted','ResultPersisted','AmbiguousAfterDispatch','InterruptedAfterResponse','RecoveryRequired');
-            """;
-        await command.ExecuteNonQueryAsync(cancellationToken);
+            """, cancellationToken);
     }
+
+    private static async Task EnsureSchemaObjectAsync(
+        SqliteConnection connection,
+        string objectType,
+        string objectName,
+        string definition,
+        CancellationToken cancellationToken)
+    {
+        if (objectType is not ("TRIGGER" or "INDEX"))
+            throw new ArgumentOutOfRangeException(nameof(objectType));
+
+        await using var inspect = connection.CreateCommand();
+        inspect.CommandText = "SELECT sql FROM sqlite_schema WHERE type = $type AND name = $name;";
+        inspect.Parameters.AddWithValue("$type", objectType.ToLowerInvariant());
+        inspect.Parameters.AddWithValue("$name", objectName);
+        var existing = await inspect.ExecuteScalarAsync(cancellationToken) as string;
+        if (existing is not null && string.Equals(NormalizeSchemaSql(existing), NormalizeSchemaSql(definition),
+                StringComparison.OrdinalIgnoreCase)) return;
+
+        await using var transaction = connection.BeginTransaction();
+        await using var replace = connection.CreateCommand();
+        replace.Transaction = transaction;
+        replace.CommandText = existing is null
+            ? definition
+            : $"DROP {objectType} IF EXISTS \"{objectName.Replace("\"", "\"\"")}\";\n{definition}";
+        await replace.ExecuteNonQueryAsync(cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
+    }
+
+    private static string NormalizeSchemaSql(string value) => string.Join(' ', value
+        .Replace("IF NOT EXISTS", string.Empty, StringComparison.OrdinalIgnoreCase)
+        .Trim().TrimEnd(';')
+        .Split([' ', '\t', '\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
 }

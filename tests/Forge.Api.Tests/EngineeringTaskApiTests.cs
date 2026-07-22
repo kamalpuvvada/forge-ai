@@ -378,7 +378,7 @@ public sealed class EngineeringTaskApiTests : IClassFixture<FakeModeFactory>
     public async Task Approved_requirement_can_be_analyzed_planned_approved_and_read_back()
     {
         var created = await CreateAsync("""
-            Add report export. Acceptance criteria: export is available. Validation: run focused tests.
+            Modify src/ReportExportService.cs to add report export. Acceptance criteria: export is available. Validation: run focused tests.
             """, _factory.TargetRepositoryPath);
         var id = created.GetProperty("id").GetGuid();
         (await _client.PostAsync($"/api/tasks/{id}/requirement-approval", null)).EnsureSuccessStatusCode();
@@ -430,7 +430,7 @@ public sealed class EngineeringTaskApiTests : IClassFixture<FakeModeFactory>
         var statusBefore = FakeModeFactory.RunGit(repository, "status", "--porcelain=v1", "--untracked-files=all");
 
         var created = await CreateAsync(
-            "Add report export. Acceptance criteria: export is available. Validation: run focused tests.",
+            "Modify src/ReportExportService.cs to add report export. Acceptance criteria: export is available. Validation: run focused tests.",
             repository);
         var id = created.GetProperty("id").GetGuid();
         (await _client.PostAsync($"/api/tasks/{id}/requirement-approval", null)).EnsureSuccessStatusCode();
@@ -503,7 +503,7 @@ public sealed class EngineeringTaskApiTests : IClassFixture<FakeModeFactory>
     {
         var repository = _factory.TargetRepositoryPath;
         var created = await CreateAsync(
-            "Add report export. Acceptance criteria: export is available. Validation: inspect the bounded diff.",
+            "Modify src/ReportExportService.cs to add report export. Acceptance criteria: export is available. Validation: inspect the bounded diff.",
             repository);
         var id = created.GetProperty("id").GetGuid();
         (await _client.PostAsync($"/api/tasks/{id}/requirement-approval", null)).EnsureSuccessStatusCode();
@@ -569,7 +569,7 @@ public sealed class EngineeringTaskApiTests : IClassFixture<FakeModeFactory>
     {
         var repository = _factory.TargetRepositoryPath;
         var created = await CreateAsync(
-            "Add report export. Acceptance criteria: export is available. Validation: inspect the bounded diff.",
+            "Modify src/ReportExportService.cs to add report export. Acceptance criteria: export is available. Validation: inspect the bounded diff.",
             repository);
         var id = created.GetProperty("id").GetGuid();
         (await _client.PostAsync($"/api/tasks/{id}/requirement-approval", null)).EnsureSuccessStatusCode();
@@ -1126,7 +1126,7 @@ public sealed class EngineeringTaskApiTests : IClassFixture<FakeModeFactory>
         var created = await client.PostAsJsonAsync("/api/tasks", new
         {
             repository,
-            requirement = "Modify report export. Acceptance criteria: a bounded diff is available. Validation: inspect the diff."
+            requirement = "Modify src/ReportExportService.cs for report export. Acceptance criteria: a bounded diff is available. Validation: inspect the diff."
         });
         created.EnsureSuccessStatusCode();
         var id = (await created.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("id").GetGuid();
@@ -1206,7 +1206,7 @@ public sealed class EngineeringTaskApiTests : IClassFixture<FakeModeFactory>
         var createdResponse = await client.PostAsJsonAsync("/api/tasks", new
         {
             repository = factory.TargetRepositoryPath,
-            requirement = "Add report export. Acceptance criteria: export is available. Validation: inspect the diff."
+            requirement = "Modify src/ReportExportService.cs to add report export. Acceptance criteria: export is available. Validation: inspect the diff."
         });
         createdResponse.EnsureSuccessStatusCode();
         var created = await createdResponse.Content.ReadFromJsonAsync<JsonElement>();
@@ -1265,7 +1265,7 @@ public sealed class EngineeringTaskApiTests : IClassFixture<FakeModeFactory>
         var createdResponse = await client.PostAsJsonAsync("/api/tasks", new
         {
             repository,
-            requirement = "Add report export. Acceptance criteria: export is available. Validation: run focused tests."
+            requirement = "Modify src/ReportExportService.cs to add report export. Acceptance criteria: export is available. Validation: run focused tests."
         });
         createdResponse.EnsureSuccessStatusCode();
         var id = (await createdResponse.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("id").GetGuid();
@@ -1293,7 +1293,7 @@ public sealed class EngineeringTaskApiTests : IClassFixture<FakeModeFactory>
     [Fact]
     public async Task Approved_task_pdf_has_safe_headers_required_content_and_does_not_mutate_task()
     {
-        const string requirement = "Add report export. Acceptance criteria: export is available. Validation: run focused tests.";
+        const string requirement = "Modify src/ReportExportService.cs. Acceptance criteria: export. Validation: tests.";
         var created = await CreateAsync(requirement, _factory.TargetRepositoryPath);
         var id = created.GetProperty("id").GetGuid();
         (await _client.PostAsync($"/api/tasks/{id}/requirement-approval", null)).EnsureSuccessStatusCode();
@@ -1322,7 +1322,7 @@ public sealed class EngineeringTaskApiTests : IClassFixture<FakeModeFactory>
     [Fact]
     public async Task Proposed_and_approved_plan_pdf_routes_use_persisted_status_safe_headers_and_do_not_mutate_task()
     {
-        const string requirement = "Add plan PDF export. Acceptance criteria: export all plan sections. Validation: run focused tests.";
+        const string requirement = "Modify src/ReportExportService.cs to add plan PDF export. Acceptance criteria: export all plan sections. Validation: run focused tests.";
         var created = await CreateAsync(requirement, _factory.TargetRepositoryPath);
         var id = created.GetProperty("id").GetGuid();
         (await _client.PostAsync($"/api/tasks/{id}/requirement-approval", null)).EnsureSuccessStatusCode();
@@ -1427,7 +1427,7 @@ public sealed class EngineeringTaskApiTests : IClassFixture<FakeModeFactory>
     public async Task Fake_plan_correction_endpoint_preserves_previous_plan_and_requires_explicit_approval()
     {
         var created = await CreateAsync("""
-            Add report export with pricing telemetry. Acceptance criteria: export is available. Validation: run focused tests.
+            Modify src/ReportExportService.cs to add report export with pricing telemetry. Acceptance criteria: export is available. Validation: run focused tests.
             """, _factory.TargetRepositoryPath);
         var id = created.GetProperty("id").GetGuid();
         (await _client.PostAsync($"/api/tasks/{id}/requirement-approval", null)).EnsureSuccessStatusCode();
@@ -1798,7 +1798,7 @@ public sealed class EngineeringTaskApiTests : IClassFixture<FakeModeFactory>
         var createdResponse = await client.PostAsJsonAsync("/api/tasks", new
         {
             repository = factory.TargetRepositoryPath,
-            requirement = "Export the task report from the UI through the frontend API helper. Acceptance criteria: export is available. Validation: run tests."
+            requirement = "Modify web/src/api.ts to export the task report through the frontend API helper. Acceptance criteria: export is available. Validation: run tests."
         });
         createdResponse.EnsureSuccessStatusCode();
         var id = (await createdResponse.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("id").GetGuid();
