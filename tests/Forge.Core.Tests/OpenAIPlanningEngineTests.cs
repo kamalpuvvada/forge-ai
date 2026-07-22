@@ -307,7 +307,10 @@ public sealed class OpenAIPlanningEngineTests
     public async Task Revision_context_contains_correction_and_only_compact_previous_plan_paths()
     {
         var context = Context();
-        var previousPlan = (await new FakePlanningEngine().CreatePlanAsync(context)).Plan;
+        var previousPlan = (await new FakePlanningEngine().CreatePlanAsync(context with
+        {
+            ApprovedRequirementSummary = "Modify src/App.cs to add a bounded report export."
+        })).Plan;
         var revision = new PlanRevisionNote(
             "Include pricing snapshot persistence and legacy fallback labels.",
             Now,
@@ -354,7 +357,10 @@ public sealed class OpenAIPlanningEngineTests
     [Fact]
     public async Task Fake_planning_is_async_and_records_no_model_call()
     {
-        var result = await new FakePlanningEngine().CreatePlanAsync(Context());
+        var result = await new FakePlanningEngine().CreatePlanAsync(Context() with
+        {
+            ApprovedRequirementSummary = "Modify src/App.cs to add a bounded report export."
+        });
         Assert.Equal(PlanningSource.DeterministicFake, result.Plan.Source);
         Assert.Null(result.Plan.PlanningModel);
         Assert.Null(result.ModelCall);
